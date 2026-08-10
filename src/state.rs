@@ -200,6 +200,26 @@ impl Store {
         Self { path }
     }
 
+    pub(crate) fn lock_operations(&self) -> Result<OperationGuard, Error> {
+        let parent = self.path.parent().ok_or_else(|| {
+            io_error(
+                &self.path,
+                io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"),
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+        let path = self.path.with_extension("operations.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| io_error(&path, source))?;
+        file.lock().map_err(|source| io_error(&path, source))?;
+        Ok(OperationGuard { _file: file })
+    }
+
     pub(crate) fn mutate<T>(
         &self,
         operation: impl FnOnce(&mut Registry) -> Result<T, Error>,
@@ -250,6 +270,10 @@ impl Store {
             .map_err(|source| io_error(parent, source))?;
         Ok(result)
     }
+}
+
+pub(crate) struct OperationGuard {
+    _file: File,
 }
 
 fn io_error(path: impl Into<PathBuf>, source: io::Error) -> Error {

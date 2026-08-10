@@ -5,16 +5,21 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+use crate::config::ResolvedRunConfig;
+use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
 use crate::state::Lease;
+use crate::state::{LeaseState, PendingOperation, PendingOperationKind, Scheme, Store};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Liveness {
@@ -93,6 +98,209 @@ impl ManagedChild {
         Ok(status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+    }
+
+    fn has_exited(&mut self) -> Result<bool, Error> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(Error::Spawn)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RunError {
+    State(crate::state::Error),
+    Route(RouteError),
+    Process(Error),
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(error) => error.fmt(formatter),
+            Self::Route(error) => error.fmt(formatter),
+            Self::Process(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+impl From<crate::state::Error> for RunError {
+    fn from(error: crate::state::Error) -> Self {
+        Self::State(error)
+    }
+}
+impl From<RouteError> for RunError {
+    fn from(error: RouteError) -> Self {
+        Self::Route(error)
+    }
+}
+impl From<Error> for RunError {
+    fn from(error: Error) -> Self {
+        Self::Process(error)
+    }
+}
+
+pub(crate) struct RunningChild {
+    pub(crate) child: ManagedChild,
+    pub(crate) lease_id: Uuid,
+    pub(crate) hostname: String,
+    pub(crate) port: u16,
+    pub(crate) warning: Option<String>,
+    readiness_warn_after: Duration,
+}
+
+pub(crate) fn start_run(
+    config: &ResolvedRunConfig,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+) -> Result<RunningChild, RunError> {
+    let _operations = store.lock_operations()?;
+    let reservation = reserve_port(config.app_port, config.strict_port)?;
+    let port = reservation.port;
+    let owner_id = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let target = format!("http://127.0.0.1:{port}");
+    let route = RouteSpec {
+        owner_id,
+        hostname: config.hostname.clone(),
+        target: target.clone(),
+        scheme: Scheme::Http,
+        tls: config.tls,
+    };
+    store.mutate(|registry| {
+        registry.pending_operations.push(PendingOperation {
+            id: operation_id,
+            kind: PendingOperationKind::InstallRoute {
+                hostname: route.hostname.clone(),
+                target: target.clone(),
+                scheme: Scheme::Http,
+                owner_id,
+                tls: config.tls,
+            },
+        });
+        Ok(())
+    })?;
+    routes.ensure(&route)?;
+    store.mutate(|registry| {
+        replace_operation(
+            registry,
+            operation_id,
+            PendingOperationKind::StartProcess {
+                hostname: route.hostname.clone(),
+                target: target.clone(),
+                scheme: Scheme::Http,
+                owner_id,
+                tls: config.tls,
+            },
+        );
+        Ok(())
+    })?;
+
+    let argv = substitute_port(&config.command, port);
+    let environment = child_environment(port, &config.hostname, config.tls);
+    let warning = reservation.warning.clone();
+    reservation.release();
+    let child = match spawn_child(&argv, &environment) {
+        Ok(child) => child,
+        Err(error) => {
+            let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
+            store.mutate(|registry| {
+                registry
+                    .pending_operations
+                    .retain(|operation| operation.id != operation_id);
+                if cleanup.is_err() {
+                    registry.pending_operations.push(PendingOperation {
+                        id: Uuid::new_v4(),
+                        kind: PendingOperationKind::RemoveRoute {
+                            hostname: config.hostname.clone(),
+                            owner_id,
+                            tls: config.tls,
+                        },
+                    });
+                }
+                Ok(())
+            })?;
+            return Err(error.into());
+        }
+    };
+    store.mutate(|registry| {
+        registry
+            .pending_operations
+            .retain(|operation| operation.id != operation_id);
+        registry.leases.insert(
+            owner_id,
+            Lease {
+                id: owner_id,
+                hostname: config.hostname.clone(),
+                target,
+                scheme: Scheme::Http,
+                tls: config.tls,
+                pid: child.pid,
+                pgid: child.pgid,
+                process_start_time_ticks: child.start_time_ticks,
+                state: LeaseState::Starting,
+            },
+        );
+        Ok(())
+    })?;
+    Ok(RunningChild {
+        child,
+        lease_id: owner_id,
+        hostname: config.hostname.clone(),
+        port,
+        warning,
+        readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
+    })
+}
+
+impl RunningChild {
+    pub(crate) fn wait_for_readiness(
+        &mut self,
+        store: &Store,
+        mut warn: impl FnMut(&str),
+    ) -> Result<bool, RunError> {
+        let started = Instant::now();
+        let mut warned = false;
+        loop {
+            if TcpStream::connect_timeout(
+                &SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port).into(),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                store.mutate(|registry| {
+                    if let Some(lease) = registry.leases.get_mut(&self.lease_id) {
+                        lease.state = LeaseState::Ready;
+                    }
+                    Ok(())
+                })?;
+                return Ok(true);
+            }
+            if self.child.has_exited()? {
+                return Ok(false);
+            }
+            if !warned && started.elapsed() >= self.readiness_warn_after {
+                warn(&format!(
+                    "{} is still not accepting connections on port {}",
+                    self.hostname, self.port
+                ));
+                warned = true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn replace_operation(registry: &mut crate::state::Registry, id: Uuid, kind: PendingOperationKind) {
+    if let Some(operation) = registry
+        .pending_operations
+        .iter_mut()
+        .find(|operation| operation.id == id)
+    {
+        operation.kind = kind;
     }
 }
 
@@ -288,14 +496,47 @@ fn parse_stat(stat: &str) -> Option<ProcIdentity> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::{
-        Error, ProcIdentity, child_environment, parse_stat, reserve_port, spawn_child,
+        Error, ProcIdentity, child_environment, parse_stat, reserve_port, spawn_child, start_run,
         substitute_port,
     };
+    use crate::config::ResolvedRunConfig;
+    use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
+    use crate::state::{LeaseState, Store, decode};
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct Routes {
+        owners: BTreeMap<String, Uuid>,
+        unavailable_on_remove: bool,
+    }
+
+    impl RouteBackend for Routes {
+        fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
+            self.owners.insert(route.hostname.clone(), route.owner_id);
+            Ok(())
+        }
+
+        fn remove_if_owned(
+            &mut self,
+            hostname: &str,
+            owner_id: Uuid,
+            _tls: bool,
+        ) -> Result<(), RouteError> {
+            if self.unavailable_on_remove {
+                return Err(RouteError("unavailable".into()));
+            }
+            if self.owners.get(hostname) == Some(&owner_id) {
+                self.owners.remove(hostname);
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn parses_pgid_and_start_time_even_when_comm_contains_spaces_and_parentheses() {
@@ -402,5 +643,88 @@ mod tests {
             spawn_child(&[OsString::from("/bin/sleep"), OsString::from("10")], &[]).unwrap();
         child.signal_group(libc::SIGTERM).unwrap();
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGTERM);
+    }
+
+    #[test]
+    fn route_precedes_spawn_and_lease_is_starting_before_readiness() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sleep", "10"], 30);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            registry.leases[&running.lease_id].state,
+            LeaseState::Starting
+        );
+        assert_eq!(routes.owners.get("api.localhost"), Some(&running.lease_id));
+        assert!(registry.pending_operations.is_empty());
+        running.child.signal_group(libc::SIGTERM).unwrap();
+        assert_eq!(running.child.wait().unwrap(), 143);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn readiness_marks_lease_ready_after_real_tcp_acceptor_starts() {
+        let (store, path) = temporary_store();
+        let code = "import os,socket,time;time.sleep(.1);s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
+        let config = run_config(vec!["/usr/bin/python3", "-c", code], 2);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        assert!(
+            running
+                .wait_for_readiness(&store, |_| panic!("unexpected warning"))
+                .unwrap()
+        );
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(registry.leases[&running.lease_id].state, LeaseState::Ready);
+        running.child.signal_group(libc::SIGTERM).unwrap();
+        running.child.wait().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_spawn_removes_route_and_provisional_operation() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/definitely/missing/nook-command"], 30);
+        let mut routes = Routes::default();
+        assert!(start_run(&config, &store, &mut routes).is_err());
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(registry.leases.is_empty());
+        assert!(registry.pending_operations.is_empty());
+        assert!(routes.owners.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn readiness_warns_once_but_waits_until_child_exits() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sleep", "0.2"], 0);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let mut warnings = 0;
+        assert!(
+            !running
+                .wait_for_readiness(&store, |_| warnings += 1)
+                .unwrap()
+        );
+        assert_eq!(warnings, 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn run_config(command: Vec<&str>, readiness: u64) -> ResolvedRunConfig {
+        ResolvedRunConfig {
+            hostname: "api.localhost".into(),
+            command: command.into_iter().map(OsString::from).collect(),
+            tls: true,
+            app_port: None,
+            strict_port: false,
+            readiness_warn_after_seconds: readiness,
+        }
+    }
+
+    fn temporary_store() -> (Store, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!("nook-run-{}", Uuid::new_v4()));
+        let path = directory.join("state.json");
+        (Store::new(path.clone()), path)
     }
 }
