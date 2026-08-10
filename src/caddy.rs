@@ -8,6 +8,8 @@ use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
 
+use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Error {
     InvalidPort,
@@ -34,6 +36,7 @@ pub(crate) enum Error {
     MissingEtag,
     ConcurrentMutation,
     InvalidOwnedRoute,
+    MissingSelectedServer(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -85,6 +88,10 @@ impl fmt::Display for Error {
             Self::InvalidOwnedRoute => write!(
                 formatter,
                 "Nook route container contains a route without a valid Nook owner marker"
+            ),
+            Self::MissingSelectedServer(kind) => write!(
+                formatter,
+                "no selected Caddy {kind} server is available for this route"
             ),
         }
     }
@@ -176,6 +183,67 @@ impl Client {
             .extend(["config", "apps", "http", "servers", server, "routes"]);
         Ok(endpoint)
     }
+}
+
+pub(crate) struct ManagedCaddyRoutes<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) https_server: Option<&'a str>,
+    pub(crate) http_server: Option<&'a str>,
+}
+
+impl ManagedCaddyRoutes<'_> {
+    fn server(&self, tls: bool) -> Result<(&str, &'static str), Error> {
+        if tls {
+            self.https_server
+                .map(|server| (server, HTTPS_CONTAINER_ID))
+                .ok_or(Error::MissingSelectedServer("HTTPS"))
+        } else {
+            self.http_server
+                .map(|server| (server, HTTP_CONTAINER_ID))
+                .ok_or(Error::MissingSelectedServer("HTTP"))
+        }
+    }
+}
+
+impl RouteBackend for ManagedCaddyRoutes<'_> {
+    fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
+        let (server, container_id) = self.server(route.tls).map_err(route_error)?;
+        let upstream = normalize_upstream(&route.target).map_err(route_error)?;
+        let owner_id = route.owner_id;
+        let hostname = route.hostname.clone();
+        let proxy = build_proxy_route(&owner_route_id(owner_id), &hostname, &upstream.url);
+        self.client
+            .mutate_server_routes(server, move |mut routes| {
+                reject_foreign_hostname_claims(&routes, std::slice::from_ref(&hostname))?;
+                update_owned_route(
+                    &mut routes,
+                    container_id,
+                    owner_id,
+                    Some((hostname.clone(), proxy.clone())),
+                )?;
+                Ok(routes)
+            })
+            .map_err(route_error)
+    }
+
+    fn remove_if_owned(
+        &mut self,
+        _hostname: &str,
+        owner_id: Uuid,
+        tls: bool,
+    ) -> Result<(), RouteError> {
+        let (server, container_id) = self.server(tls).map_err(route_error)?;
+        self.client
+            .mutate_server_routes(server, move |mut routes| {
+                update_owned_route(&mut routes, container_id, owner_id, None)?;
+                Ok(routes)
+            })
+            .map_err(route_error)
+    }
+}
+
+fn route_error(error: Error) -> RouteError {
+    RouteError(error.to_string())
 }
 
 fn admin_request(error: impl fmt::Display) -> Error {
@@ -888,5 +956,83 @@ mod tests {
             super::update_owned_route(&mut routes, super::HTTPS_CONTAINER_ID, owner, None).unwrap();
         }
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn managed_backend_applies_owned_route_with_etag() {
+        use crate::reconcile::{RouteBackend, RouteSpec};
+        use crate::state::Scheme;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        let expected_marker = super::owner_route_id(owner);
+        let server = std::thread::spawn(move || {
+            for step in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let request = String::from_utf8_lossy(&request);
+                if step == 0 {
+                    assert!(request.starts_with("GET /config/apps/http/servers/https/routes "));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"v1\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                    )
+                    .unwrap();
+                } else {
+                    assert!(request.starts_with("PUT /config/apps/http/servers/https/routes "));
+                    assert!(request.to_ascii_lowercase().contains("if-match: \"v1\""));
+                    assert!(request.contains(&expected_marker));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let client = Client::new(&format!("http://{address}")).unwrap();
+        let mut backend = super::ManagedCaddyRoutes {
+            client: &client,
+            https_server: Some("https"),
+            http_server: None,
+        };
+        backend
+            .ensure(&RouteSpec {
+                owner_id: owner,
+                hostname: "api.localhost".into(),
+                target: "http://127.0.0.1:3000".into(),
+                scheme: Scheme::Http,
+                tls: true,
+            })
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 4096];
+            let size = stream.read(&mut chunk).unwrap();
+            request.extend_from_slice(&chunk[..size]);
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers_end = headers_end + 4;
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + content_length {
+                return request;
+            }
+        }
     }
 }

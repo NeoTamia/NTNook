@@ -29,7 +29,12 @@ impl fmt::Display for RouteError {
 
 pub(crate) trait RouteBackend {
     fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError>;
-    fn remove_if_owned(&mut self, hostname: &str, owner_id: Uuid) -> Result<(), RouteError>;
+    fn remove_if_owned(
+        &mut self,
+        hostname: &str,
+        owner_id: Uuid,
+        tls: bool,
+    ) -> Result<(), RouteError>;
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -56,10 +61,10 @@ pub(crate) fn reconcile(
             }
             Liveness::Dead => {
                 registry.leases.remove(&lease.id);
-                match routes.remove_if_owned(&lease.hostname, lease.id) {
+                match routes.remove_if_owned(&lease.hostname, lease.id, lease.tls) {
                     Ok(()) => report.removed_dead_leases += 1,
                     Err(error) => {
-                        queue_remove(registry, &lease.hostname, lease.id);
+                        queue_remove(registry, &lease.hostname, lease.id, lease.tls);
                         report
                             .warnings
                             .push(format!("cleanup of {} is pending: {error}", lease.hostname));
@@ -98,13 +103,15 @@ fn retry_pending(
     let pending = std::mem::take(&mut registry.pending_operations);
     for operation in pending {
         let result = match &operation.kind {
-            PendingOperationKind::InstallRoute { hostname, owner_id } => {
-                current_route(registry, hostname, *owner_id)
-                    .map_or(Ok(()), |route| routes.ensure(&route))
-            }
-            PendingOperationKind::RemoveRoute { hostname, owner_id } => {
-                routes.remove_if_owned(hostname, *owner_id)
-            }
+            PendingOperationKind::InstallRoute {
+                hostname, owner_id, ..
+            } => current_route(registry, hostname, *owner_id)
+                .map_or(Ok(()), |route| routes.ensure(&route)),
+            PendingOperationKind::RemoveRoute {
+                hostname,
+                owner_id,
+                tls,
+            } => routes.remove_if_owned(hostname, *owner_id, *tls),
             PendingOperationKind::StartProcess { lease_id }
             | PendingOperationKind::FinalizeLease { lease_id } => {
                 match registry.leases.get(lease_id) {
@@ -138,7 +145,7 @@ fn restore(
     match routes.ensure(&route) {
         Ok(()) => report.restored += 1,
         Err(error) => {
-            queue_install(registry, &route.hostname, route.owner_id);
+            queue_install(registry, &route.hostname, route.owner_id, route.tls);
             report.warnings.push(format!(
                 "restoration of {} is pending: {error}",
                 route.hostname
@@ -168,7 +175,7 @@ fn route_for_lease(lease: &Lease) -> RouteSpec {
         hostname: lease.hostname.clone(),
         target: lease.target.clone(),
         scheme: lease.scheme,
-        tls: lease.scheme == Scheme::Https,
+        tls: lease.tls,
     }
 }
 
@@ -182,22 +189,24 @@ fn route_for_alias(alias: &Alias) -> RouteSpec {
     }
 }
 
-fn queue_install(registry: &mut Registry, hostname: &str, owner_id: Uuid) {
+fn queue_install(registry: &mut Registry, hostname: &str, owner_id: Uuid, tls: bool) {
     registry.pending_operations.push(PendingOperation {
         id: Uuid::new_v4(),
         kind: PendingOperationKind::InstallRoute {
             hostname: hostname.to_owned(),
             owner_id,
+            tls,
         },
     });
 }
 
-fn queue_remove(registry: &mut Registry, hostname: &str, owner_id: Uuid) {
+fn queue_remove(registry: &mut Registry, hostname: &str, owner_id: Uuid, tls: bool) {
     registry.pending_operations.push(PendingOperation {
         id: Uuid::new_v4(),
         kind: PendingOperationKind::RemoveRoute {
             hostname: hostname.to_owned(),
             owner_id,
+            tls,
         },
     });
 }
@@ -206,15 +215,21 @@ fn deduplicate_pending(registry: &mut Registry) {
     let mut seen = BTreeSet::new();
     registry.pending_operations.retain(|operation| {
         let key = match &operation.kind {
-            PendingOperationKind::InstallRoute { hostname, owner_id } => {
-                ("install", hostname.clone(), *owner_id)
+            PendingOperationKind::InstallRoute {
+                hostname,
+                owner_id,
+                tls,
+            } => ("install", hostname.clone(), *owner_id, *tls),
+            PendingOperationKind::RemoveRoute {
+                hostname,
+                owner_id,
+                tls,
+            } => ("remove", hostname.clone(), *owner_id, *tls),
+            PendingOperationKind::StartProcess { lease_id } => {
+                ("start", String::new(), *lease_id, false)
             }
-            PendingOperationKind::RemoveRoute { hostname, owner_id } => {
-                ("remove", hostname.clone(), *owner_id)
-            }
-            PendingOperationKind::StartProcess { lease_id } => ("start", String::new(), *lease_id),
             PendingOperationKind::FinalizeLease { lease_id } => {
-                ("finalize", String::new(), *lease_id)
+                ("finalize", String::new(), *lease_id, false)
             }
         };
         seen.insert(key)
@@ -245,7 +260,12 @@ mod tests {
             Ok(())
         }
 
-        fn remove_if_owned(&mut self, hostname: &str, owner_id: Uuid) -> Result<(), RouteError> {
+        fn remove_if_owned(
+            &mut self,
+            hostname: &str,
+            owner_id: Uuid,
+            _tls: bool,
+        ) -> Result<(), RouteError> {
             if self.unavailable {
                 return Err(RouteError("Caddy unavailable".into()));
             }
@@ -359,6 +379,7 @@ mod tests {
             hostname: hostname.into(),
             target: "http://127.0.0.1:3001".into(),
             scheme: Scheme::Http,
+            tls: true,
             pid: 1,
             pgid: 1,
             process_start_time_ticks: 1,

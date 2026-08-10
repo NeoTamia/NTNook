@@ -79,10 +79,12 @@ impl Registry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Alias {
+    #[serde(default = "Uuid::new_v4")]
     pub(crate) id: Uuid,
     pub(crate) hostname: String,
     pub(crate) target: String,
     pub(crate) scheme: Scheme,
+    #[serde(default = "default_true")]
     pub(crate) tls: bool,
     pub(crate) preserve_host: bool,
 }
@@ -94,6 +96,8 @@ pub(crate) struct Lease {
     pub(crate) hostname: String,
     pub(crate) target: String,
     pub(crate) scheme: Scheme,
+    #[serde(default = "default_true")]
+    pub(crate) tls: bool,
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) process_start_time_ticks: u64,
@@ -131,10 +135,24 @@ pub(crate) struct PendingOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PendingOperationKind {
-    InstallRoute { hostname: String, owner_id: Uuid },
-    RemoveRoute { hostname: String, owner_id: Uuid },
-    StartProcess { lease_id: Uuid },
-    FinalizeLease { lease_id: Uuid },
+    InstallRoute {
+        hostname: String,
+        owner_id: Uuid,
+        #[serde(default = "default_true")]
+        tls: bool,
+    },
+    RemoveRoute {
+        hostname: String,
+        owner_id: Uuid,
+        #[serde(default = "default_true")]
+        tls: bool,
+    },
+    StartProcess {
+        lease_id: Uuid,
+    },
+    FinalizeLease {
+        lease_id: Uuid,
+    },
 }
 
 pub(crate) fn decode(contents: &[u8]) -> Result<Registry, Error> {
@@ -147,6 +165,10 @@ pub(crate) fn decode(contents: &[u8]) -> Result<Registry, Error> {
         1 => serde_json::from_value(value).map_err(Error::InvalidJson),
         other => Err(Error::UnsupportedVersion(other)),
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub(crate) fn state_path() -> Result<PathBuf, Error> {
@@ -264,6 +286,7 @@ mod tests {
             kind: PendingOperationKind::RemoveRoute {
                 hostname: "api.localhost".into(),
                 owner_id: owner,
+                tls: true,
             },
         });
         let json = serde_json::to_vec(&registry).unwrap();
@@ -291,6 +314,12 @@ mod tests {
         ));
         assert!(matches!(decode(b"not json"), Err(Error::InvalidJson(_))));
         assert!(matches!(decode(br#"{"format_version":1,"aliases":{},"leases":{},"selected_servers":{},"last_synchronized_at_unix_ms":null,"pending_operations":[],"surprise":true}"#), Err(Error::InvalidJson(_))));
+    }
+
+    #[test]
+    fn legacy_v1_alias_without_owner_id_is_migrated_on_decode() {
+        let registry = decode(br#"{"format_version":1,"aliases":{"api.localhost":{"hostname":"api.localhost","target":"http://127.0.0.1:3000","scheme":"http","tls":true,"preserve_host":false}},"leases":{},"selected_servers":{},"last_synchronized_at_unix_ms":null,"pending_operations":[]}"#).unwrap();
+        assert_ne!(registry.aliases["api.localhost"].id, Uuid::nil());
     }
 
     #[test]
