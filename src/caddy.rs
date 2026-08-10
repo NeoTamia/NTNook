@@ -4,6 +4,7 @@
 use serde_json::Value;
 use serde_json::json;
 use std::fmt;
+use std::time::Duration;
 use url::Url;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub(crate) enum Error {
         candidates: Vec<String>,
     },
     ForeignHostname(String),
+    MissingEtag,
+    ConcurrentMutation,
 }
 
 impl fmt::Display for Error {
@@ -68,6 +71,14 @@ impl fmt::Display for Error {
             Self::ForeignHostname(hostname) => write!(
                 formatter,
                 "hostname `{hostname}` is already claimed by a foreign Caddy route"
+            ),
+            Self::MissingEtag => write!(
+                formatter,
+                "Caddy response did not include an ETag required for a safe mutation"
+            ),
+            Self::ConcurrentMutation => write!(
+                formatter,
+                "Caddy configuration kept changing after three retries; retry the command"
             ),
         }
     }
@@ -115,6 +126,86 @@ impl Client {
             .read_json()
             .map_err(|error| Error::AdminRequest(error.to_string()))
     }
+
+    pub(crate) fn mutate_server_routes(
+        &self,
+        server: &str,
+        transform: impl FnMut(Vec<Value>) -> Result<Vec<Value>, Error>,
+    ) -> Result<(), Error> {
+        let endpoint = self.server_routes_endpoint(server)?;
+        mutate_with_retry(
+            || {
+                let mut response = ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .ok_or(Error::MissingEtag)?;
+                let routes = response
+                    .body_mut()
+                    .read_json::<Vec<Value>>()
+                    .map_err(|error| Error::AdminRequest(error.to_string()))?;
+                Ok((etag, routes))
+            },
+            |etag, routes| match ureq::put(endpoint.as_str())
+                .header("If-Match", etag)
+                .send_json(routes)
+            {
+                Ok(_) => Ok(WriteOutcome::Applied),
+                Err(ureq::Error::StatusCode(412)) => Ok(WriteOutcome::PreconditionFailed),
+                Err(error) => Err(admin_request(error)),
+            },
+            transform,
+            std::thread::sleep,
+        )
+    }
+
+    fn server_routes_endpoint(&self, server: &str) -> Result<Url, Error> {
+        let mut endpoint = self.admin.clone();
+        endpoint.set_path("");
+        endpoint
+            .path_segments_mut()
+            .map_err(|()| Error::AdminUrl("URL cannot be a base".into()))?
+            .extend(["config", "apps", "http", "servers", server, "routes"]);
+        Ok(endpoint)
+    }
+}
+
+fn admin_request(error: impl fmt::Display) -> Error {
+    Error::AdminRequest(error.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    Applied,
+    PreconditionFailed,
+}
+
+fn mutate_with_retry(
+    mut read: impl FnMut() -> Result<(String, Vec<Value>), Error>,
+    mut write: impl FnMut(&str, &Vec<Value>) -> Result<WriteOutcome, Error>,
+    mut transform: impl FnMut(Vec<Value>) -> Result<Vec<Value>, Error>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), Error> {
+    const DELAYS: [Duration; 3] = [
+        Duration::from_millis(25),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    ];
+    for attempt in 0..=DELAYS.len() {
+        let (etag, current) = read()?;
+        let updated = transform(current)?;
+        if write(&etag, &updated)? == WriteOutcome::Applied {
+            return Ok(());
+        }
+        if let Some(delay) = DELAYS.get(attempt) {
+            sleep(*delay);
+        } else {
+            return Err(Error::ConcurrentMutation);
+        }
+    }
+    unreachable!()
 }
 
 #[derive(Debug, Default)]
@@ -594,5 +685,81 @@ mod tests {
             super::reject_foreign_hostname_claims(&routes, &["foreign.localhost".into()]),
             Err(Error::ForeignHostname("foreign.localhost".into()))
         );
+    }
+
+    #[test]
+    fn retries_re_read_reapply_and_use_exact_bounded_delays() {
+        use std::cell::RefCell;
+        use std::time::Duration;
+
+        let versions = RefCell::new(
+            vec![
+                ("v1".to_owned(), vec![json!({"foreign":1})]),
+                (
+                    "v2".to_owned(),
+                    vec![json!({"foreign":1}), json!({"foreign":2})],
+                ),
+                (
+                    "v3".to_owned(),
+                    vec![json!({"foreign":1}), json!({"foreign":2})],
+                ),
+                (
+                    "v4".to_owned(),
+                    vec![json!({"foreign":1}), json!({"foreign":2})],
+                ),
+            ]
+            .into_iter(),
+        );
+        let writes = RefCell::new(0);
+        let delays = RefCell::new(Vec::new());
+        super::mutate_with_retry(
+            || Ok(versions.borrow_mut().next().unwrap()),
+            |_etag, routes| {
+                assert!(
+                    routes
+                        .iter()
+                        .any(|route| route.get("@id").and_then(serde_json::Value::as_str)
+                            == Some("nook_https_routes_v1"))
+                );
+                let mut writes = writes.borrow_mut();
+                *writes += 1;
+                Ok(if *writes < 4 {
+                    super::WriteOutcome::PreconditionFailed
+                } else {
+                    super::WriteOutcome::Applied
+                })
+            },
+            |mut routes| {
+                super::place_container(
+                    &mut routes,
+                    super::HTTPS_CONTAINER_ID,
+                    Some(json!({"@id":super::HTTPS_CONTAINER_ID})),
+                );
+                Ok(routes)
+            },
+            |delay| delays.borrow_mut().push(delay),
+        )
+        .unwrap();
+        assert_eq!(
+            *delays.borrow(),
+            [
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100)
+            ]
+        );
+    }
+
+    #[test]
+    fn fourth_precondition_failure_is_actionable_error() {
+        let mut delays = Vec::new();
+        let result = super::mutate_with_retry(
+            || Ok(("etag".into(), Vec::new())),
+            |_, _| Ok(super::WriteOutcome::PreconditionFailed),
+            Ok,
+            |delay| delays.push(delay),
+        );
+        assert_eq!(result, Err(Error::ConcurrentMutation));
+        assert_eq!(delays.len(), 3);
     }
 }
