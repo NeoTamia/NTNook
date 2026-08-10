@@ -67,11 +67,11 @@ pub(crate) struct RunArgs {
 #[derive(Debug, Args)]
 pub(crate) struct AliasArgs {
     #[command(subcommand)]
-    command: AliasCommand,
+    pub(crate) command: AliasCommand,
 }
 
 #[derive(Debug, Subcommand)]
-enum AliasCommand {
+pub(crate) enum AliasCommand {
     /// Create or replace a persistent alias.
     Set(AliasSetArgs),
     /// Remove a persistent alias.
@@ -81,9 +81,9 @@ enum AliasCommand {
 }
 
 #[derive(Debug, Args)]
-struct AliasSetArgs {
+pub(crate) struct AliasSetArgs {
     name: String,
-    target: String,
+    pub(crate) target: String,
     #[arg(long)]
     no_tls: bool,
     #[arg(long)]
@@ -93,7 +93,7 @@ struct AliasSetArgs {
 }
 
 #[derive(Debug, Args)]
-struct AliasRemoveArgs {
+pub(crate) struct AliasRemoveArgs {
     name: String,
 }
 
@@ -109,6 +109,12 @@ pub(crate) fn run() -> crate::Result<()> {
     let _global_config = crate::config::load_global()?;
     if let Command::Run(arguments) = &cli.command {
         let _run_config = crate::config::resolve_run(arguments, &std::env::current_dir()?)?;
+    }
+    if let Command::Alias(AliasArgs {
+        command: AliasCommand::Set(arguments),
+    }) = &cli.command
+    {
+        let _upstream = crate::caddy::normalize_upstream(&arguments.target)?;
     }
     let stdout = io::stdout();
     let mut output = stdout.lock();

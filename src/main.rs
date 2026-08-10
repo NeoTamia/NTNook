@@ -20,6 +20,7 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 /// error API outside the binary crate.
 #[derive(Debug)]
 pub(crate) enum Error {
+    Caddy(caddy::Error),
     Cli(clap::Error),
     Config(config::Error),
     Io(io::Error),
@@ -28,6 +29,7 @@ pub(crate) enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Caddy(error) => error.fmt(formatter),
             Self::Cli(error) => error.fmt(formatter),
             Self::Config(error) => error.fmt(formatter),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
@@ -38,6 +40,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Caddy(error) => Some(error),
             Self::Cli(error) => Some(error),
             Self::Config(error) => Some(error),
             Self::Io(error) => Some(error),
@@ -48,12 +51,19 @@ impl std::error::Error for Error {
 impl Error {
     fn exit_code(&self) -> ExitCode {
         match self {
+            Self::Caddy(_) => ExitCode::FAILURE,
             Self::Cli(error) => {
                 u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
             }
             Self::Config(_) => ExitCode::FAILURE,
             Self::Io(_) => ExitCode::FAILURE,
         }
+    }
+}
+
+impl From<caddy::Error> for Error {
+    fn from(error: caddy::Error) -> Self {
+        Self::Caddy(error)
     }
 }
 
