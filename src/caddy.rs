@@ -6,6 +6,7 @@ use serde_json::json;
 use std::fmt;
 use std::time::Duration;
 use url::Url;
+use uuid::Uuid;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -32,6 +33,7 @@ pub(crate) enum Error {
     ForeignHostname(String),
     MissingEtag,
     ConcurrentMutation,
+    InvalidOwnedRoute,
 }
 
 impl fmt::Display for Error {
@@ -79,6 +81,10 @@ impl fmt::Display for Error {
             Self::ConcurrentMutation => write!(
                 formatter,
                 "Caddy configuration kept changing after three retries; retry the command"
+            ),
+            Self::InvalidOwnedRoute => write!(
+                formatter,
+                "Nook route container contains a route without a valid Nook owner marker"
             ),
         }
     }
@@ -371,6 +377,67 @@ pub(crate) fn build_proxy_route(id: &str, hostname: &str, upstream: &Url) -> Val
         }],
         "handle": [proxy]
     })
+}
+
+pub(crate) fn owner_route_id(owner_id: Uuid) -> String {
+    format!("nook_route_v1_{owner_id}")
+}
+
+pub(crate) fn parse_owner_route_id(id: &str) -> Option<Uuid> {
+    Uuid::parse_str(id.strip_prefix("nook_route_v1_")?).ok()
+}
+
+pub(crate) fn update_owned_route(
+    server_routes: &mut Vec<Value>,
+    container_id: &str,
+    owner_id: Uuid,
+    replacement: Option<(String, Value)>,
+) -> Result<(), Error> {
+    let no_tls = container_id == HTTP_CONTAINER_ID;
+    let mut managed = Vec::new();
+    if let Some(container) = server_routes
+        .iter()
+        .find(|route| route.get("@id").and_then(Value::as_str) == Some(container_id))
+    {
+        for route in container
+            .pointer("/handle/0/routes")
+            .and_then(Value::as_array)
+            .ok_or(Error::InvalidOwnedRoute)?
+        {
+            let id = route
+                .get("@id")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidOwnedRoute)?;
+            let existing_owner = parse_owner_route_id(id).ok_or(Error::InvalidOwnedRoute)?;
+            if existing_owner == owner_id {
+                continue;
+            }
+            let hostname = route
+                .pointer("/match/0/host/0")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidOwnedRoute)?
+                .to_owned();
+            managed.push(ManagedRoute {
+                hostname,
+                no_tls,
+                route: route.clone(),
+            });
+        }
+    }
+    if let Some((hostname, route)) = replacement {
+        managed.push(ManagedRoute {
+            hostname,
+            no_tls,
+            route,
+        });
+    }
+    let (https, http) = build_containers(&managed);
+    place_container(
+        server_routes,
+        container_id,
+        if no_tls { http } else { https },
+    );
+    Ok(())
 }
 
 pub(crate) fn reject_foreign_hostname_claims(
@@ -761,5 +828,65 @@ mod tests {
         );
         assert_eq!(result, Err(Error::ConcurrentMutation));
         assert_eq!(delays.len(), 3);
+    }
+
+    #[test]
+    fn owner_marker_round_trips_and_rejects_foreign_ids() {
+        let owner = uuid::Uuid::new_v4();
+        let marker = super::owner_route_id(owner);
+        assert_eq!(super::parse_owner_route_id(&marker), Some(owner));
+        assert_eq!(super::parse_owner_route_id("foreign_route"), None);
+    }
+
+    #[test]
+    fn stale_owner_cleanup_cannot_remove_replacement_route() {
+        let old_owner = uuid::Uuid::new_v4();
+        let new_owner = uuid::Uuid::new_v4();
+        let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
+        let new_route = super::build_proxy_route(
+            &super::owner_route_id(new_owner),
+            "api.localhost",
+            &upstream,
+        );
+        let managed = super::ManagedRoute {
+            hostname: "api.localhost".into(),
+            no_tls: false,
+            route: new_route.clone(),
+        };
+        let (container, _) = super::build_containers(&[managed]);
+        let mut routes = vec![container.unwrap()];
+        super::update_owned_route(&mut routes, super::HTTPS_CONTAINER_ID, old_owner, None).unwrap();
+        assert_eq!(routes[0].pointer("/handle/0/routes/0").unwrap(), &new_route);
+    }
+
+    #[test]
+    fn owned_route_upsert_and_removal_are_idempotent() {
+        let owner = uuid::Uuid::new_v4();
+        let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
+        let route =
+            super::build_proxy_route(&super::owner_route_id(owner), "api.localhost", &upstream);
+        let mut routes = Vec::new();
+        for _ in 0..2 {
+            super::update_owned_route(
+                &mut routes,
+                super::HTTPS_CONTAINER_ID,
+                owner,
+                Some(("api.localhost".into(), route.clone())),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            routes[0]
+                .pointer("/handle/0/routes")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        for _ in 0..2 {
+            super::update_owned_route(&mut routes, super::HTTPS_CONTAINER_ID, owner, None).unwrap();
+        }
+        assert!(routes.is_empty());
     }
 }
