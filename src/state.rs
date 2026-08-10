@@ -76,9 +76,10 @@ impl Registry {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Alias {
+    pub(crate) id: Uuid,
     pub(crate) hostname: String,
     pub(crate) target: String,
     pub(crate) scheme: Scheme,
@@ -86,7 +87,7 @@ pub(crate) struct Alias {
     pub(crate) preserve_host: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Lease {
     pub(crate) id: Uuid,
@@ -120,14 +121,14 @@ pub(crate) struct SelectedServers {
     pub(crate) http: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingOperation {
     pub(crate) id: Uuid,
     pub(crate) kind: PendingOperationKind,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PendingOperationKind {
     InstallRoute { hostname: String, owner_id: Uuid },
@@ -326,6 +327,7 @@ mod tests {
                         registry.aliases.insert(
                             format!("app-{index}"),
                             Alias {
+                                id: Uuid::new_v4(),
                                 hostname: format!("app-{index}.localhost"),
                                 target: format!("http://127.0.0.1:{}", 3000 + index),
                                 scheme: Scheme::Http,
