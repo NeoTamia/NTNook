@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use serde_json::Value;
+use serde_json::json;
 use std::fmt;
 use url::Url;
 
@@ -193,6 +194,67 @@ fn listener_port(listener: &str) -> Option<u16> {
     listener.rsplit(':').next()?.parse().ok()
 }
 
+pub(crate) const HTTPS_CONTAINER_ID: &str = "nook_https_routes_v1";
+pub(crate) const HTTP_CONTAINER_ID: &str = "nook_http_routes_v1";
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedRoute {
+    pub(crate) hostname: String,
+    pub(crate) no_tls: bool,
+    pub(crate) route: Value,
+}
+
+pub(crate) fn build_containers(routes: &[ManagedRoute]) -> (Option<Value>, Option<Value>) {
+    (
+        build_container(
+            HTTPS_CONTAINER_ID,
+            routes.iter().filter(|route| !route.no_tls),
+        ),
+        build_container(
+            HTTP_CONTAINER_ID,
+            routes.iter().filter(|route| route.no_tls),
+        ),
+    )
+}
+
+fn build_container<'a>(id: &str, routes: impl Iterator<Item = &'a ManagedRoute>) -> Option<Value> {
+    let routes: Vec<_> = routes.collect();
+    if routes.is_empty() {
+        return None;
+    }
+    let mut hostnames: Vec<_> = routes.iter().map(|route| route.hostname.clone()).collect();
+    hostnames.sort();
+    hostnames.dedup();
+    let children: Vec<_> = routes
+        .into_iter()
+        .map(|route| route.route.clone())
+        .collect();
+    Some(json!({
+        "@id": id,
+        "match": [{ "host": hostnames }],
+        "handle": [{ "handler": "subroute", "routes": children }]
+    }))
+}
+
+pub(crate) fn place_container(server_routes: &mut Vec<Value>, id: &str, container: Option<Value>) {
+    server_routes.retain(|route| route.get("@id").and_then(Value::as_str) != Some(id));
+    let Some(container) = container else {
+        return;
+    };
+    let insertion = server_routes
+        .iter()
+        .position(is_catch_all)
+        .unwrap_or(server_routes.len());
+    server_routes.insert(insertion, container);
+}
+
+fn is_catch_all(route: &Value) -> bool {
+    route
+        .get("match")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+}
+
 pub(crate) fn normalize_upstream(target: &str) -> Result<Upstream, Error> {
     if target.bytes().all(|byte| byte.is_ascii_digit()) {
         let port: u16 = target.parse().map_err(|_| Error::InvalidPort)?;
@@ -356,5 +418,71 @@ mod tests {
             .unwrap();
         assert!(config.pointer("/apps/http/servers").is_some());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn containers_partition_tls_and_keep_https_hosts_top_level() {
+        let routes = vec![
+            super::ManagedRoute {
+                hostname: "b.localhost".into(),
+                no_tls: false,
+                route: json!({"marker":"https-b"}),
+            },
+            super::ManagedRoute {
+                hostname: "a.localhost".into(),
+                no_tls: false,
+                route: json!({"marker":"https-a"}),
+            },
+            super::ManagedRoute {
+                hostname: "plain.localhost".into(),
+                no_tls: true,
+                route: json!({"marker":"http"}),
+            },
+        ];
+        let (https, http) = super::build_containers(&routes);
+        let https = https.unwrap();
+        assert_eq!(
+            https.pointer("/match/0/host").unwrap(),
+            &json!(["a.localhost", "b.localhost"])
+        );
+        assert_eq!(
+            https
+                .pointer("/handle/0/routes")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let http = http.unwrap();
+        assert_eq!(
+            http.pointer("/match/0/host").unwrap(),
+            &json!(["plain.localhost"])
+        );
+        assert_eq!(http.pointer("/handle/0/routes/0/marker").unwrap(), "http");
+    }
+
+    #[test]
+    fn container_is_repositioned_before_first_catch_all() {
+        let old = json!({"@id": super::HTTPS_CONTAINER_ID, "match":[{"host":["old.localhost"]}]});
+        let foreign = json!({"match":[{"host":["foreign.localhost"]}], "marker":"foreign"});
+        let catch_all = json!({"handle":[], "marker":"catch-all"});
+        let container =
+            json!({"@id": super::HTTPS_CONTAINER_ID, "match":[{"host":["new.localhost"]}]});
+        let mut routes = vec![foreign.clone(), catch_all.clone(), old];
+        super::place_container(
+            &mut routes,
+            super::HTTPS_CONTAINER_ID,
+            Some(container.clone()),
+        );
+        assert_eq!(routes, vec![foreign, container, catch_all]);
+    }
+
+    #[test]
+    fn empty_container_is_removed_without_touching_foreign_routes() {
+        let foreign = json!({"marker":"foreign"});
+        let mut routes = vec![json!({"@id": super::HTTP_CONTAINER_ID}), foreign.clone()];
+        super::place_container(&mut routes, super::HTTP_CONTAINER_ID, None);
+        assert_eq!(routes, vec![foreign]);
     }
 }
