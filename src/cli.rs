@@ -15,13 +15,13 @@ const ACCEPTED: &str = "Command accepted; operational behavior is not implemente
     about = "Expose local services through stable *.localhost domains",
     arg_required_else_help = true
 )]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
-    command: Command,
+    pub(crate) command: Command,
 }
 
 #[derive(Debug, Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Run a command behind a temporary Nook route.
     Run(RunArgs),
     /// Manage persistent aliases.
@@ -37,35 +37,35 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
-struct RunArgs {
+pub(crate) struct RunArgs {
     /// Route name when using `nook run`.
     #[arg(long)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
-    no_tls: bool,
+    pub(crate) no_tls: bool,
     /// Preferred application port.
     #[arg(long, value_name = "PORT")]
-    app_port: Option<u16>,
+    pub(crate) app_port: Option<u16>,
     /// Fail rather than falling back when the preferred port is occupied.
     #[arg(long, requires = "app_port")]
-    strict_port: bool,
+    pub(crate) strict_port: bool,
     /// Replace an existing Nook-owned route.
     #[arg(long)]
     force: bool,
     /// Explicit project configuration file.
     #[arg(long, value_name = "PATH")]
-    config: Option<PathBuf>,
+    pub(crate) config: Option<PathBuf>,
     /// Seconds before warning that the application is not ready.
     #[arg(long, value_name = "SECONDS")]
-    readiness_warn_after: Option<u64>,
+    pub(crate) readiness_warn_after: Option<u64>,
     /// Child argv, preserved exactly and never passed through a shell.
-    #[arg(last = true, required = true, value_name = "COMMAND")]
-    command: Vec<OsString>,
+    #[arg(last = true, value_name = "COMMAND")]
+    pub(crate) command: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
-struct AliasArgs {
+pub(crate) struct AliasArgs {
     #[command(subcommand)]
     command: AliasCommand,
 }
@@ -98,14 +98,18 @@ struct AliasRemoveArgs {
 }
 
 #[derive(Debug, Args)]
-struct StopArgs {
+pub(crate) struct StopArgs {
     name: String,
     #[arg(long)]
     force: bool,
 }
 
 pub(crate) fn run() -> crate::Result<()> {
-    let _cli = parse_from(std::env::args_os())?;
+    let cli = parse_from(std::env::args_os())?;
+    let _global_config = crate::config::load_global()?;
+    if let Command::Run(arguments) = &cli.command {
+        let _run_config = crate::config::resolve_run(arguments, &std::env::current_dir()?)?;
+    }
     let stdout = io::stdout();
     let mut output = stdout.lock();
     output.write_all(ACCEPTED.as_bytes())?;
@@ -271,11 +275,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_child_command_and_strict_port_without_port() {
-        for arguments in [&["run"][..], &["run", "--strict-port", "--", "server"][..]] {
-            let error = try_parse(arguments).expect_err("arguments should be rejected");
-            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-        }
+    fn accepts_a_run_without_cli_command_for_project_configuration() {
+        let cli = parse(&["run"]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(run.command.is_empty());
+    }
+
+    #[test]
+    fn rejects_strict_port_without_a_requested_port() {
+        let error = try_parse(&["run", "--strict-port", "--", "server"])
+            .expect_err("arguments should be rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     fn parse(arguments: &[&str]) -> super::Cli {
