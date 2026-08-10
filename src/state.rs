@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,7 @@ pub(crate) enum Error {
     InvalidJson(serde_json::Error),
     MissingVersion,
     UnsupportedVersion(u64),
+    Io { path: PathBuf, source: io::Error },
 }
 
 impl fmt::Display for Error {
@@ -32,6 +35,9 @@ impl fmt::Display for Error {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported state format_version {version}")
             }
+            Self::Io { path, source } => {
+                write!(formatter, "state I/O error at {}: {source}", path.display())
+            }
         }
     }
 }
@@ -40,6 +46,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidJson(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -145,6 +152,75 @@ pub(crate) fn state_path() -> Result<PathBuf, Error> {
     state_path_with(|key| env::var_os(key))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct Store {
+    path: PathBuf,
+}
+
+impl Store {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub(crate) fn mutate<T>(
+        &self,
+        operation: impl FnOnce(&mut Registry) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let parent = self.path.parent().ok_or_else(|| {
+            io_error(
+                &self.path,
+                io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"),
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+        let lock_path = self.path.with_extension("lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| io_error(&lock_path, source))?;
+        lock.lock().map_err(|source| io_error(&lock_path, source))?;
+
+        let temporary_path = self.path.with_extension("json.tmp");
+        match fs::remove_file(&temporary_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&temporary_path, source)),
+        }
+        let mut registry = match fs::read(&self.path) {
+            Ok(contents) => decode(&contents)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Registry::empty(),
+            Err(source) => return Err(io_error(&self.path, source)),
+        };
+        let result = operation(&mut registry)?;
+        let bytes = serde_json::to_vec_pretty(&registry).map_err(Error::InvalidJson)?;
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|source| io_error(&temporary_path, source))?;
+        temporary
+            .write_all(&bytes)
+            .and_then(|()| temporary.flush())
+            .and_then(|()| temporary.sync_all())
+            .map_err(|source| io_error(&temporary_path, source))?;
+        fs::rename(&temporary_path, &self.path).map_err(|source| io_error(&self.path, source))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error(parent, source))?;
+        Ok(result)
+    }
+}
+
+fn io_error(path: impl Into<PathBuf>, source: io::Error) -> Error {
+    Error::Io {
+        path: path.into(),
+        source,
+    }
+}
+
 fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Error> {
     if let Some(directory) = get("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(directory).join("nook/state.json"));
@@ -159,10 +235,11 @@ fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Er
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, LeaseState, PendingOperation, PendingOperationKind, Registry, decode,
-        state_path_with,
+        Alias, Error, LeaseState, PendingOperation, PendingOperationKind, Registry, Scheme, Store,
+        decode, state_path_with,
     };
     use std::ffi::OsString;
+    use std::fs;
     use std::path::Path;
     use uuid::Uuid;
 
@@ -213,5 +290,68 @@ mod tests {
         ));
         assert!(matches!(decode(b"not json"), Err(Error::InvalidJson(_))));
         assert!(matches!(decode(br#"{"format_version":1,"aliases":{},"leases":{},"selected_servers":{},"last_synchronized_at_unix_ms":null,"pending_operations":[],"surprise":true}"#), Err(Error::InvalidJson(_))));
+    }
+
+    #[test]
+    fn atomic_mutations_recover_stale_temporary_file() {
+        let directory = temporary_directory("recovery");
+        let path = directory.join("state.json");
+        fs::write(path.with_extension("json.tmp"), b"partial").unwrap();
+        let store = Store::new(path.clone());
+        store
+            .mutate(|registry| {
+                registry.last_synchronized_at_unix_ms = Some(42);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            decode(&fs::read(&path).unwrap())
+                .unwrap()
+                .last_synchronized_at_unix_ms,
+            Some(42)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_mutations_do_not_lose_updates() {
+        let directory = temporary_directory("concurrent");
+        let path = directory.join("state.json");
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let store = Store::new(path.clone());
+                std::thread::spawn(move || {
+                    store.mutate(|registry| {
+                        registry.aliases.insert(
+                            format!("app-{index}"),
+                            Alias {
+                                hostname: format!("app-{index}.localhost"),
+                                target: format!("http://127.0.0.1:{}", 3000 + index),
+                                scheme: Scheme::Http,
+                                tls: true,
+                                preserve_host: false,
+                            },
+                        );
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(decode(&fs::read(&path).unwrap()).unwrap().aliases.len(), 8);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn temporary_directory(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nook-state-{label}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
     }
 }
