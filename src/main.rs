@@ -20,12 +20,14 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 /// error API outside the binary crate.
 #[derive(Debug)]
 pub(crate) enum Error {
+    Cli(clap::Error),
     Io(io::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cli(error) => error.fmt(formatter),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
         }
     }
@@ -34,8 +36,26 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Cli(error) => Some(error),
             Self::Io(error) => Some(error),
         }
+    }
+}
+
+impl Error {
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Cli(error) => {
+                u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
+            }
+            Self::Io(_) => ExitCode::FAILURE,
+        }
+    }
+}
+
+impl From<clap::Error> for Error {
+    fn from(error: clap::Error) -> Self {
+        Self::Cli(error)
     }
 }
 
@@ -49,8 +69,8 @@ fn main() -> ExitCode {
     match cli::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("nook: {error}");
-            ExitCode::FAILURE
+            eprint!("{error}");
+            error.exit_code()
         }
     }
 }
