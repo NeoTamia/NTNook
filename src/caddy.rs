@@ -28,6 +28,7 @@ pub(crate) enum Error {
         name: String,
         candidates: Vec<String>,
     },
+    ForeignHostname(String),
 }
 
 impl fmt::Display for Error {
@@ -63,6 +64,10 @@ impl fmt::Display for Error {
                 formatter,
                 "configured {kind} server `{name}` is not compatible; detected: {}",
                 display_candidates(candidates)
+            ),
+            Self::ForeignHostname(hostname) => write!(
+                formatter,
+                "hostname `{hostname}` is already claimed by a foreign Caddy route"
             ),
         }
     }
@@ -253,6 +258,71 @@ fn is_catch_all(route: &Value) -> bool {
         .get("match")
         .and_then(Value::as_array)
         .is_none_or(Vec::is_empty)
+}
+
+pub(crate) fn build_proxy_route(id: &str, hostname: &str, upstream: &Url) -> Value {
+    let host = upstream.host_str().expect("validated upstream has a host");
+    let port = upstream
+        .port_or_known_default()
+        .expect("HTTP(S) has a default port");
+    let mut proxy = json!({
+        "handler": "reverse_proxy",
+        "upstreams": [{ "dial": format!("{host}:{port}") }]
+    });
+    if upstream.scheme() == "https" {
+        proxy["transport"] = json!({ "protocol": "http", "tls": {} });
+    }
+    json!({
+        "@id": id,
+        "match": [{
+            "host": [hostname],
+            "remote_ip": { "ranges": ["127.0.0.0/8", "::1"] }
+        }],
+        "handle": [proxy]
+    })
+}
+
+pub(crate) fn reject_foreign_hostname_claims(
+    server_routes: &[Value],
+    hostnames: &[String],
+) -> Result<(), Error> {
+    for route in server_routes {
+        if matches!(
+            route.get("@id").and_then(Value::as_str),
+            Some(HTTPS_CONTAINER_ID | HTTP_CONTAINER_ID)
+        ) {
+            continue;
+        }
+        for hostname in hostnames {
+            if value_claims_hostname(route, hostname) {
+                return Err(Error::ForeignHostname(hostname.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn value_claims_hostname(value: &Value, hostname: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("host")
+                .and_then(Value::as_array)
+                .is_some_and(|hosts| {
+                    hosts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|host| host.eq_ignore_ascii_case(hostname))
+                })
+                || object
+                    .values()
+                    .any(|child| value_claims_hostname(child, hostname))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|child| value_claims_hostname(child, hostname)),
+        _ => false,
+    }
 }
 
 pub(crate) fn normalize_upstream(target: &str) -> Result<Upstream, Error> {
@@ -484,5 +554,45 @@ mod tests {
         let mut routes = vec![json!({"@id": super::HTTP_CONTAINER_ID}), foreign.clone()];
         super::place_container(&mut routes, super::HTTP_CONTAINER_ID, None);
         assert_eq!(routes, vec![foreign]);
+    }
+
+    #[test]
+    fn proxy_route_combines_host_and_loopback_in_one_matcher() {
+        let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
+        let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream);
+        assert_eq!(
+            route.pointer("/match/0/host").unwrap(),
+            &json!(["api.localhost"])
+        );
+        assert_eq!(
+            route.pointer("/match/0/remote_ip/ranges").unwrap(),
+            &json!(["127.0.0.0/8", "::1"])
+        );
+    }
+
+    #[test]
+    fn https_proxy_enables_tls_without_disabling_verification() {
+        let upstream = url::Url::parse("https://example.com").unwrap();
+        let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream);
+        assert_eq!(
+            route.pointer("/handle/0/transport/tls").unwrap(),
+            &json!({})
+        );
+        assert!(route.to_string().find("insecure").is_none());
+    }
+
+    #[test]
+    fn foreign_claim_is_rejected_but_nook_container_is_ignored() {
+        let routes = vec![
+            json!({"@id": super::HTTPS_CONTAINER_ID, "match":[{"host":["owned.localhost"]}]}),
+            json!({"handle":[{"handler":"subroute","routes":[{"match":[{"host":["foreign.localhost"]}]}]}]}),
+        ];
+        assert!(
+            super::reject_foreign_hostname_claims(&routes, &["owned.localhost".into()]).is_ok()
+        );
+        assert_eq!(
+            super::reject_foreign_hostname_claims(&routes, &["foreign.localhost".into()]),
+            Err(Error::ForeignHostname("foreign.localhost".into()))
+        );
     }
 }
