@@ -7,6 +7,12 @@ use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use crate::state::Lease;
 
@@ -28,6 +34,9 @@ pub(crate) enum Error {
     InvalidPort,
     PortInUse(u16),
     Bind(io::Error),
+    EmptyCommand,
+    Spawn(io::Error),
+    ProcessIdentity(u32),
 }
 
 impl fmt::Display for Error {
@@ -39,6 +48,11 @@ impl fmt::Display for Error {
                 "requested application port {port} is already in use"
             ),
             Self::Bind(error) => write!(formatter, "cannot reserve a loopback port: {error}"),
+            Self::EmptyCommand => write!(formatter, "child command argv cannot be empty"),
+            Self::Spawn(error) => write!(formatter, "cannot launch child process: {error}"),
+            Self::ProcessIdentity(pid) => {
+                write!(formatter, "cannot read identity of child process {pid}")
+            }
         }
     }
 }
@@ -46,10 +60,104 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Bind(error) => Some(error),
+            Self::Bind(error) | Self::Spawn(error) => Some(error),
             _ => None,
         }
     }
+}
+
+pub(crate) struct ManagedChild {
+    child: Child,
+    pub(crate) pid: u32,
+    pub(crate) pgid: i32,
+    pub(crate) start_time_ticks: u64,
+}
+
+impl ManagedChild {
+    pub(crate) fn signal_group(&self, signal: i32) -> Result<(), Error> {
+        send_group_signal(self.pgid, signal).map_err(Error::Spawn)
+    }
+
+    pub(crate) fn wait(&mut self) -> Result<i32, Error> {
+        let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(Error::Spawn)?;
+        let handle = signals.handle();
+        let pgid = self.pgid;
+        let forwarder = thread::spawn(move || {
+            for signal in signals.forever() {
+                let _ = send_group_signal(pgid, signal);
+            }
+        });
+        let status = self.child.wait().map_err(Error::Spawn)?;
+        handle.close();
+        let _ = forwarder.join();
+        Ok(status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+    }
+}
+
+pub(crate) fn spawn_child(
+    argv: &[OsString],
+    environment: &[(OsString, OsString)],
+) -> Result<ManagedChild, Error> {
+    let (program, arguments) = argv.split_first().ok_or(Error::EmptyCommand)?;
+    let mut command = Command::new(program);
+    command.args(arguments).envs(environment.iter().cloned());
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    configure_linux_child(&mut command);
+    let mut child = command.spawn().map_err(Error::Spawn)?;
+    let pid = child.id();
+    let Some(identity) = read_proc_identity(pid) else {
+        let _ = send_group_signal(pid as i32, libc::SIGKILL);
+        let _ = child.wait();
+        return Err(Error::ProcessIdentity(pid));
+    };
+    Ok(ManagedChild {
+        child,
+        pid,
+        pgid: identity.pgid,
+        start_time_ticks: identity.start_time_ticks,
+    })
+}
+
+#[allow(unsafe_code)]
+fn configure_linux_child(command: &mut Command) {
+    // SAFETY: this closure runs after fork and before exec. It only invokes
+    // async-signal-safe libc syscalls and constructs errors from errno.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                libc::raise(libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[allow(unsafe_code)]
+fn send_group_signal(pgid: i32, signal: i32) -> io::Result<()> {
+    // SAFETY: pgid is read from /proc for the spawned child and negating it
+    // asks kill(2) to target exactly that process group.
+    if unsafe { libc::kill(-pgid, signal) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn read_proc_identity(pid: u32) -> Option<ProcIdentity> {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_stat(&stat))
 }
 
 pub(crate) struct PortReservation {
@@ -185,7 +293,8 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::{
-        Error, ProcIdentity, child_environment, parse_stat, reserve_port, substitute_port,
+        Error, ProcIdentity, child_environment, parse_stat, reserve_port, spawn_child,
+        substitute_port,
     };
 
     #[test]
@@ -269,5 +378,29 @@ mod tests {
                 OsString::from("https://api.localhost")
             )
         );
+    }
+
+    #[test]
+    fn child_runs_in_its_own_group_and_returns_its_exit_code() {
+        let mut child = spawn_child(
+            &[
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("sleep 0.05; exit 7"),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(child.pgid, child.pid as i32);
+        assert!(child.start_time_ticks > 0);
+        assert_eq!(child.wait().unwrap(), 7);
+    }
+
+    #[test]
+    fn group_signal_returns_conventional_signal_exit_code() {
+        let mut child =
+            spawn_child(&[OsString::from("/bin/sleep"), OsString::from("10")], &[]).unwrap();
+        child.signal_group(libc::SIGTERM).unwrap();
+        assert_eq!(child.wait().unwrap(), 128 + libc::SIGTERM);
     }
 }
