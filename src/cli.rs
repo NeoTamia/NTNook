@@ -52,7 +52,7 @@ pub(crate) struct RunArgs {
     pub(crate) strict_port: bool,
     /// Replace an existing Nook-owned route.
     #[arg(long)]
-    force: bool,
+    pub(crate) force: bool,
     /// Explicit project configuration file.
     #[arg(long, value_name = "PATH")]
     pub(crate) config: Option<PathBuf>,

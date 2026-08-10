@@ -16,6 +16,7 @@ pub(crate) struct RouteSpec {
     pub(crate) target: String,
     pub(crate) scheme: Scheme,
     pub(crate) tls: bool,
+    pub(crate) replace_existing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +188,7 @@ fn route_for_lease(lease: &Lease) -> RouteSpec {
         target: lease.target.clone(),
         scheme: lease.scheme,
         tls: lease.tls,
+        replace_existing: false,
     }
 }
 
@@ -197,6 +199,7 @@ fn route_for_alias(alias: &Alias) -> RouteSpec {
         target: alias.target.clone(),
         scheme: alias.scheme,
         tls: alias.tls,
+        replace_existing: false,
     }
 }
 

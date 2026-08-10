@@ -113,6 +113,7 @@ pub(crate) enum RunError {
     State(crate::state::Error),
     Route(RouteError),
     Process(Error),
+    Conflict(String),
 }
 
 impl fmt::Display for RunError {
@@ -121,6 +122,10 @@ impl fmt::Display for RunError {
             Self::State(error) => error.fmt(formatter),
             Self::Route(error) => error.fmt(formatter),
             Self::Process(error) => error.fmt(formatter),
+            Self::Conflict(hostname) => write!(
+                formatter,
+                "hostname `{hostname}` is already managed by Nook; use --force to replace it"
+            ),
         }
     }
 }
@@ -168,6 +173,22 @@ fn start_run_with_hook(
     after_release: impl FnOnce(u16),
 ) -> Result<RunningChild, RunError> {
     let _operations = store.lock_operations()?;
+    let conflicts = store.mutate(|registry| {
+        let aliases = registry
+            .aliases
+            .values()
+            .filter(|alias| alias.hostname == config.hostname)
+            .map(|alias| (alias.id, alias.tls));
+        let leases = registry
+            .leases
+            .values()
+            .filter(|lease| lease.hostname == config.hostname)
+            .map(|lease| (lease.id, lease.tls));
+        Ok(aliases.chain(leases).collect::<Vec<_>>())
+    })?;
+    if !conflicts.is_empty() && !config.force {
+        return Err(RunError::Conflict(config.hostname.clone()));
+    }
     let reservation = reserve_port(config.app_port, config.strict_port)?;
     let port = reservation.port;
     let owner_id = Uuid::new_v4();
@@ -179,6 +200,7 @@ fn start_run_with_hook(
         target: target.clone(),
         scheme: Scheme::Http,
         tls: config.tls,
+        replace_existing: config.force,
     };
     store.mutate(|registry| {
         registry.pending_operations.push(PendingOperation {
@@ -194,7 +216,38 @@ fn start_run_with_hook(
         Ok(())
     })?;
     routes.ensure(&route)?;
+    let cleanup_results: Vec<_> = conflicts
+        .iter()
+        .map(|(id, tls)| {
+            (
+                *id,
+                *tls,
+                routes.remove_if_owned(&config.hostname, *id, *tls),
+            )
+        })
+        .collect();
     store.mutate(|registry| {
+        let replaced_ids: std::collections::BTreeSet<_> =
+            conflicts.iter().map(|(id, _)| *id).collect();
+        registry
+            .aliases
+            .retain(|_, alias| !replaced_ids.contains(&alias.id));
+        registry.leases.retain(|id, _| !replaced_ids.contains(id));
+        registry.pending_operations.retain(|operation| {
+            pending_owner(&operation.kind).is_none_or(|id| !replaced_ids.contains(&id))
+        });
+        for (owner_id, tls, result) in &cleanup_results {
+            if result.is_err() {
+                registry.pending_operations.push(PendingOperation {
+                    id: Uuid::new_v4(),
+                    kind: PendingOperationKind::RemoveRoute {
+                        hostname: config.hostname.clone(),
+                        owner_id: *owner_id,
+                        tls: *tls,
+                    },
+                });
+            }
+        }
         replace_operation(
             registry,
             operation_id,
@@ -211,7 +264,19 @@ fn start_run_with_hook(
 
     let argv = substitute_port(&config.command, port);
     let environment = child_environment(port, &config.hostname, config.tls);
-    let warning = reservation.warning.clone();
+    let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
+    if !conflicts.is_empty() {
+        warnings.push(format!(
+            "replaced existing Nook route for {}; the previous owner is no longer managed",
+            config.hostname
+        ));
+    }
+    for (_, _, result) in &cleanup_results {
+        if let Err(error) = result {
+            warnings.push(format!("cleanup of the previous route is pending: {error}"));
+        }
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     reservation.release();
     after_release(port);
     let child = match spawn_child(&argv, &environment) {
@@ -266,6 +331,16 @@ fn start_run_with_hook(
         tls: config.tls,
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
     })
+}
+
+fn pending_owner(kind: &PendingOperationKind) -> Option<Uuid> {
+    match kind {
+        PendingOperationKind::InstallRoute { owner_id, .. }
+        | PendingOperationKind::RestoreRoute { owner_id, .. }
+        | PendingOperationKind::RemoveRoute { owner_id, .. }
+        | PendingOperationKind::StartProcess { owner_id, .. } => Some(*owner_id),
+        PendingOperationKind::FinalizeLease { lease_id } => Some(*lease_id),
+    }
 }
 
 impl RunningChild {
@@ -652,10 +727,14 @@ mod tests {
     struct Routes {
         owners: BTreeMap<String, Uuid>,
         unavailable_on_remove: bool,
+        foreign: bool,
     }
 
     impl RouteBackend for Routes {
         fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
+            if self.foreign {
+                return Err(RouteError("foreign route".into()));
+            }
             self.owners.insert(route.hostname.clone(), route.owner_id);
             Ok(())
         }
@@ -841,6 +920,77 @@ mod tests {
     }
 
     #[test]
+    fn existing_managed_hostname_requires_force() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let config = run_config(vec!["/bin/sleep", "10"], 30);
+        let mut first = start_run(&config, &store, &mut routes).unwrap();
+        assert!(matches!(
+            start_run(&config, &store, &mut routes),
+            Err(super::RunError::Conflict(hostname)) if hostname == "api.localhost"
+        ));
+        first.child.signal_group(libc::SIGTERM).unwrap();
+        first.finish(&store, &mut routes).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn force_transfers_ownership_without_stopping_previous_run() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let mut first = start_run(
+            &run_config(vec!["/bin/sleep", "10"], 30),
+            &store,
+            &mut routes,
+        )
+        .unwrap();
+        let mut replacement_config = run_config(vec!["/bin/sleep", "10"], 30);
+        replacement_config.force = true;
+        let mut replacement = start_run(&replacement_config, &store, &mut routes).unwrap();
+        assert!(
+            replacement
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("previous owner")
+        );
+        assert_eq!(routes.owners["api.localhost"], replacement.lease_id);
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!registry.leases.contains_key(&first.lease_id));
+        assert!(registry.leases.contains_key(&replacement.lease_id));
+
+        first.child.signal_group(libc::SIGTERM).unwrap();
+        first.finish(&store, &mut routes).unwrap();
+        assert_eq!(routes.owners["api.localhost"], replacement.lease_id);
+        assert!(
+            decode(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .leases
+                .contains_key(&replacement.lease_id)
+        );
+        replacement.child.signal_group(libc::SIGTERM).unwrap();
+        replacement.finish(&store, &mut routes).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn force_never_bypasses_a_foreign_route_rejection() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes {
+            foreign: true,
+            ..Routes::default()
+        };
+        let mut config = run_config(vec!["/bin/sleep", "10"], 30);
+        config.force = true;
+        assert!(matches!(
+            start_run(&config, &store, &mut routes),
+            Err(super::RunError::Route(_))
+        ));
+        assert!(routes.owners.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn readiness_warns_once_but_waits_until_child_exits() {
         let (store, path) = temporary_store();
         let config = run_config(vec!["/bin/sleep", "0.2"], 0);
@@ -989,6 +1139,7 @@ mod tests {
             tls: true,
             app_port: None,
             strict_port: false,
+            force: false,
             readiness_warn_after_seconds: readiness,
         }
     }

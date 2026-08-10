@@ -33,6 +33,7 @@ pub(crate) enum Error {
         candidates: Vec<String>,
     },
     ForeignHostname(String),
+    ManagedHostname(String),
     MissingEtag,
     ConcurrentMutation,
     InvalidOwnedRoute,
@@ -76,6 +77,10 @@ impl fmt::Display for Error {
             Self::ForeignHostname(hostname) => write!(
                 formatter,
                 "hostname `{hostname}` is already claimed by a foreign Caddy route"
+            ),
+            Self::ManagedHostname(hostname) => write!(
+                formatter,
+                "hostname `{hostname}` is already managed by Nook; use --force to replace it"
             ),
             Self::MissingEtag => write!(
                 formatter,
@@ -215,6 +220,13 @@ impl RouteBackend for ManagedCaddyRoutes<'_> {
         self.client
             .mutate_server_routes(server, move |mut routes| {
                 reject_foreign_hostname_claims(&routes, std::slice::from_ref(&hostname))?;
+                reject_managed_hostname_claim(
+                    &routes,
+                    container_id,
+                    &hostname,
+                    owner_id,
+                    route.replace_existing,
+                )?;
                 update_owned_route(
                     &mut routes,
                     container_id,
@@ -462,6 +474,7 @@ pub(crate) fn update_owned_route(
     replacement: Option<(String, Value)>,
 ) -> Result<(), Error> {
     let no_tls = container_id == HTTP_CONTAINER_ID;
+    let replacement_hostname = replacement.as_ref().map(|(hostname, _)| hostname.as_str());
     let mut managed = Vec::new();
     if let Some(container) = server_routes
         .iter()
@@ -485,6 +498,9 @@ pub(crate) fn update_owned_route(
                 .and_then(Value::as_str)
                 .ok_or(Error::InvalidOwnedRoute)?
                 .to_owned();
+            if replacement_hostname == Some(hostname.as_str()) {
+                continue;
+            }
             managed.push(ManagedRoute {
                 hostname,
                 no_tls,
@@ -505,6 +521,40 @@ pub(crate) fn update_owned_route(
         container_id,
         if no_tls { http } else { https },
     );
+    Ok(())
+}
+
+fn reject_managed_hostname_claim(
+    server_routes: &[Value],
+    container_id: &str,
+    hostname: &str,
+    owner_id: Uuid,
+    replace_existing: bool,
+) -> Result<(), Error> {
+    let Some(container) = server_routes
+        .iter()
+        .find(|route| route.get("@id").and_then(Value::as_str) == Some(container_id))
+    else {
+        return Ok(());
+    };
+    for route in container
+        .pointer("/handle/0/routes")
+        .and_then(Value::as_array)
+        .ok_or(Error::InvalidOwnedRoute)?
+    {
+        let existing_hostname = route
+            .pointer("/match/0/host/0")
+            .and_then(Value::as_str)
+            .ok_or(Error::InvalidOwnedRoute)?;
+        let existing_owner = route
+            .get("@id")
+            .and_then(Value::as_str)
+            .and_then(parse_owner_route_id)
+            .ok_or(Error::InvalidOwnedRoute)?;
+        if existing_hostname == hostname && existing_owner != owner_id && !replace_existing {
+            return Err(Error::ManagedHostname(hostname.to_owned()));
+        }
+    }
     Ok(())
 }
 
@@ -928,6 +978,44 @@ mod tests {
     }
 
     #[test]
+    fn managed_hostname_replacement_requires_explicit_force() {
+        let old_owner = uuid::Uuid::new_v4();
+        let new_owner = uuid::Uuid::new_v4();
+        let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
+        let old_route = super::build_proxy_route(
+            &super::owner_route_id(old_owner),
+            "api.localhost",
+            &upstream,
+        );
+        let (container, _) = super::build_containers(&[super::ManagedRoute {
+            hostname: "api.localhost".into(),
+            no_tls: false,
+            route: old_route,
+        }]);
+        let routes = vec![container.unwrap()];
+        assert_eq!(
+            super::reject_managed_hostname_claim(
+                &routes,
+                super::HTTPS_CONTAINER_ID,
+                "api.localhost",
+                new_owner,
+                false,
+            ),
+            Err(Error::ManagedHostname("api.localhost".into()))
+        );
+        assert!(
+            super::reject_managed_hostname_claim(
+                &routes,
+                super::HTTPS_CONTAINER_ID,
+                "api.localhost",
+                new_owner,
+                true,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn owned_route_upsert_and_removal_are_idempotent() {
         let owner = uuid::Uuid::new_v4();
         let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
@@ -1004,6 +1092,7 @@ mod tests {
                 target: "http://127.0.0.1:3000".into(),
                 scheme: Scheme::Http,
                 tls: true,
+                replace_existing: false,
             })
             .unwrap();
         server.join().unwrap();

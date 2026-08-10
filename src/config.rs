@@ -122,6 +122,7 @@ pub(crate) struct ResolvedRunConfig {
     pub(crate) tls: bool,
     pub(crate) app_port: Option<u16>,
     pub(crate) strict_port: bool,
+    pub(crate) force: bool,
     pub(crate) readiness_warn_after_seconds: u64,
 }
 
@@ -203,6 +204,7 @@ fn merge_run(
         },
         app_port: arguments.app_port.or(project.app_port),
         strict_port: arguments.strict_port || project.strict_port.unwrap_or(false),
+        force: arguments.force,
         readiness_warn_after_seconds: arguments
             .readiness_warn_after
             .or(project.readiness_warn_after_seconds)
@@ -393,6 +395,7 @@ mod tests {
             "--app-port",
             "9000",
             "--strict-port",
+            "--force",
             "--readiness-warn-after",
             "5",
             "--",
@@ -410,6 +413,7 @@ mod tests {
         assert!(!resolved.tls);
         assert_eq!(resolved.app_port, Some(9000));
         assert!(resolved.strict_port);
+        assert!(resolved.force);
         assert_eq!(resolved.readiness_warn_after_seconds, 5);
     }
 
@@ -427,6 +431,7 @@ mod tests {
         assert!(resolved.tls);
         assert_eq!(resolved.app_port, Some(8000));
         assert!(!resolved.strict_port);
+        assert!(!resolved.force);
         assert_eq!(resolved.readiness_warn_after_seconds, 20);
     }
 
