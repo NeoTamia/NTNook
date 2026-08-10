@@ -103,17 +103,28 @@ fn retry_pending(
     let pending = std::mem::take(&mut registry.pending_operations);
     for operation in pending {
         let result = match &operation.kind {
-            PendingOperationKind::InstallRoute {
+            PendingOperationKind::RestoreRoute {
                 hostname, owner_id, ..
             } => current_route(registry, hostname, *owner_id)
                 .map_or(Ok(()), |route| routes.ensure(&route)),
+            PendingOperationKind::InstallRoute {
+                hostname,
+                owner_id,
+                tls,
+                ..
+            }
+            | PendingOperationKind::StartProcess {
+                hostname,
+                owner_id,
+                tls,
+                ..
+            } => routes.remove_if_owned(hostname, *owner_id, *tls),
             PendingOperationKind::RemoveRoute {
                 hostname,
                 owner_id,
                 tls,
             } => routes.remove_if_owned(hostname, *owner_id, *tls),
-            PendingOperationKind::StartProcess { lease_id }
-            | PendingOperationKind::FinalizeLease { lease_id } => {
+            PendingOperationKind::FinalizeLease { lease_id } => {
                 match registry.leases.get(lease_id) {
                     Some(lease) if liveness(lease) == Liveness::Indeterminate => {
                         registry.pending_operations.push(operation);
@@ -145,7 +156,7 @@ fn restore(
     match routes.ensure(&route) {
         Ok(()) => report.restored += 1,
         Err(error) => {
-            queue_install(registry, &route.hostname, route.owner_id, route.tls);
+            queue_restore(registry, &route);
             report.warnings.push(format!(
                 "restoration of {} is pending: {error}",
                 route.hostname
@@ -189,13 +200,15 @@ fn route_for_alias(alias: &Alias) -> RouteSpec {
     }
 }
 
-fn queue_install(registry: &mut Registry, hostname: &str, owner_id: Uuid, tls: bool) {
+fn queue_restore(registry: &mut Registry, route: &RouteSpec) {
     registry.pending_operations.push(PendingOperation {
         id: Uuid::new_v4(),
-        kind: PendingOperationKind::InstallRoute {
-            hostname: hostname.to_owned(),
-            owner_id,
-            tls,
+        kind: PendingOperationKind::RestoreRoute {
+            hostname: route.hostname.clone(),
+            target: route.target.clone(),
+            scheme: route.scheme,
+            owner_id: route.owner_id,
+            tls: route.tls,
         },
     });
 }
@@ -219,15 +232,25 @@ fn deduplicate_pending(registry: &mut Registry) {
                 hostname,
                 owner_id,
                 tls,
+                ..
             } => ("install", hostname.clone(), *owner_id, *tls),
+            PendingOperationKind::RestoreRoute {
+                hostname,
+                owner_id,
+                tls,
+                ..
+            } => ("restore", hostname.clone(), *owner_id, *tls),
             PendingOperationKind::RemoveRoute {
                 hostname,
                 owner_id,
                 tls,
             } => ("remove", hostname.clone(), *owner_id, *tls),
-            PendingOperationKind::StartProcess { lease_id } => {
-                ("start", String::new(), *lease_id, false)
-            }
+            PendingOperationKind::StartProcess {
+                hostname,
+                owner_id,
+                tls,
+                ..
+            } => ("start", hostname.clone(), *owner_id, *tls),
             PendingOperationKind::FinalizeLease { lease_id } => {
                 ("finalize", String::new(), *lease_id, false)
             }

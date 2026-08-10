@@ -137,6 +137,16 @@ pub(crate) struct PendingOperation {
 pub(crate) enum PendingOperationKind {
     InstallRoute {
         hostname: String,
+        target: String,
+        scheme: Scheme,
+        owner_id: Uuid,
+        #[serde(default = "default_true")]
+        tls: bool,
+    },
+    RestoreRoute {
+        hostname: String,
+        target: String,
+        scheme: Scheme,
         owner_id: Uuid,
         #[serde(default = "default_true")]
         tls: bool,
@@ -148,7 +158,12 @@ pub(crate) enum PendingOperationKind {
         tls: bool,
     },
     StartProcess {
-        lease_id: Uuid,
+        hostname: String,
+        target: String,
+        scheme: Scheme,
+        owner_id: Uuid,
+        #[serde(default = "default_true")]
+        tls: bool,
     },
     FinalizeLease {
         lease_id: Uuid,
