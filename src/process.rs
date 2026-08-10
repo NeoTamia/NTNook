@@ -149,6 +149,7 @@ pub(crate) struct RunningChild {
     pub(crate) hostname: String,
     pub(crate) port: u16,
     pub(crate) warning: Option<String>,
+    tls: bool,
     readiness_warn_after: Duration,
 }
 
@@ -156,6 +157,15 @@ pub(crate) fn start_run(
     config: &ResolvedRunConfig,
     store: &Store,
     routes: &mut impl RouteBackend,
+) -> Result<RunningChild, RunError> {
+    start_run_with_hook(config, store, routes, |_| {})
+}
+
+fn start_run_with_hook(
+    config: &ResolvedRunConfig,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    after_release: impl FnOnce(u16),
 ) -> Result<RunningChild, RunError> {
     let _operations = store.lock_operations()?;
     let reservation = reserve_port(config.app_port, config.strict_port)?;
@@ -203,6 +213,7 @@ pub(crate) fn start_run(
     let environment = child_environment(port, &config.hostname, config.tls);
     let warning = reservation.warning.clone();
     reservation.release();
+    after_release(port);
     let child = match spawn_child(&argv, &environment) {
         Ok(child) => child,
         Err(error) => {
@@ -252,6 +263,7 @@ pub(crate) fn start_run(
         hostname: config.hostname.clone(),
         port,
         warning,
+        tls: config.tls,
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
     })
 }
@@ -292,6 +304,132 @@ impl RunningChild {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    pub(crate) fn finish(
+        &mut self,
+        store: &Store,
+        routes: &mut impl RouteBackend,
+    ) -> Result<RunOutcome, RunError> {
+        let exit_code = self.child.wait()?;
+        let _operations = store.lock_operations()?;
+        let cleanup = routes.remove_if_owned(&self.hostname, self.lease_id, self.tls);
+        let mut warnings = Vec::new();
+        store.mutate(|registry| {
+            registry.leases.remove(&self.lease_id);
+            if let Err(error) = &cleanup {
+                registry.pending_operations.push(PendingOperation {
+                    id: Uuid::new_v4(),
+                    kind: PendingOperationKind::RemoveRoute {
+                        hostname: self.hostname.clone(),
+                        owner_id: self.lease_id,
+                        tls: self.tls,
+                    },
+                });
+                warnings.push(format!("cleanup of {} is pending: {error}", self.hostname));
+            }
+            Ok(())
+        })?;
+        Ok(RunOutcome {
+            exit_code,
+            warnings,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RunOutcome {
+    pub(crate) exit_code: i32,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopError {
+    State(String),
+    NotManaged(String),
+    Stale(String),
+    Signal(String),
+}
+
+impl fmt::Display for StopError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(error) => write!(formatter, "cannot read managed runs: {error}"),
+            Self::NotManaged(hostname) => {
+                write!(formatter, "no managed run exists for `{hostname}`")
+            }
+            Self::Stale(hostname) => write!(
+                formatter,
+                "managed run `{hostname}` is no longer the same process"
+            ),
+            Self::Signal(error) => {
+                write!(formatter, "cannot signal managed process group: {error}")
+            }
+        }
+    }
+}
+
+pub(crate) trait StopSystem {
+    fn liveness(&mut self, lease: &Lease) -> Liveness;
+    fn signal(&mut self, pgid: i32, signal: i32) -> io::Result<()>;
+    fn sleep(&mut self, duration: Duration);
+}
+
+pub(crate) struct LinuxStopSystem;
+
+impl StopSystem for LinuxStopSystem {
+    fn liveness(&mut self, lease: &Lease) -> Liveness {
+        lease_liveness(lease)
+    }
+    fn signal(&mut self, pgid: i32, signal: i32) -> io::Result<()> {
+        send_group_signal(pgid, signal)
+    }
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+pub(crate) fn stop_managed(
+    store: &Store,
+    hostname: &str,
+    force: bool,
+    system: &mut impl StopSystem,
+) -> Result<(), StopError> {
+    let _operations = store
+        .lock_operations()
+        .map_err(|error| StopError::State(error.to_string()))?;
+    let lease = store
+        .mutate(|registry| {
+            Ok(registry
+                .leases
+                .values()
+                .find(|lease| lease.hostname == hostname)
+                .cloned())
+        })
+        .map_err(|error: crate::state::Error| StopError::State(error.to_string()))?;
+    let lease = lease
+        .as_ref()
+        .ok_or_else(|| StopError::NotManaged(hostname.to_owned()))?;
+    if system.liveness(lease) != Liveness::Alive {
+        return Err(StopError::Stale(hostname.to_owned()));
+    }
+    system
+        .signal(lease.pgid, libc::SIGTERM)
+        .map_err(|error| StopError::Signal(error.to_string()))?;
+    if !force {
+        return Ok(());
+    }
+    for _ in 0..40 {
+        if system.liveness(lease) != Liveness::Alive {
+            return Ok(());
+        }
+        system.sleep(Duration::from_millis(50));
+    }
+    if system.liveness(lease) == Liveness::Alive {
+        system
+            .signal(lease.pgid, libc::SIGKILL)
+            .map_err(|error| StopError::Signal(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn replace_operation(registry: &mut crate::state::Registry, id: Uuid, kind: PendingOperationKind) {
@@ -502,8 +640,8 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::{
-        Error, ProcIdentity, child_environment, parse_stat, reserve_port, spawn_child, start_run,
-        substitute_port,
+        Error, Liveness, ProcIdentity, StopError, StopSystem, child_environment, parse_stat,
+        reserve_port, spawn_child, start_run, start_run_with_hook, stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -659,7 +797,14 @@ mod tests {
         assert_eq!(routes.owners.get("api.localhost"), Some(&running.lease_id));
         assert!(registry.pending_operations.is_empty());
         running.child.signal_group(libc::SIGTERM).unwrap();
-        assert_eq!(running.child.wait().unwrap(), 143);
+        assert_eq!(running.finish(&store, &mut routes).unwrap().exit_code, 143);
+        assert!(
+            decode(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .leases
+                .is_empty()
+        );
+        assert!(routes.owners.is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -708,6 +853,132 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(warnings, 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn caddy_cleanup_failure_preserves_exit_code_and_persists_retry() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sh", "-c", "exit 7"], 30);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        routes.unavailable_on_remove = true;
+        let outcome = running.finish(&store, &mut routes).unwrap();
+        assert_eq!(outcome.exit_code, 7);
+        assert_eq!(outcome.warnings.len(), 1);
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(registry.leases.is_empty());
+        assert_eq!(registry.pending_operations.len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn successful_cleanup_is_idempotent() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sh", "-c", "exit 0"], 30);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        assert_eq!(running.finish(&store, &mut routes).unwrap().exit_code, 0);
+        assert_eq!(running.finish(&store, &mut routes).unwrap().exit_code, 0);
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(registry.leases.is_empty());
+        assert!(registry.pending_operations.is_empty());
+        assert!(routes.owners.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn lost_port_race_does_not_restart_or_leave_route_or_lease() {
+        use std::cell::RefCell;
+        let (store, path) = temporary_store();
+        let code =
+            "import os,socket;s=socket.socket();s.bind(('127.0.0.1',int(os.environ['PORT'])))";
+        let config = run_config(vec!["/usr/bin/python3", "-c", code], 30);
+        let stolen = RefCell::new(None);
+        let mut routes = Routes::default();
+        let mut running = start_run_with_hook(&config, &store, &mut routes, |port| {
+            *stolen.borrow_mut() = Some(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap());
+        })
+        .unwrap();
+        let outcome = running.finish(&store, &mut routes).unwrap();
+        assert_ne!(outcome.exit_code, 0);
+        assert!(
+            decode(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .leases
+                .is_empty()
+        );
+        assert!(routes.owners.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[derive(Default)]
+    struct ControlledStop {
+        alive_checks: usize,
+        signals: Vec<i32>,
+        sleeps: usize,
+        stale: bool,
+    }
+
+    impl StopSystem for ControlledStop {
+        fn liveness(&mut self, _lease: &crate::state::Lease) -> Liveness {
+            self.alive_checks += 1;
+            if self.stale {
+                Liveness::Dead
+            } else {
+                Liveness::Alive
+            }
+        }
+        fn signal(&mut self, _pgid: i32, signal: i32) -> std::io::Result<()> {
+            self.signals.push(signal);
+            Ok(())
+        }
+        fn sleep(&mut self, _duration: std::time::Duration) {
+            self.sleeps += 1;
+        }
+    }
+
+    #[test]
+    fn force_stop_waits_two_controlled_seconds_then_kills_group() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sleep", "10"], 30);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let mut system = ControlledStop::default();
+        stop_managed(&store, "api.localhost", true, &mut system).unwrap();
+        assert_eq!(system.signals, [libc::SIGTERM, libc::SIGKILL]);
+        assert_eq!(system.sleeps, 40);
+        running.child.signal_group(libc::SIGTERM).unwrap();
+        running.child.wait().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn stale_managed_identity_is_never_signalled() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sleep", "10"], 30);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let mut system = ControlledStop {
+            stale: true,
+            ..ControlledStop::default()
+        };
+        assert!(stop_managed(&store, "api.localhost", true, &mut system).is_err());
+        assert!(system.signals.is_empty());
+        running.child.signal_group(libc::SIGTERM).unwrap();
+        running.child.wait().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unmanaged_hostname_is_never_signalled() {
+        let (store, path) = temporary_store();
+        let mut system = ControlledStop::default();
+        assert_eq!(
+            stop_managed(&store, "missing.localhost", true, &mut system),
+            Err(StopError::NotManaged("missing.localhost".into()))
+        );
+        assert!(system.signals.is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
