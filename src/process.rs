@@ -50,7 +50,7 @@ impl fmt::Display for Error {
             Self::InvalidPort => write!(formatter, "application port must be between 1 and 65535"),
             Self::PortInUse(port) => write!(
                 formatter,
-                "requested application port {port} is already in use"
+                "requested application port {port} is already in use; choose another port or omit --strict-port"
             ),
             Self::Bind(error) => write!(formatter, "cannot reserve a loopback port: {error}"),
             Self::EmptyCommand => write!(formatter, "child command argv cannot be empty"),
@@ -130,7 +130,16 @@ impl fmt::Display for RunError {
     }
 }
 
-impl std::error::Error for RunError {}
+impl std::error::Error for RunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::State(error) => Some(error),
+            Self::Route(error) => Some(error),
+            Self::Process(error) => Some(error),
+            Self::Conflict(_) => None,
+        }
+    }
+}
 
 impl From<crate::state::Error> for RunError {
     fn from(error: crate::state::Error) -> Self {
@@ -372,7 +381,7 @@ impl RunningChild {
             }
             if !warned && started.elapsed() >= self.readiness_warn_after {
                 warn(&format!(
-                    "{} is still not accepting connections on port {}",
+                    "{} is still not accepting connections on port {}; its route and process remain active (check that it binds HOST and PORT)",
                     self.hostname, self.port
                 ));
                 warned = true;
@@ -401,7 +410,10 @@ impl RunningChild {
                         tls: self.tls,
                     },
                 });
-                warnings.push(format!("cleanup of {} is pending: {error}", self.hostname));
+                warnings.push(format!(
+                    "cleanup of {} is pending: {error}; run `nook prune` to retry",
+                    self.hostname
+                ));
             }
             Ok(())
         })?;
@@ -443,6 +455,8 @@ impl fmt::Display for StopError {
         }
     }
 }
+
+impl std::error::Error for StopError {}
 
 pub(crate) trait StopSystem {
     fn liveness(&mut self, lease: &Lease) -> Liveness;

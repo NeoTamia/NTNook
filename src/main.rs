@@ -25,6 +25,8 @@ pub(crate) enum Error {
     Config(config::Error),
     State(state::Error),
     Alias(reconcile::AliasError),
+    Run(process::RunError),
+    Stop(process::StopError),
     Io(io::Error),
 }
 
@@ -36,6 +38,8 @@ impl fmt::Display for Error {
             Self::Config(error) => error.fmt(formatter),
             Self::State(error) => error.fmt(formatter),
             Self::Alias(error) => error.fmt(formatter),
+            Self::Run(error) => error.fmt(formatter),
+            Self::Stop(error) => error.fmt(formatter),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
         }
     }
@@ -49,6 +53,8 @@ impl std::error::Error for Error {
             Self::Config(error) => Some(error),
             Self::State(error) => Some(error),
             Self::Alias(error) => Some(error),
+            Self::Run(error) => Some(error),
+            Self::Stop(error) => Some(error),
             Self::Io(error) => Some(error),
         }
     }
@@ -62,7 +68,7 @@ impl Error {
                 u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
             }
             Self::Config(_) => ExitCode::FAILURE,
-            Self::State(_) | Self::Alias(_) => ExitCode::FAILURE,
+            Self::State(_) | Self::Alias(_) | Self::Run(_) | Self::Stop(_) => ExitCode::FAILURE,
             Self::Io(_) => ExitCode::FAILURE,
         }
     }
@@ -104,11 +110,23 @@ impl From<reconcile::AliasError> for Error {
     }
 }
 
+impl From<process::RunError> for Error {
+    fn from(error: process::RunError) -> Self {
+        Self::Run(error)
+    }
+}
+
+impl From<process::StopError> for Error {
+    fn from(error: process::StopError) -> Self {
+        Self::Stop(error)
+    }
+}
+
 fn main() -> ExitCode {
     match cli::run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),
         Err(error) => {
-            eprint!("{error}");
+            eprintln!("error: {error}");
             error.exit_code()
         }
     }

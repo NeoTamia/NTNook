@@ -117,6 +117,128 @@ fn status_has_a_stable_failure_when_caddy_is_unavailable() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn run_preserves_child_exit_when_cleanup_becomes_unavailable() {
+    let (directory, config_home, state_home) = temporary_homes("run-cleanup");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 3));
+    let script = "import os,socket,time;s=socket.socket();s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(.1);raise SystemExit(7)";
+    let run = nook(
+        &config_home,
+        &state_home,
+        &[
+            "run",
+            "--name",
+            "child",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+        ],
+    );
+    server.join().unwrap();
+    assert_eq!(run.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("cleanup of child.localhost is pending"));
+    let state = fs::read_to_string(state_home.join("nook/state.json")).unwrap();
+    assert!(state.contains("remove_route"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn caddy_failure_before_run_never_starts_the_child() {
+    let (directory, config_home, state_home) = temporary_homes("run-preflight");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    write_global_config(&config_home, address);
+    let marker = directory.join("child-started");
+    let run = nook(
+        &config_home,
+        &state_home,
+        &[
+            "run",
+            "--name",
+            "child",
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!("touch {}", marker.display()),
+        ],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(!marker.exists());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("Caddy Admin API request failed"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn stop_command_targets_the_current_managed_process_group() {
+    let (directory, config_home, state_home) = temporary_homes("stop");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 5));
+    let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args(["run", "--name", "sleeper", "--", "/bin/sleep", "10"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let state_path = state_home.join("nook/state.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if fs::read_to_string(&state_path).is_ok_and(|state| state.contains("sleeper.localhost")) {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("sleeper.localhost")
+    );
+    let stop = nook(&config_home, &state_home, &["stop", "sleeper"]);
+    assert_success(&stop);
+    assert_eq!(
+        String::from_utf8(stop.stdout).unwrap(),
+        "sent SIGTERM to sleeper.localhost\n"
+    );
+    let outcome = running.wait().unwrap();
+    server.join().unwrap();
+    assert_eq!(outcome.code(), Some(143));
+    assert!(routes.lock().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn temporary_homes(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let directory = std::env::temp_dir().join(format!(
+        "nook-cli-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_home = directory.join("config");
+    let state_home = directory.join("state");
+    fs::create_dir_all(config_home.join("nook")).unwrap();
+    (directory, config_home, state_home)
+}
+
+fn write_global_config(config_home: &Path, address: std::net::SocketAddr) {
+    fs::write(
+        config_home.join("nook/config.toml"),
+        format!("format_version = 1\ncaddy_admin = \"http://{address}\"\n"),
+    )
+    .unwrap();
+}
+
 fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_nook"))
         .args(arguments)

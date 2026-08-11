@@ -29,6 +29,8 @@ impl fmt::Display for RouteError {
     }
 }
 
+impl std::error::Error for RouteError {}
+
 pub(crate) trait RouteBackend {
     fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError>;
     fn remove_if_owned(
@@ -77,7 +79,14 @@ impl fmt::Display for AliasError {
     }
 }
 
-impl std::error::Error for AliasError {}
+impl std::error::Error for AliasError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Route(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AliasOutcome {
@@ -186,7 +195,9 @@ pub(crate) fn set_alias(
                 .retain(|operation| operation.id != operation_id);
             for (owner_id, tls, result) in &cleanup {
                 if let Err(error) = result {
-                    warnings.push(format!("cleanup of previous route is pending: {error}"));
+                    warnings.push(format!(
+                        "cleanup of previous route is pending: {error}; run `nook prune` to retry"
+                    ));
                     queue_remove(registry, &alias.hostname, *owner_id, *tls);
                 }
             }
@@ -236,7 +247,9 @@ pub(crate) fn remove_alias(
                 .map_err(|error| AliasError::State(error.to_string()))?;
             Ok(Vec::new())
         }
-        Err(error) => Ok(vec![format!("alias cleanup is pending: {error}")]),
+        Err(error) => Ok(vec![format!(
+            "alias cleanup is pending: {error}; run `nook prune` to retry"
+        )]),
     }
 }
 

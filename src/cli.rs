@@ -9,8 +9,6 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::reconcile::RouteBackend;
 
-const ACCEPTED: &str = "Command accepted; operational behavior is not implemented yet.\n";
-
 #[derive(Debug, Parser)]
 #[command(
     name = "nook",
@@ -102,42 +100,64 @@ pub(crate) struct AliasRemoveArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct StopArgs {
-    name: String,
+    pub(crate) name: String,
     #[arg(long)]
-    force: bool,
+    pub(crate) force: bool,
 }
 
-pub(crate) fn run() -> crate::Result<()> {
+pub(crate) fn run() -> crate::Result<i32> {
     let cli = parse_from(std::env::args_os())?;
     let stdout = io::stdout();
     let stderr = io::stderr();
     execute(cli, &mut stdout.lock(), &mut stderr.lock())
 }
 
-fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
+fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate::Result<i32> {
     match cli.command {
         Command::Alias(AliasArgs {
             command: AliasCommand::Set(arguments),
-        }) => set_alias_command(arguments, output, errors),
+        }) => set_alias_command(arguments, output, errors).map(|()| 0),
         Command::Alias(AliasArgs {
             command: AliasCommand::Remove(arguments),
-        }) => remove_alias_command(arguments, output, errors),
+        }) => remove_alias_command(arguments, output, errors).map(|()| 0),
         Command::Alias(AliasArgs {
             command: AliasCommand::List,
-        }) => list_alias_command(output),
-        Command::List => list_command(output),
-        Command::Status => status_command(output, errors),
-        Command::Prune => prune_command(output, errors),
-        Command::Run(arguments) => {
-            let _run_config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
-            output.write_all(ACCEPTED.as_bytes())?;
-            Ok(())
-        }
-        _ => {
-            output.write_all(ACCEPTED.as_bytes())?;
-            Ok(())
-        }
+        }) => list_alias_command(output).map(|()| 0),
+        Command::List => list_command(output).map(|()| 0),
+        Command::Status => status_command(output, errors).map(|()| 0),
+        Command::Prune => prune_command(output, errors).map(|()| 0),
+        Command::Run(arguments) => run_command(arguments, errors),
+        Command::Stop(arguments) => stop_command(arguments, output).map(|()| 0),
     }
+}
+
+fn run_command(arguments: RunArgs, errors: &mut impl Write) -> crate::Result<i32> {
+    let config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
+    let store = state_store()?;
+    let global = crate::config::load_global()?;
+    with_caddy_routes(&global, config.tls, !config.tls, |routes| {
+        let mut running = crate::process::start_run(&config, &store, routes)?;
+        if let Some(warning) = &running.warning {
+            writeln!(errors, "warning: {warning}")?;
+        }
+        let _ready = running.wait_for_readiness(&store, |warning| {
+            let _ = writeln!(errors, "warning: {warning}");
+        })?;
+        let outcome = running.finish(&store, routes)?;
+        for warning in outcome.warnings {
+            writeln!(errors, "warning: {warning}")?;
+        }
+        Ok(outcome.exit_code)
+    })
+}
+
+fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<()> {
+    let hostname = crate::config::normalize_hostname(&arguments.name)?;
+    let store = state_store()?;
+    let mut system = crate::process::LinuxStopSystem;
+    crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
+    writeln!(output, "sent SIGTERM to {hostname}")?;
+    Ok(())
 }
 
 fn set_alias_command(

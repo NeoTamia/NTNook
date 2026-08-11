@@ -55,7 +55,10 @@ impl fmt::Display for Error {
             Self::Fragment => write!(formatter, "alias target URL must not contain a fragment"),
             Self::AdminUrl(reason) => write!(formatter, "invalid Caddy Admin API URL: {reason}"),
             Self::AdminRequest(reason) => {
-                write!(formatter, "Caddy Admin API request failed: {reason}")
+                write!(
+                    formatter,
+                    "Caddy Admin API request failed: {reason}; check that Caddy is running and caddy_admin is correct"
+                )
             }
             Self::InvalidConfig(reason) => {
                 write!(formatter, "invalid Caddy configuration: {reason}")
@@ -76,7 +79,7 @@ impl fmt::Display for Error {
             ),
             Self::ForeignHostname(hostname) => write!(
                 formatter,
-                "hostname `{hostname}` is already claimed by a foreign Caddy route"
+                "hostname `{hostname}` is already claimed by a foreign Caddy route; choose another hostname or update that route outside Nook"
             ),
             Self::ManagedHostname(hostname) => write!(
                 formatter,
@@ -96,7 +99,7 @@ impl fmt::Display for Error {
             ),
             Self::MissingSelectedServer(kind) => write!(
                 formatter,
-                "no selected Caddy {kind} server is available for this route"
+                "no selected Caddy {kind} server is available for this route; configure a compatible listener or server override"
             ),
         }
     }
