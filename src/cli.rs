@@ -158,6 +158,12 @@ fn run_command(
     let store = state_store()?;
     with_caddy_routes(global, config.tls, !config.tls, |routes| {
         let mut running = crate::process::start_run(&config, &store, routes)?;
+        let scheme = if config.tls { "https" } else { "http" };
+        writeln!(
+            errors,
+            "nook: domain={} url={scheme}://{} port={}",
+            running.hostname, running.hostname, running.port
+        )?;
         if let Some(warning) = &running.warning {
             writeln!(errors, "warning: {warning}")?;
         }

@@ -90,6 +90,14 @@ Options de `run` :
 
 Nook remplace littéralement `{port}` dans chaque argument et injecte `PORT`, `HOST=127.0.0.1` et `NOOK_URL`. Le processus reçoit stdin/stdout/stderr du terminal et son code de sortie est conservé, même si le cleanup Caddy doit être réessayé plus tard.
 
+Après la réservation de la route et le lancement du processus, Nook affiche toujours le domaine, l’URL publique et le port applicatif effectivement retenus, y compris lorsque le nom et le port sont inférés :
+
+```text
+nook: domain=api.localhost url=https://api.localhost port=5173
+```
+
+Cette information est écrite sur stderr afin de ne pas mélanger les messages de supervision avec la sortie standard de l’application.
+
 ## Aliases persistants
 
 ```sh

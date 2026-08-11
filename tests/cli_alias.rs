@@ -161,6 +161,43 @@ fn run_preserves_child_exit_when_cleanup_becomes_unavailable() {
 }
 
 #[test]
+fn run_reports_inferred_domain_url_and_effective_port() {
+    let (directory, config_home, state_home) = temporary_homes("run-info");
+    let project = directory.join("inferred-app");
+    fs::create_dir_all(&project).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let script = "import os,socket,time;s=socket.socket();s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(.1)";
+    let run = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args(["run", "--", "/usr/bin/python3", "-c", script])
+        .current_dir(&project)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert_success(&run);
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    let info = stderr
+        .lines()
+        .find(|line| line.starts_with("nook: "))
+        .expect("run information must be printed");
+    assert!(info.contains("domain=inferred-app.localhost"));
+    assert!(info.contains("url=https://inferred-app.localhost"));
+    let port = info
+        .split("port=")
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("effective port must be printed as a u16");
+    assert_ne!(port, 0);
+    assert!(routes.lock().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn caddy_failure_before_run_never_starts_the_child() {
     let (directory, config_home, state_home) = temporary_homes("run-preflight");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
