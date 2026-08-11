@@ -9,6 +9,17 @@ use std::thread;
 use serde_json::{Value, json};
 
 #[test]
+fn help_is_successful_and_never_reported_as_an_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: nook <COMMAND>"));
+}
+
+#[test]
 fn alias_shortcuts_persist_list_and_remove_idempotently() {
     let directory = std::env::temp_dir().join(format!(
         "nook-cli-alias-{}-{}",

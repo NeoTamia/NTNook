@@ -125,6 +125,11 @@ impl From<process::StopError> for Error {
 fn main() -> ExitCode {
     match cli::run() {
         Ok(code) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),
+        Err(Error::Cli(error)) => {
+            let code = u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from);
+            let _ = error.print();
+            code
+        }
         Err(error) => {
             eprintln!("error: {error}");
             error.exit_code()

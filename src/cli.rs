@@ -83,24 +83,32 @@ pub(crate) enum AliasCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct AliasSetArgs {
+    /// Stable route name; `.localhost` is appended automatically.
     pub(crate) name: String,
+    /// Upstream port or absolute HTTP(S) URL.
     pub(crate) target: String,
+    /// Expose the alias over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Pass the requested `.localhost` Host header to the upstream.
     #[arg(long)]
     pub(crate) preserve_host: bool,
+    /// Replace an existing Nook-owned route.
     #[arg(long)]
     pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct AliasRemoveArgs {
+    /// Alias name to remove.
     pub(crate) name: String,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct StopArgs {
+    /// Managed run name to stop.
     pub(crate) name: String,
+    /// Send SIGKILL if the same process remains alive after two seconds.
     #[arg(long)]
     pub(crate) force: bool,
 }
