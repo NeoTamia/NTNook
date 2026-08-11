@@ -43,11 +43,19 @@ sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl reload caddy
 ```
 
-L’utilisateur exécutant Nook doit pouvoir traverser `/run/caddy` et lire/écrire sur le socket. Sur une installation utilisant le groupe `caddy`, ajoutez l’utilisateur à ce groupe, puis ouvrez une nouvelle session :
+L’utilisateur exécutant Nook doit pouvoir traverser `/run/caddy` et lire/écrire sur le socket. Sur une installation utilisant le groupe `caddy`, ajoutez votre utilisateur à ce groupe une seule fois afin d’utiliser Nook ensuite sans `sudo`, puis déconnectez-vous et ouvrez une nouvelle session :
 
 ```sh
 sudo usermod -aG caddy "$USER"
 ```
+
+Après reconnexion, vérifiez que la nouvelle session possède bien le groupe :
+
+```sh
+id -nG
+```
+
+La sortie doit contenir `caddy`. Ne lancez pas Nook avec `sudo` : ses fichiers de configuration et d’état appartiennent à votre utilisateur, et les processus applicatifs doivent conserver ses permissions normales.
 
 Caddy émet les certificats `*.localhost` avec sa CA locale. Installez explicitement cette CA depuis votre session utilisateur afin que le système et les navigateurs lui fassent confiance :
 
