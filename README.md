@@ -17,6 +17,47 @@ nook --help
 
 Nook ne démarre ni n’installe Caddy. Il ne lance jamais `sudo`, ne modifie pas `/etc/hosts` et n’installe pas la CA locale. Les noms sous `.localhost` sont résolus nativement vers loopback par les navigateurs et systèmes compatibles.
 
+## Préparer Caddy pour Nook
+
+Nook ajoute ses routes à un serveur Caddy existant : il ne crée pas le listener HTTPS lui-même. Le Caddyfile doit donc produire exactement un serveur écoutant explicitement sur `:443`. Par exemple, ajoutez ce site à votre configuration existante :
+
+```caddyfile
+https://localhost {
+	tls internal
+	respond 404
+}
+```
+
+Si l’Admin API doit utiliser le socket Unix standard, placez aussi cette directive dans le bloc global existant du Caddyfile :
+
+```caddyfile
+{
+	admin "unix//run/caddy/admin.socket"
+}
+```
+
+Validez puis rechargez Caddy :
+
+```sh
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+```
+
+L’utilisateur exécutant Nook doit pouvoir traverser `/run/caddy` et lire/écrire sur le socket. Sur une installation utilisant le groupe `caddy`, ajoutez l’utilisateur à ce groupe, puis ouvrez une nouvelle session :
+
+```sh
+sudo usermod -aG caddy "$USER"
+```
+
+Caddy émet les certificats `*.localhost` avec sa CA locale. Installez explicitement cette CA depuis votre session utilisateur afin que le système et les navigateurs lui fassent confiance :
+
+```sh
+caddy trust --address unix//run/caddy/admin.socket
+nook --caddy-socket /run/caddy/admin.socket status
+```
+
+La seconde commande doit indiquer `trusted` pour `local_ca`. Fermez complètement puis relancez les navigateurs déjà ouverts. Pour une Admin API TCP, utilisez plutôt l’adresse affichée par `nook status`, par exemple `caddy trust --address 127.0.0.1:2019`.
+
 ## Lancer une application
 
 ```sh
@@ -123,7 +164,8 @@ L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallba
 ## Dépannage
 
 - `Caddy Admin API request failed` : vérifier que Caddy tourne, que `caddy_admin` est correct et, pour un socket Unix, que ses permissions autorisent l’utilisateur courant.
-- `expected exactly one ... server` : utiliser les candidats affichés pour définir `https_server` ou `http_server`.
+- `expected exactly one ... server; detected: none` : ajouter le listener `:443` ou `:80` correspondant dans Caddy.
+- plusieurs serveurs compatibles détectés : utiliser les candidats affichés pour définir `https_server` ou `http_server`.
 - `no selected Caddy HTTP server` : configurer un listener `:80` avant d’utiliser `--no-tls`.
 - `hostname ... foreign Caddy route` : choisir un autre nom ou modifier cette route directement hors de Nook.
 - `drift detected` ou cleanup en attente : lancer `nook prune`.
