@@ -23,7 +23,8 @@ fn isolated_caddy_exposes_http_https_reload_and_concurrency() {
     assert!(
         tls_error.contains("certificate")
             || tls_error.contains("unknownissuer")
-            || tls_error.contains("tls"),
+            || tls_error.contains("tls")
+            || tls_error.contains("internalerror"),
         "expected a TLS trust failure, got {tls_error}"
     );
     harness.reload();

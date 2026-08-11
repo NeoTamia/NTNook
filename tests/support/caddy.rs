@@ -78,6 +78,14 @@ impl CaddyHarness {
         format!("https://localhost:{}", self.https_port)
     }
 
+    pub(crate) fn http_port(&self) -> u16 {
+        self.http_port
+    }
+
+    pub(crate) fn https_port(&self) -> u16 {
+        self.https_port
+    }
+
     pub(crate) fn reload(&self) {
         self.reload_current();
     }
@@ -88,6 +96,18 @@ impl CaddyHarness {
             format!(
                 "{{\n\tadmin 127.0.0.1:{}\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\nhttp://localhost:{} {{\n{directives}\n}}\n\nhttps://localhost:{} {{\n\ttls internal\n\trespond \"https-ok\"\n}}\n",
                 self.admin_port, self.http_port, self.https_port
+            ),
+        )
+        .unwrap();
+        self.reload_current();
+    }
+
+    pub(crate) fn reload_sites(&self, sites: &str) {
+        fs::write(
+            &self.config,
+            format!(
+                "{{\n\tadmin 127.0.0.1:{}\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\n{sites}\n",
+                self.admin_port
             ),
         )
         .unwrap();
