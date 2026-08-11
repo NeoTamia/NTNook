@@ -230,7 +230,7 @@ fn resolve_hostname(
     )
 }
 
-fn normalize_hostname(name: &str) -> Result<String, Error> {
+pub(crate) fn normalize_hostname(name: &str) -> Result<String, Error> {
     if !name.is_ascii() {
         return invalid_name(name, "only ASCII DNS labels are supported");
     }

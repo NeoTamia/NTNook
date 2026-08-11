@@ -82,19 +82,19 @@ pub(crate) enum AliasCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct AliasSetArgs {
-    name: String,
+    pub(crate) name: String,
     pub(crate) target: String,
     #[arg(long)]
-    no_tls: bool,
+    pub(crate) no_tls: bool,
     #[arg(long)]
-    preserve_host: bool,
+    pub(crate) preserve_host: bool,
     #[arg(long)]
-    force: bool,
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct AliasRemoveArgs {
-    name: String,
+    pub(crate) name: String,
 }
 
 #[derive(Debug, Args)]
@@ -106,20 +106,122 @@ pub(crate) struct StopArgs {
 
 pub(crate) fn run() -> crate::Result<()> {
     let cli = parse_from(std::env::args_os())?;
-    let _global_config = crate::config::load_global()?;
-    if let Command::Run(arguments) = &cli.command {
-        let _run_config = crate::config::resolve_run(arguments, &std::env::current_dir()?)?;
-    }
-    if let Command::Alias(AliasArgs {
-        command: AliasCommand::Set(arguments),
-    }) = &cli.command
-    {
-        let _upstream = crate::caddy::normalize_upstream(&arguments.target)?;
-    }
     let stdout = io::stdout();
-    let mut output = stdout.lock();
-    output.write_all(ACCEPTED.as_bytes())?;
+    let stderr = io::stderr();
+    execute(cli, &mut stdout.lock(), &mut stderr.lock())
+}
+
+fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
+    match cli.command {
+        Command::Alias(AliasArgs {
+            command: AliasCommand::Set(arguments),
+        }) => set_alias_command(arguments, output, errors),
+        Command::Alias(AliasArgs {
+            command: AliasCommand::Remove(arguments),
+        }) => remove_alias_command(arguments, output, errors),
+        Command::Alias(AliasArgs {
+            command: AliasCommand::List,
+        }) => list_alias_command(output),
+        Command::Run(arguments) => {
+            let _run_config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
+            output.write_all(ACCEPTED.as_bytes())?;
+            Ok(())
+        }
+        _ => {
+            output.write_all(ACCEPTED.as_bytes())?;
+            Ok(())
+        }
+    }
+}
+
+fn set_alias_command(
+    arguments: AliasSetArgs,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> crate::Result<()> {
+    let hostname = crate::config::normalize_hostname(&arguments.name)?;
+    let upstream = crate::caddy::normalize_upstream(&arguments.target)?;
+    let scheme = match upstream.url.scheme() {
+        "https" => crate::state::Scheme::Https,
+        _ => crate::state::Scheme::Http,
+    };
+    let request = crate::reconcile::AliasRequest {
+        hostname,
+        target: upstream.url.to_string(),
+        scheme,
+        tls: !arguments.no_tls,
+        preserve_host: arguments.preserve_host,
+        force: arguments.force,
+    };
+    let store = crate::state::Store::new(crate::state::state_path()?);
+    let global = crate::config::load_global()?;
+    with_caddy_routes(&global, request.tls, !request.tls, |routes| {
+        let outcome = crate::reconcile::set_alias(&store, routes, request)?;
+        for warning in outcome.warnings {
+            writeln!(errors, "warning: {warning}")?;
+        }
+        writeln!(
+            output,
+            "{} -> {}",
+            outcome.alias.hostname, outcome.alias.target
+        )?;
+        Ok(())
+    })
+}
+
+fn remove_alias_command(
+    arguments: AliasRemoveArgs,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> crate::Result<()> {
+    let hostname = crate::config::normalize_hostname(&arguments.name)?;
+    let store = crate::state::Store::new(crate::state::state_path()?);
+    let aliases = crate::reconcile::list_aliases(&store)?;
+    let Some(alias) = aliases.iter().find(|alias| alias.hostname == hostname) else {
+        writeln!(output, "alias {hostname} is not configured")?;
+        return Ok(());
+    };
+    let global = crate::config::load_global()?;
+    with_caddy_routes(&global, alias.tls, !alias.tls, |routes| {
+        for warning in crate::reconcile::remove_alias(&store, routes, &hostname)? {
+            writeln!(errors, "warning: {warning}")?;
+        }
+        writeln!(output, "removed {hostname}")?;
+        Ok(())
+    })
+}
+
+fn list_alias_command(output: &mut impl Write) -> crate::Result<()> {
+    let store = crate::state::Store::new(crate::state::state_path()?);
+    for alias in crate::reconcile::list_aliases(&store)? {
+        writeln!(output, "{} -> {}", alias.hostname, alias.target)?;
+    }
     Ok(())
+}
+
+fn with_caddy_routes<T>(
+    global: &crate::config::GlobalConfig,
+    need_https: bool,
+    need_http: bool,
+    operation: impl FnOnce(&mut crate::caddy::ManagedCaddyRoutes<'_>) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let client = crate::caddy::Client::new(&global.caddy_admin)?;
+    let config = client.fetch_config()?;
+    let selection = crate::caddy::discover_servers(
+        &config,
+        crate::caddy::ServerOverrides {
+            https: global.https_server.as_deref(),
+            http: global.http_server.as_deref(),
+        },
+        need_https,
+        need_http,
+    )?;
+    let mut routes = crate::caddy::ManagedCaddyRoutes {
+        client: &client,
+        https_server: selection.https.as_deref(),
+        http_server: selection.http.as_deref(),
+    };
+    operation(&mut routes)
 }
 
 fn parse_from(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, clap::Error> {

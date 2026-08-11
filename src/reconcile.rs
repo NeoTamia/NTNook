@@ -77,6 +77,8 @@ impl fmt::Display for AliasError {
     }
 }
 
+impl std::error::Error for AliasError {}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AliasOutcome {
     pub(crate) alias: Alias,

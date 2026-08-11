@@ -23,6 +23,8 @@ pub(crate) enum Error {
     Caddy(caddy::Error),
     Cli(clap::Error),
     Config(config::Error),
+    State(state::Error),
+    Alias(reconcile::AliasError),
     Io(io::Error),
 }
 
@@ -32,6 +34,8 @@ impl fmt::Display for Error {
             Self::Caddy(error) => error.fmt(formatter),
             Self::Cli(error) => error.fmt(formatter),
             Self::Config(error) => error.fmt(formatter),
+            Self::State(error) => error.fmt(formatter),
+            Self::Alias(error) => error.fmt(formatter),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
         }
     }
@@ -43,6 +47,8 @@ impl std::error::Error for Error {
             Self::Caddy(error) => Some(error),
             Self::Cli(error) => Some(error),
             Self::Config(error) => Some(error),
+            Self::State(error) => Some(error),
+            Self::Alias(error) => Some(error),
             Self::Io(error) => Some(error),
         }
     }
@@ -56,6 +62,7 @@ impl Error {
                 u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
             }
             Self::Config(_) => ExitCode::FAILURE,
+            Self::State(_) | Self::Alias(_) => ExitCode::FAILURE,
             Self::Io(_) => ExitCode::FAILURE,
         }
     }
@@ -82,6 +89,18 @@ impl From<config::Error> for Error {
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<state::Error> for Error {
+    fn from(error: state::Error) -> Self {
+        Self::State(error)
+    }
+}
+
+impl From<reconcile::AliasError> for Error {
+    fn from(error: reconcile::AliasError) -> Self {
+        Self::Alias(error)
     }
 }
 
