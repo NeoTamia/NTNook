@@ -68,6 +68,13 @@ impl fmt::Display for Error {
             Self::InvalidConfig(reason) => {
                 write!(formatter, "invalid Caddy configuration: {reason}")
             }
+            Self::AmbiguousServer { kind, candidates } if candidates.is_empty() => {
+                let listener = if *kind == "HTTPS" { ":443" } else { ":80" };
+                write!(
+                    formatter,
+                    "expected exactly one {kind} server; detected: none. Configure a Caddy server listening explicitly on {listener}"
+                )
+            }
             Self::AmbiguousServer { kind, candidates } => write!(
                 formatter,
                 "expected exactly one {kind} server; detected: {}. Configure an explicit override",
@@ -1295,6 +1302,16 @@ mod tests {
             discover_servers(&config, ServerOverrides::default(), false, true),
             Err(Error::AmbiguousServer { kind: "HTTP", candidates, .. }) if candidates.is_empty()
         ));
+    }
+
+    #[test]
+    fn missing_server_diagnostic_requests_a_listener_instead_of_an_override() {
+        let config = json!({"apps":{"http":{"servers":{}}}});
+        let error = discover_servers(&config, ServerOverrides::default(), true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("listening explicitly on :443"));
+        assert!(!error.contains("override"));
     }
 
     #[test]
