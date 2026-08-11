@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CADDY_VERSION: 2.11.4
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system test dependencies
+        run: sudo apt-get update && sudo apt-get install --yes ca-certificates curl openssl python3
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install Caddy
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+            --output /tmp/caddy.tar.gz
+          tar --extract --gzip --file /tmp/caddy.tar.gz --directory "$HOME/.cargo/bin" caddy
+          caddy version
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Compile
+        run: cargo check --locked
+
+      - name: Test
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Build release binary
+        run: |
+          cargo build --locked --release
+          install -D -m 0755 target/release/nook dist/nook
+          cp README.md RELEASE.md dist/
+          cd dist
+          sha256sum nook > nook.sha256
+
+      - name: Upload Linux release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: nook-linux-x86_64
+          path: dist/
+          if-no-files-found: error

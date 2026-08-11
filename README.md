@@ -130,3 +130,5 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Les intégrations requièrent Caddy `2.11.x` et OpenSSL. Elles utilisent uniquement des ports loopback et des répertoires temporaires, désactivent l’installation de confiance et nettoient leurs processus et fichiers.
+
+La CI Linux applique cette porte avec la toolchain épinglée dans `rust-toolchain.toml`, puis produit un artefact x86-64 et sa somme SHA-256. Voir [la traçabilité](docs/TRACEABILITY.md) et [les notes de release](RELEASE.md).
