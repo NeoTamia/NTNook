@@ -229,6 +229,191 @@ fn stop_command_targets_the_current_managed_process_group() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn sigint_is_forwarded_and_the_route_is_cleaned_up() {
+    let (directory, config_home, state_home) = temporary_homes("sigint");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 5));
+    let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
+    let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args([
+            "run",
+            "--name",
+            "interrupt",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+        ])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_lease(&state_home, "interrupt.localhost");
+    let signal = Command::new("kill")
+        .args(["-INT", &running.id().to_string()])
+        .output()
+        .unwrap();
+    assert_success(&signal);
+    let outcome = running.wait().unwrap();
+    server.join().unwrap();
+    assert_eq!(outcome.code(), Some(130));
+    assert!(routes.lock().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn prune_recovers_after_the_supervising_cli_is_killed() {
+    let (directory, config_home, state_home) = temporary_homes("crash-prune");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
+    let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args([
+            "run",
+            "--name",
+            "crashed",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+        ])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_lease(&state_home, "crashed.localhost");
+    running.kill().unwrap();
+    running.wait().unwrap();
+
+    let prune = nook(&config_home, &state_home, &["prune"]);
+    assert_success(&prune);
+    assert!(
+        String::from_utf8(prune.stdout)
+            .unwrap()
+            .contains("removed_dead=1")
+    );
+    server.join().unwrap();
+    assert!(routes.lock().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn external_reload_is_reconciled_on_prune() {
+    let (directory, config_home, state_home) = temporary_homes("reload");
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, first_listener.local_addr().unwrap());
+    let first_routes = Arc::clone(&routes);
+    let first_server = thread::spawn(move || serve_caddy(first_listener, first_routes, 3));
+    assert_success(&nook(&config_home, &state_home, &["alias", "api", "3000"]));
+    first_server.join().unwrap();
+    routes.lock().unwrap().clear();
+
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, second_listener.local_addr().unwrap());
+    let second_routes = Arc::clone(&routes);
+    let second_server = thread::spawn(move || serve_caddy(second_listener, second_routes, 3));
+    let prune = nook(&config_home, &state_home, &["prune"]);
+    assert_success(&prune);
+    assert!(
+        String::from_utf8(prune.stdout)
+            .unwrap()
+            .contains("restored=1")
+    );
+    second_server.join().unwrap();
+    assert_eq!(
+        routes.lock().unwrap()[0]
+            .pointer("/handle/0/routes")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn force_refuses_a_foreign_caddy_route_without_mutating_it() {
+    let (directory, config_home, state_home) = temporary_homes("foreign");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let foreign = json!({
+        "match": [{"host": ["foreign.localhost"]}],
+        "handle": [{"handler": "static_response", "body": "foreign"}]
+    });
+    let routes = Arc::new(Mutex::new(vec![foreign.clone()]));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 2));
+    let set = nook(
+        &config_home,
+        &state_home,
+        &["alias", "set", "foreign", "3000", "--force"],
+    );
+    assert_eq!(set.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&set.stderr).contains("foreign Caddy route"));
+    server.join().unwrap();
+    assert_eq!(*routes.lock().unwrap(), [foreign]);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn concurrent_clis_create_and_remove_aliases_without_lost_updates() {
+    let (directory, config_home, state_home) = temporary_homes("concurrent");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 12));
+    let create: Vec<_> = [("one", "3001"), ("two", "3002")]
+        .into_iter()
+        .map(|(name, port)| {
+            let config_home = config_home.clone();
+            let state_home = state_home.clone();
+            thread::spawn(move || nook(&config_home, &state_home, &["alias", name, port]))
+        })
+        .collect();
+    for output in create {
+        assert_success(&output.join().unwrap());
+    }
+    let list = nook(&config_home, &state_home, &["alias", "list"]);
+    assert_success(&list);
+    let list = String::from_utf8(list.stdout).unwrap();
+    assert!(list.contains("one.localhost"));
+    assert!(list.contains("two.localhost"));
+
+    let remove: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|name| {
+            let config_home = config_home.clone();
+            let state_home = state_home.clone();
+            thread::spawn(move || nook(&config_home, &state_home, &["alias", "remove", name]))
+        })
+        .collect();
+    for output in remove {
+        assert_success(&output.join().unwrap());
+    }
+    server.join().unwrap();
+    assert!(routes.lock().unwrap().is_empty());
+    assert!(
+        nook(&config_home, &state_home, &["alias", "list"])
+            .stdout
+            .is_empty()
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn temporary_homes(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let directory = std::env::temp_dir().join(format!(
         "nook-cli-{name}-{}-{}",
@@ -250,6 +435,20 @@ fn write_global_config(config_home: &Path, address: std::net::SocketAddr) {
         format!("format_version = 1\ncaddy_admin = \"http://{address}\"\n"),
     )
     .unwrap();
+}
+
+fn wait_for_lease(state_home: &Path, hostname: &str) {
+    let state_path = state_home.join("nook/state.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if fs::read_to_string(&state_path)
+            .is_ok_and(|state| state.contains(hostname) && state.contains("\"state\": \"ready\""))
+        {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("lease {hostname} did not become ready");
 }
 
 fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {

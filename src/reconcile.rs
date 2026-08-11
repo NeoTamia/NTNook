@@ -497,7 +497,10 @@ mod tests {
         reconcile_store, remove_alias, set_alias,
     };
     use crate::process::Liveness;
-    use crate::state::{Alias, Lease, LeaseState, Registry, Scheme, Store, decode};
+    use crate::state::{
+        Alias, Lease, LeaseState, PendingOperation, PendingOperationKind, Registry, Scheme, Store,
+        decode,
+    };
     use uuid::Uuid;
 
     #[derive(Default)]
@@ -543,6 +546,96 @@ mod tests {
         reconcile(&mut registry, &mut routes, |_| Liveness::Alive);
         assert_eq!(routes.owners.len(), 2);
         assert!(registry.pending_operations.is_empty());
+    }
+
+    #[test]
+    fn recovers_journals_left_at_every_external_mutation_boundary() {
+        let owner = Uuid::new_v4();
+        let route_fields = || {
+            (
+                "boundary.localhost".to_owned(),
+                "http://127.0.0.1:3000".to_owned(),
+            )
+        };
+
+        for kind in [
+            {
+                let (hostname, target) = route_fields();
+                PendingOperationKind::InstallRoute {
+                    hostname,
+                    target,
+                    scheme: Scheme::Http,
+                    owner_id: owner,
+                    tls: true,
+                }
+            },
+            {
+                let (hostname, target) = route_fields();
+                PendingOperationKind::StartProcess {
+                    hostname,
+                    target,
+                    scheme: Scheme::Http,
+                    owner_id: owner,
+                    tls: true,
+                }
+            },
+            PendingOperationKind::RemoveRoute {
+                hostname: "boundary.localhost".into(),
+                owner_id: owner,
+                tls: true,
+            },
+        ] {
+            let mut registry = Registry::empty();
+            registry.pending_operations.push(PendingOperation {
+                id: Uuid::new_v4(),
+                kind,
+            });
+            let mut routes = Routes {
+                owners: BTreeMap::from([("boundary.localhost".into(), owner)]),
+                unavailable: false,
+            };
+            reconcile(&mut registry, &mut routes, |_| Liveness::Dead);
+            assert!(registry.pending_operations.is_empty());
+            assert!(routes.owners.is_empty());
+        }
+
+        let alias = alias("restore.localhost");
+        let mut registry = Registry::empty();
+        registry
+            .aliases
+            .insert(alias.hostname.clone(), alias.clone());
+        registry.pending_operations.push(PendingOperation {
+            id: Uuid::new_v4(),
+            kind: PendingOperationKind::RestoreRoute {
+                hostname: alias.hostname.clone(),
+                target: alias.target.clone(),
+                scheme: alias.scheme,
+                owner_id: alias.id,
+                tls: alias.tls,
+            },
+        });
+        let mut routes = Routes::default();
+        reconcile(&mut registry, &mut routes, |_| Liveness::Dead);
+        assert!(registry.pending_operations.is_empty());
+        assert_eq!(routes.owners[&alias.hostname], alias.id);
+
+        let lease = lease("finalize.localhost");
+        let mut registry = Registry::empty();
+        registry.leases.insert(lease.id, lease.clone());
+        registry.pending_operations.push(PendingOperation {
+            id: Uuid::new_v4(),
+            kind: PendingOperationKind::FinalizeLease { lease_id: lease.id },
+        });
+        let mut routes = Routes {
+            owners: BTreeMap::from([(lease.hostname.clone(), lease.id)]),
+            unavailable: false,
+        };
+        let report = reconcile(&mut registry, &mut routes, |_| Liveness::Dead);
+        assert_eq!(report.completed_operations, 1);
+        assert_eq!(report.removed_dead_leases, 1);
+        assert!(registry.pending_operations.is_empty());
+        assert!(registry.leases.is_empty());
+        assert!(routes.owners.is_empty());
     }
 
     #[test]
