@@ -19,7 +19,7 @@ Nook ne démarre ni n’installe Caddy. Il ne lance jamais `sudo`, ne modifie pa
 
 ## Préparer Caddy pour Nook
 
-Nook ajoute ses routes à un serveur Caddy existant : il ne crée pas le listener HTTPS lui-même. Le Caddyfile doit donc produire exactement un serveur écoutant explicitement sur `:443`. Par exemple, ajoutez ce site à votre configuration existante :
+Nook ajoute ses routes à un serveur Caddy existant : il ne crée pas les listeners lui-même. Pour les routes HTTPS, le Caddyfile doit produire exactement un serveur écoutant explicitement sur `:443`. Par exemple, ajoutez ce site à votre configuration existante :
 
 ```caddyfile
 https://localhost {
@@ -27,6 +27,8 @@ https://localhost {
 	respond 404
 }
 ```
+
+Si toutes les commandes utilisent `--no-tls`, aucun serveur HTTPS n’est requis. Caddy doit alors fournir exactement un serveur HTTP sur `:80` ; Nook n’émet ni ne vérifie de certificat pour ces routes.
 
 Si l’Admin API doit utiliser le socket Unix standard, placez aussi cette directive dans le bloc global existant du Caddyfile :
 

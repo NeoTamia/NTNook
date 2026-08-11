@@ -61,6 +61,7 @@ fn real_nook_routes_alias_and_run_through_caddy_https() {
     let http_alias_host = format!("http-alias-{unique}.localhost");
     let tls_alias_host = format!("tls-alias-{unique}.localhost");
     let http_run_host = format!("http-run-{unique}.localhost");
+    let http_only_run_host = format!("http-only-run-{unique}.localhost");
     let foreign_host = format!("foreign-{unique}.localhost");
     harness.reload_sites(&format!(
         "http://localhost:80 {{
@@ -304,6 +305,51 @@ https://localhost:443 {{
     assert!(!fetch_config(&harness).contains(&http_alias_host));
     assert!(!fetch_config(&harness).contains(&tls_alias_host));
     assert!(!fetch_config(&harness).contains(&http_run_host));
+
+    harness.reload_sites(
+        "http://localhost:80 {
+\trespond \"http-only-caddy\"
+}",
+    );
+    let tls_without_https_server = nook(
+        &config_home,
+        &state_home,
+        &["run", "--name", "needs-https", "--", "/usr/bin/true"],
+    );
+    assert!(!tls_without_https_server.status.success());
+    assert!(
+        String::from_utf8_lossy(&tls_without_https_server.stderr)
+            .contains("listening explicitly on :443")
+    );
+
+    let mut http_only_running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args([
+            "run",
+            "--name",
+            &http_only_run_host,
+            "--no-tls",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+        ])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_state(&state_home, &http_only_run_host, "ready");
+    assert!(http_body(&http_only_run_host).contains("Directory listing"));
+    assert_not_exposed_over_https(&http_only_run_host, "Directory listing");
+    assert_success(
+        &Command::new("kill")
+            .args(["-TERM", &http_only_running.id().to_string()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(http_only_running.wait().unwrap().code(), Some(143));
+    assert!(!fetch_config(&harness).contains(&http_only_run_host));
 }
 
 fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
