@@ -5,6 +5,9 @@ use serde_json::Value;
 use serde_json::json;
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
@@ -127,54 +130,101 @@ pub(crate) struct Upstream {
 }
 
 #[derive(Debug)]
+enum AdminEndpoint {
+    Http(Url),
+    Unix { address: String, socket: PathBuf },
+}
+
+#[derive(Debug)]
 pub(crate) struct Client {
-    admin: Url,
+    admin: AdminEndpoint,
 }
 
 impl Client {
     pub(crate) fn new(admin: &str) -> Result<Self, Error> {
+        if let Some(socket) = admin
+            .strip_prefix("unix://")
+            .or_else(|| admin.strip_prefix("unix/"))
+        {
+            let socket = PathBuf::from(socket);
+            if !socket.is_absolute() {
+                return Err(Error::AdminUrl(
+                    "Unix socket path must be absolute (for example unix//run/caddy/admin.socket)"
+                        .into(),
+                ));
+            }
+            return Ok(Self {
+                admin: AdminEndpoint::Unix {
+                    address: admin.to_owned(),
+                    socket,
+                },
+            });
+        }
         let admin = Url::parse(admin).map_err(|error| Error::AdminUrl(error.to_string()))?;
         if !matches!(admin.scheme(), "http" | "https") || admin.host().is_none() {
-            return Err(Error::AdminUrl("expected an absolute HTTP(S) URL".into()));
+            return Err(Error::AdminUrl(
+                "expected an absolute HTTP(S) URL or Unix socket address".into(),
+            ));
         }
-        Ok(Self { admin })
+        Ok(Self {
+            admin: AdminEndpoint::Http(admin),
+        })
     }
 
     pub(crate) fn fetch_config(&self) -> Result<Value, Error> {
-        let endpoint = self
-            .admin
-            .join("/config/")
-            .map_err(|error| Error::AdminUrl(error.to_string()))?;
-        let mut response = ureq::get(endpoint.as_str())
-            .call()
-            .map_err(|error| Error::AdminRequest(error.to_string()))?;
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|error| Error::AdminRequest(error.to_string()))
+        match &self.admin {
+            AdminEndpoint::Http(admin) => {
+                let endpoint = admin
+                    .join("/config/")
+                    .map_err(|error| Error::AdminUrl(error.to_string()))?;
+                let mut response = ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
+                response
+                    .body_mut()
+                    .read_json()
+                    .map_err(|error| Error::AdminRequest(error.to_string()))
+            }
+            AdminEndpoint::Unix { socket, .. } => {
+                let response = unix_request(socket, "GET", "/config/", &[], None)?;
+                response.ensure_success()?;
+                serde_json::from_slice(&response.body)
+                    .map_err(|error| Error::AdminRequest(error.to_string()))
+            }
+        }
     }
 
     pub(crate) fn fetch_local_ca(&self) -> Result<String, Error> {
-        let endpoint = self
-            .admin
-            .join("/pki/ca/local")
-            .map_err(|error| Error::AdminUrl(error.to_string()))?;
-        let mut response = ureq::get(endpoint.as_str())
-            .call()
-            .map_err(|error| Error::AdminRequest(error.to_string()))?;
-        response
-            .body_mut()
-            .read_to_string()
-            .map_err(|error| Error::AdminRequest(error.to_string()))
+        match &self.admin {
+            AdminEndpoint::Http(admin) => {
+                let endpoint = admin
+                    .join("/pki/ca/local")
+                    .map_err(|error| Error::AdminUrl(error.to_string()))?;
+                let mut response = ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
+                response
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|error| Error::AdminRequest(error.to_string()))
+            }
+            AdminEndpoint::Unix { socket, .. } => {
+                let response = unix_request(socket, "GET", "/pki/ca/local", &[], None)?;
+                response.ensure_success()?;
+                String::from_utf8(response.body)
+                    .map_err(|error| Error::AdminRequest(error.to_string()))
+            }
+        }
     }
 
     pub(crate) fn trust_command(&self) -> String {
-        let host = self.admin.host_str().unwrap_or("127.0.0.1");
-        let port = self.admin.port_or_known_default().unwrap_or(2019);
-        let address = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
+        let address = match &self.admin {
+            AdminEndpoint::Http(admin) => {
+                let host = admin.host_str().unwrap_or("127.0.0.1");
+                let port = admin.port_or_known_default().unwrap_or(2019);
+                if host.contains(':') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                }
+            }
+            AdminEndpoint::Unix { address, .. } => address.clone(),
         };
         format!("caddy trust --address {address}")
     }
@@ -184,43 +234,242 @@ impl Client {
         server: &str,
         transform: impl FnMut(Vec<Value>) -> Result<Vec<Value>, Error>,
     ) -> Result<(), Error> {
-        let endpoint = self.server_routes_endpoint(server)?;
-        mutate_with_retry(
-            || {
-                let mut response = ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
-                let etag = response
-                    .headers()
-                    .get("etag")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-                    .ok_or(Error::MissingEtag)?;
-                let routes = response
-                    .body_mut()
-                    .read_json::<Vec<Value>>()
-                    .map_err(|error| Error::AdminRequest(error.to_string()))?;
-                Ok((etag, routes))
-            },
-            |etag, routes| match ureq::patch(endpoint.as_str())
-                .header("If-Match", etag)
-                .send_json(routes)
-            {
-                Ok(_) => Ok(WriteOutcome::Applied),
-                Err(ureq::Error::StatusCode(412)) => Ok(WriteOutcome::PreconditionFailed),
-                Err(error) => Err(admin_request(error)),
-            },
-            transform,
-            std::thread::sleep,
-        )
+        match &self.admin {
+            AdminEndpoint::Http(_) => {
+                let endpoint = self.server_routes_http_endpoint(server)?;
+                mutate_with_retry(
+                    || {
+                        let mut response =
+                            ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
+                        let etag = response
+                            .headers()
+                            .get("etag")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned)
+                            .ok_or(Error::MissingEtag)?;
+                        let routes = response
+                            .body_mut()
+                            .read_json::<Vec<Value>>()
+                            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+                        Ok((etag, routes))
+                    },
+                    |etag, routes| match ureq::patch(endpoint.as_str())
+                        .header("If-Match", etag)
+                        .send_json(routes)
+                    {
+                        Ok(_) => Ok(WriteOutcome::Applied),
+                        Err(ureq::Error::StatusCode(412)) => Ok(WriteOutcome::PreconditionFailed),
+                        Err(error) => Err(admin_request(error)),
+                    },
+                    transform,
+                    std::thread::sleep,
+                )
+            }
+            AdminEndpoint::Unix { socket, .. } => {
+                let endpoint = server_routes_path(server);
+                mutate_with_retry(
+                    || {
+                        let response = unix_request(socket, "GET", &endpoint, &[], None)?;
+                        response.ensure_success()?;
+                        let etag = response
+                            .header("etag")
+                            .ok_or(Error::MissingEtag)?
+                            .to_owned();
+                        let routes = serde_json::from_slice::<Vec<Value>>(&response.body)
+                            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+                        Ok((etag, routes))
+                    },
+                    |etag, routes| {
+                        let body = serde_json::to_vec(routes)
+                            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+                        let response = unix_request(
+                            socket,
+                            "PATCH",
+                            &endpoint,
+                            &[("If-Match", etag), ("Content-Type", "application/json")],
+                            Some(&body),
+                        )?;
+                        match response.status {
+                            200..=299 => Ok(WriteOutcome::Applied),
+                            412 => Ok(WriteOutcome::PreconditionFailed),
+                            _ => Err(response.status_error()),
+                        }
+                    },
+                    transform,
+                    std::thread::sleep,
+                )
+            }
+        }
     }
 
-    fn server_routes_endpoint(&self, server: &str) -> Result<Url, Error> {
-        let mut endpoint = self.admin.clone();
+    fn server_routes_http_endpoint(&self, server: &str) -> Result<Url, Error> {
+        let AdminEndpoint::Http(admin) = &self.admin else {
+            return Err(Error::AdminUrl("expected an HTTP(S) endpoint".into()));
+        };
+        let mut endpoint = admin.clone();
         endpoint.set_path("");
         endpoint
             .path_segments_mut()
             .map_err(|()| Error::AdminUrl("URL cannot be a base".into()))?
             .extend(["config", "apps", "http", "servers", server, "routes"]);
         Ok(endpoint)
+    }
+}
+
+fn server_routes_path(server: &str) -> String {
+    let mut endpoint = Url::parse("http://localhost").expect("static URL is valid");
+    endpoint
+        .path_segments_mut()
+        .expect("HTTP URL is a valid base")
+        .extend(["config", "apps", "http", "servers", server, "routes"]);
+    endpoint.path().to_owned()
+}
+
+struct UnixResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl UnixResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn ensure_success(&self) -> Result<(), Error> {
+        if (200..=299).contains(&self.status) {
+            Ok(())
+        } else {
+            Err(self.status_error())
+        }
+    }
+
+    fn status_error(&self) -> Error {
+        let body = String::from_utf8_lossy(&self.body);
+        Error::AdminRequest(format!("HTTP status {}: {}", self.status, body.trim()))
+    }
+}
+
+fn unix_request(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+) -> Result<UnixResponse, Error> {
+    let mut stream = UnixStream::connect(socket).map_err(|error| {
+        Error::AdminRequest(format!(
+            "cannot connect to Unix socket {}: {error}",
+            socket.display()
+        ))
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| Error::AdminRequest(error.to_string()))?;
+
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n"
+    )
+    .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")
+            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    }
+    if let Some(body) = body {
+        write!(stream, "Content-Length: {}\r\n", body.len())
+            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    }
+    stream
+        .write_all(b"\r\n")
+        .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    if let Some(body) = body {
+        stream
+            .write_all(body)
+            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    }
+
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    parse_http_response(&bytes)
+}
+
+fn parse_http_response(bytes: &[u8]) -> Result<UnixResponse, Error> {
+    let header_end = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| Error::AdminRequest("invalid response from Unix socket".into()))?;
+    let head = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| Error::AdminRequest("invalid HTTP status from Unix socket".into()))?;
+    let headers: Vec<(String, String)> = lines
+        .map(|line| {
+            line.split_once(':')
+                .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+                .ok_or_else(|| Error::AdminRequest("invalid HTTP header from Unix socket".into()))
+        })
+        .collect::<Result<_, _>>()?;
+    let raw_body = &bytes[header_end + 4..];
+    let body = if headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding") && value.eq_ignore_ascii_case("chunked")
+    }) {
+        decode_chunked(raw_body)?
+    } else if let Some(length) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+    {
+        raw_body
+            .get(..length)
+            .ok_or_else(|| Error::AdminRequest("truncated response from Unix socket".into()))?
+            .to_vec()
+    } else {
+        raw_body.to_vec()
+    };
+    Ok(UnixResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = bytes
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| Error::AdminRequest("invalid chunked response".into()))?;
+        let size = std::str::from_utf8(&bytes[..line_end])
+            .ok()
+            .and_then(|line| line.split(';').next())
+            .and_then(|size| usize::from_str_radix(size.trim(), 16).ok())
+            .ok_or_else(|| Error::AdminRequest("invalid chunk size".into()))?;
+        bytes = &bytes[line_end + 2..];
+        if size == 0 {
+            return Ok(decoded);
+        }
+        let chunk = bytes
+            .get(..size)
+            .ok_or_else(|| Error::AdminRequest("truncated chunked response".into()))?;
+        decoded.extend_from_slice(chunk);
+        bytes = bytes
+            .get(size + 2..)
+            .filter(|_| bytes.get(size..size + 2) == Some(b"\r\n"))
+            .ok_or_else(|| Error::AdminRequest("invalid chunk terminator".into()))?;
     }
 }
 
@@ -829,8 +1078,10 @@ mod tests {
         Client, Error, ServerOverrides, ServerSelection, discover_servers, normalize_upstream,
     };
     use serde_json::json;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn port_becomes_loopback_http_url() {
@@ -854,6 +1105,52 @@ mod tests {
                 .trust_command(),
             "caddy trust --address 127.0.0.1:2020"
         );
+        assert_eq!(
+            Client::new("unix//run/caddy/admin.socket")
+                .unwrap()
+                .trust_command(),
+            "caddy trust --address unix//run/caddy/admin.socket"
+        );
+        assert_eq!(
+            Client::new("unix:///run/caddy/admin.socket")
+                .unwrap()
+                .trust_command(),
+            "caddy trust --address unix:///run/caddy/admin.socket"
+        );
+        assert!(matches!(
+            Client::new("unix/relative.socket"),
+            Err(Error::AdminUrl(_))
+        ));
+    }
+
+    #[test]
+    fn admin_client_reads_chunked_config_over_unix_socket() {
+        let root = std::env::temp_dir().join(format!(
+            "nook-unix-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let socket = root.join("admin.socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let size = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /config/ "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nf\r\n{\"apps\":{\"http\"\r\n11\r\n:{\"servers\":{}}}}\r\n0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let config = Client::new(&format!("unix/{}", socket.display()))
+            .unwrap()
+            .fetch_config()
+            .unwrap();
+        assert!(config.pointer("/apps/http/servers").is_some());
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

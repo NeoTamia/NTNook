@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -11,22 +12,41 @@ use std::time::{Duration, Instant};
 pub(crate) struct CaddyHarness {
     root: PathBuf,
     config: PathBuf,
-    admin_port: u16,
+    admin: AdminAddress,
     http_port: u16,
     https_port: u16,
     child: Child,
 }
 
+enum AdminAddress {
+    Tcp(u16),
+    Unix(PathBuf),
+}
+
+impl AdminAddress {
+    fn caddy_address(&self) -> String {
+        match self {
+            Self::Tcp(port) => format!("127.0.0.1:{port}"),
+            Self::Unix(socket) => format!("unix/{}", socket.display()),
+        }
+    }
+}
+
 impl CaddyHarness {
     pub(crate) fn start() -> Self {
-        Self::start_with_ports(available_port(), available_port(), false)
+        Self::start_with_ports(available_port(), available_port(), false, false)
     }
 
     pub(crate) fn start_on_standard_ports() -> Self {
-        Self::start_with_ports(80, 443, true)
+        Self::start_with_ports(80, 443, true, true)
     }
 
-    fn start_with_ports(http_port: u16, https_port: u16, trust_test_certificate: bool) -> Self {
+    fn start_with_ports(
+        http_port: u16,
+        https_port: u16,
+        trust_test_certificate: bool,
+        unix_admin: bool,
+    ) -> Self {
         assert_supported_version();
         let root = std::env::temp_dir().join(format!(
             "nook-caddy-{}-{}",
@@ -40,12 +60,17 @@ impl CaddyHarness {
         if trust_test_certificate {
             generate_test_certificate(&root);
         }
-        let admin_port = available_port();
+        let admin = if unix_admin {
+            AdminAddress::Unix(root.join("admin.socket"))
+        } else {
+            AdminAddress::Tcp(available_port())
+        };
         let config = root.join("Caddyfile");
         fs::write(
             &config,
             format!(
-                "{{\n\tadmin 127.0.0.1:{admin_port}\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\nhttp://localhost:{http_port} {{\n\trespond \"http-ok\"\n}}\n\nhttps://localhost:{https_port} {{\n\ttls internal\n\trespond \"https-ok\"\n}}\n"
+                "{{\n\tadmin \"{}\"\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\nhttp://localhost:{http_port} {{\n\trespond \"http-ok\"\n}}\n\nhttps://localhost:{https_port} {{\n\ttls internal\n\trespond \"https-ok\"\n}}\n",
+                admin.caddy_address()
             ),
         )
         .unwrap();
@@ -66,7 +91,7 @@ impl CaddyHarness {
         let harness = Self {
             root,
             config,
-            admin_port,
+            admin,
             http_port,
             https_port,
             child,
@@ -80,7 +105,20 @@ impl CaddyHarness {
     }
 
     pub(crate) fn admin_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.admin_port)
+        match &self.admin {
+            AdminAddress::Tcp(port) => format!("http://127.0.0.1:{port}"),
+            AdminAddress::Unix(_) => self.admin.caddy_address(),
+        }
+    }
+
+    pub(crate) fn config_json(&self) -> String {
+        let response = admin_get(&self.admin).expect("Caddy Admin API request failed");
+        let body = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| &response[index + 4..])
+            .expect("Caddy Admin API returned an invalid HTTP response");
+        String::from_utf8(body.to_vec()).expect("Caddy configuration must be UTF-8 JSON")
     }
 
     pub(crate) fn http_url(&self) -> String {
@@ -107,8 +145,8 @@ impl CaddyHarness {
         fs::write(
             &self.config,
             format!(
-                "{{\n\tadmin 127.0.0.1:{}\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\nhttp://localhost:{} {{\n{directives}\n}}\n\nhttps://localhost:{} {{\n\ttls internal\n\trespond \"https-ok\"\n}}\n",
-                self.admin_port, self.http_port, self.https_port
+                "{{\n\tadmin \"{}\"\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\nhttp://localhost:{} {{\n{directives}\n}}\n\nhttps://localhost:{} {{\n\ttls internal\n\trespond \"https-ok\"\n}}\n",
+                self.admin.caddy_address(), self.http_port, self.https_port
             ),
         )
         .unwrap();
@@ -119,8 +157,8 @@ impl CaddyHarness {
         fs::write(
             &self.config,
             format!(
-                "{{\n\tadmin 127.0.0.1:{}\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\n{sites}\n",
-                self.admin_port
+                "{{\n\tadmin \"{}\"\n\tauto_https disable_redirects\n\tskip_install_trust\n}}\n\n{sites}\n",
+                self.admin.caddy_address()
             ),
         )
         .unwrap();
@@ -132,7 +170,7 @@ impl CaddyHarness {
             .args(["reload", "--config"])
             .arg(&self.config)
             .args(["--adapter", "caddyfile", "--address"])
-            .arg(format!("127.0.0.1:{}", self.admin_port))
+            .arg(self.admin.caddy_address())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -143,7 +181,7 @@ impl CaddyHarness {
     fn wait_until_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if admin_responds(self.admin_port) {
+            if admin_responds(&self.admin) {
                 return;
             }
             thread::sleep(Duration::from_millis(25));
@@ -203,20 +241,35 @@ fn available_port() -> u16 {
         .port()
 }
 
-fn admin_responds(port: u16) -> bool {
-    let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
-        return false;
-    };
-    let _ = write!(
-        stream,
-        "GET /config/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
-    let mut response = [0_u8; 32];
-    stream.read(&mut response).is_ok_and(|size| {
-        response[..size].starts_with(b"HTTP/1.1 200")
-            || response[..size].starts_with(b"HTTP/1.0 200")
+fn admin_responds(admin: &AdminAddress) -> bool {
+    admin_get(admin).is_some_and(|response| {
+        response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200")
     })
 }
+
+fn admin_get(admin: &AdminAddress) -> Option<Vec<u8>> {
+    let (mut stream, host): (Box<dyn ReadWrite>, String) = match admin {
+        AdminAddress::Tcp(port) => {
+            let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, *port)).ok()?;
+            (Box::new(stream), format!("127.0.0.1:{port}"))
+        }
+        AdminAddress::Unix(socket) => {
+            let stream = UnixStream::connect(socket).ok()?;
+            (Box::new(stream), "localhost".into())
+        }
+    };
+    write!(
+        stream,
+        "GET /config/ HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    Some(response)
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
 
 fn assert_supported_version() {
     let output = Command::new("caddy")

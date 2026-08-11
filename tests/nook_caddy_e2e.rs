@@ -76,6 +76,13 @@ https://localhost:443 {{
 	respond \"https-ok\"
 }}"
     ));
+    let status = nook(&config_home, &state_home, &["status"]);
+    assert_success(&status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("caddy\tok"));
+    assert!(
+        String::from_utf8_lossy(&status.stderr)
+            .contains(&format!("caddy trust --address {}", harness.admin_url()))
+    );
     let foreign_config = fetch_config(&harness);
     let rejected = nook(
         &config_home,
@@ -328,12 +335,7 @@ fn curl(scheme: &str, port: u16, hostname: &str) -> Output {
 }
 
 fn fetch_config(harness: &CaddyHarness) -> String {
-    ureq::get(format!("{}/config/", harness.admin_url()))
-        .call()
-        .unwrap()
-        .body_mut()
-        .read_to_string()
-        .unwrap()
+    harness.config_json()
 }
 
 fn wait_for_state(state_home: &Path, hostname: &str, expected: &str) {

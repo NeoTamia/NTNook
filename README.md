@@ -101,11 +101,19 @@ caddy_admin = "http://127.0.0.1:2019"
 # http_server = "http"
 ```
 
+Si l’Admin API de Caddy écoute sur un socket Unix, utilisez directement son adresse Caddy :
+
+```toml
+caddy_admin = "unix//run/caddy/admin.socket"
+```
+
+L’utilisateur qui exécute Nook doit avoir le droit de traverser le répertoire et de lire/écrire sur le socket. La forme URI `unix:///run/caddy/admin.socket` est également acceptée.
+
 L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallback `~/.local/state/nook/state.json`. Les écritures sont atomiques et verrouillées ; il ne faut pas éditer ce registre pendant l’exécution de Nook.
 
 ## Dépannage
 
-- `Caddy Admin API request failed` : vérifier que Caddy tourne et que `caddy_admin` est correct.
+- `Caddy Admin API request failed` : vérifier que Caddy tourne, que `caddy_admin` est correct et, pour un socket Unix, que ses permissions autorisent l’utilisateur courant.
 - `expected exactly one ... server` : utiliser les candidats affichés pour définir `https_server` ou `http_server`.
 - `no selected Caddy HTTP server` : configurer un listener `:80` avant d’utiliser `--no-tls`.
 - `hostname ... foreign Caddy route` : choisir un autre nom ou modifier cette route directement hors de Nook.
