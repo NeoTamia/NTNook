@@ -201,6 +201,7 @@ fn start_run_with_hook(
         scheme: Scheme::Http,
         tls: config.tls,
         replace_existing: config.force,
+        preserve_host: false,
     };
     store.mutate(|registry| {
         registry.pending_operations.push(PendingOperation {

@@ -216,7 +216,12 @@ impl RouteBackend for ManagedCaddyRoutes<'_> {
         let upstream = normalize_upstream(&route.target).map_err(route_error)?;
         let owner_id = route.owner_id;
         let hostname = route.hostname.clone();
-        let proxy = build_proxy_route(&owner_route_id(owner_id), &hostname, &upstream.url);
+        let proxy = build_proxy_route(
+            &owner_route_id(owner_id),
+            &hostname,
+            &upstream.url,
+            route.preserve_host,
+        );
         self.client
             .mutate_server_routes(server, move |mut routes| {
                 reject_foreign_hostname_claims(&routes, std::slice::from_ref(&hostname))?;
@@ -437,14 +442,23 @@ fn is_catch_all(route: &Value) -> bool {
         .is_none_or(Vec::is_empty)
 }
 
-pub(crate) fn build_proxy_route(id: &str, hostname: &str, upstream: &Url) -> Value {
+pub(crate) fn build_proxy_route(
+    id: &str,
+    hostname: &str,
+    upstream: &Url,
+    preserve_host: bool,
+) -> Value {
     let host = upstream.host_str().expect("validated upstream has a host");
     let port = upstream
         .port_or_known_default()
         .expect("HTTP(S) has a default port");
     let mut proxy = json!({
         "handler": "reverse_proxy",
-        "upstreams": [{ "dial": format!("{host}:{port}") }]
+        "upstreams": [{ "dial": format!("{host}:{port}") }],
+        "headers": { "request": { "set": {
+            "Host": [if preserve_host { "{http.request.host}" } else { "{http.reverse_proxy.upstream.hostport}" }],
+            "X-Forwarded-Host": ["{http.request.host}"]
+        } } }
     });
     if upstream.scheme() == "https" {
         proxy["transport"] = json!({ "protocol": "http", "tls": {} });
@@ -835,7 +849,7 @@ mod tests {
     #[test]
     fn proxy_route_combines_host_and_loopback_in_one_matcher() {
         let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
-        let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream);
+        let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream, false);
         assert_eq!(
             route.pointer("/match/0/host").unwrap(),
             &json!(["api.localhost"])
@@ -844,12 +858,34 @@ mod tests {
             route.pointer("/match/0/remote_ip/ranges").unwrap(),
             &json!(["127.0.0.0/8", "::1"])
         );
+        assert_eq!(
+            route.pointer("/handle/0/headers/request/set/Host/0"),
+            Some(&json!("{http.reverse_proxy.upstream.hostport}"))
+        );
+        assert_eq!(
+            route.pointer("/handle/0/headers/request/set/X-Forwarded-Host/0"),
+            Some(&json!("{http.request.host}"))
+        );
+    }
+
+    #[test]
+    fn preserve_host_uses_the_requested_localhost_domain() {
+        let upstream = url::Url::parse("https://service.example:8443").unwrap();
+        let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream, true);
+        assert_eq!(
+            route.pointer("/handle/0/headers/request/set/Host/0"),
+            Some(&json!("{http.request.host}"))
+        );
+        assert_eq!(
+            route.pointer("/handle/0/headers/request/set/X-Forwarded-Host/0"),
+            Some(&json!("{http.request.host}"))
+        );
     }
 
     #[test]
     fn https_proxy_enables_tls_without_disabling_verification() {
         let upstream = url::Url::parse("https://example.com").unwrap();
-        let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream);
+        let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream, false);
         assert_eq!(
             route.pointer("/handle/0/transport/tls").unwrap(),
             &json!({})
@@ -965,6 +1001,7 @@ mod tests {
             &super::owner_route_id(new_owner),
             "api.localhost",
             &upstream,
+            false,
         );
         let managed = super::ManagedRoute {
             hostname: "api.localhost".into(),
@@ -986,6 +1023,7 @@ mod tests {
             &super::owner_route_id(old_owner),
             "api.localhost",
             &upstream,
+            false,
         );
         let (container, _) = super::build_containers(&[super::ManagedRoute {
             hostname: "api.localhost".into(),
@@ -1019,8 +1057,12 @@ mod tests {
     fn owned_route_upsert_and_removal_are_idempotent() {
         let owner = uuid::Uuid::new_v4();
         let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
-        let route =
-            super::build_proxy_route(&super::owner_route_id(owner), "api.localhost", &upstream);
+        let route = super::build_proxy_route(
+            &super::owner_route_id(owner),
+            "api.localhost",
+            &upstream,
+            false,
+        );
         let mut routes = Vec::new();
         for _ in 0..2 {
             super::update_owned_route(
@@ -1093,6 +1135,7 @@ mod tests {
                 scheme: Scheme::Http,
                 tls: true,
                 replace_existing: false,
+                preserve_host: false,
             })
             .unwrap();
         server.join().unwrap();

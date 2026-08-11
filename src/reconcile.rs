@@ -17,6 +17,7 @@ pub(crate) struct RouteSpec {
     pub(crate) scheme: Scheme,
     pub(crate) tls: bool,
     pub(crate) replace_existing: bool,
+    pub(crate) preserve_host: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,213 @@ pub(crate) struct Report {
     pub(crate) removed_dead_leases: usize,
     pub(crate) completed_operations: usize,
     pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AliasRequest {
+    pub(crate) hostname: String,
+    pub(crate) target: String,
+    pub(crate) scheme: Scheme,
+    pub(crate) tls: bool,
+    pub(crate) preserve_host: bool,
+    pub(crate) force: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AliasError {
+    State(String),
+    Route(RouteError),
+    Conflict(String),
+}
+
+impl fmt::Display for AliasError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(error) => formatter.write_str(error),
+            Self::Route(error) => error.fmt(formatter),
+            Self::Conflict(hostname) => write!(
+                formatter,
+                "hostname `{hostname}` is already managed by Nook; use --force to replace it"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AliasOutcome {
+    pub(crate) alias: Alias,
+    pub(crate) warnings: Vec<String>,
+}
+
+pub(crate) fn set_alias(
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    request: AliasRequest,
+) -> Result<AliasOutcome, AliasError> {
+    let _operations = store
+        .lock_operations()
+        .map_err(|error| AliasError::State(error.to_string()))?;
+    let conflicts = store
+        .mutate(|registry| {
+            let aliases = registry
+                .aliases
+                .values()
+                .filter(|alias| alias.hostname == request.hostname)
+                .map(|alias| (alias.id, alias.tls));
+            let leases = registry
+                .leases
+                .values()
+                .filter(|lease| lease.hostname == request.hostname)
+                .map(|lease| (lease.id, lease.tls));
+            Ok(aliases.chain(leases).collect::<Vec<_>>())
+        })
+        .map_err(|error| AliasError::State(error.to_string()))?;
+    if !conflicts.is_empty() && !request.force {
+        return Err(AliasError::Conflict(request.hostname));
+    }
+
+    let alias = Alias {
+        id: Uuid::new_v4(),
+        hostname: request.hostname,
+        target: request.target,
+        scheme: request.scheme,
+        tls: request.tls,
+        preserve_host: request.preserve_host,
+    };
+    let operation_id = Uuid::new_v4();
+    store
+        .mutate(|registry| {
+            registry.pending_operations.push(PendingOperation {
+                id: operation_id,
+                kind: PendingOperationKind::InstallRoute {
+                    hostname: alias.hostname.clone(),
+                    target: alias.target.clone(),
+                    scheme: alias.scheme,
+                    owner_id: alias.id,
+                    tls: alias.tls,
+                },
+            });
+            Ok(())
+        })
+        .map_err(|error| AliasError::State(error.to_string()))?;
+    routes
+        .ensure(&RouteSpec {
+            owner_id: alias.id,
+            hostname: alias.hostname.clone(),
+            target: alias.target.clone(),
+            scheme: alias.scheme,
+            tls: alias.tls,
+            replace_existing: request.force,
+            preserve_host: request.preserve_host,
+        })
+        .map_err(AliasError::Route)?;
+    let cleanup: Vec<_> = conflicts
+        .iter()
+        .map(|(owner, tls)| {
+            (
+                *owner,
+                *tls,
+                routes.remove_if_owned(&alias.hostname, *owner, *tls),
+            )
+        })
+        .collect();
+    let mut warnings = Vec::new();
+    if !conflicts.is_empty() {
+        warnings.push(format!(
+            "replaced existing Nook route for {}",
+            alias.hostname
+        ));
+    }
+    store
+        .mutate(|registry| {
+            let old_owners: BTreeSet<_> = conflicts.iter().map(|(owner, _)| *owner).collect();
+            registry
+                .aliases
+                .retain(|_, old| !old_owners.contains(&old.id));
+            registry
+                .leases
+                .retain(|owner, _| !old_owners.contains(owner));
+            registry.pending_operations.retain(|operation| {
+                operation.id == operation_id
+                    || pending_owner(&operation.kind)
+                        .is_none_or(|owner| !old_owners.contains(&owner))
+            });
+            registry
+                .aliases
+                .insert(alias.hostname.clone(), alias.clone());
+            registry
+                .pending_operations
+                .retain(|operation| operation.id != operation_id);
+            for (owner_id, tls, result) in &cleanup {
+                if let Err(error) = result {
+                    warnings.push(format!("cleanup of previous route is pending: {error}"));
+                    queue_remove(registry, &alias.hostname, *owner_id, *tls);
+                }
+            }
+            Ok(())
+        })
+        .map_err(|error| AliasError::State(error.to_string()))?;
+    Ok(AliasOutcome { alias, warnings })
+}
+
+pub(crate) fn remove_alias(
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    hostname: &str,
+) -> Result<Vec<String>, AliasError> {
+    let _operations = store
+        .lock_operations()
+        .map_err(|error| AliasError::State(error.to_string()))?;
+    let removal = store
+        .mutate(|registry| {
+            let Some(alias) = registry.aliases.remove(hostname) else {
+                return Ok(None);
+            };
+            let operation_id = Uuid::new_v4();
+            registry.pending_operations.push(PendingOperation {
+                id: operation_id,
+                kind: PendingOperationKind::RemoveRoute {
+                    hostname: alias.hostname.clone(),
+                    owner_id: alias.id,
+                    tls: alias.tls,
+                },
+            });
+            Ok(Some((alias, operation_id)))
+        })
+        .map_err(|error| AliasError::State(error.to_string()))?;
+    let Some((alias, operation_id)) = removal else {
+        return Ok(Vec::new());
+    };
+    match routes.remove_if_owned(&alias.hostname, alias.id, alias.tls) {
+        Ok(()) => {
+            store
+                .mutate(|registry| {
+                    registry
+                        .pending_operations
+                        .retain(|operation| operation.id != operation_id);
+                    Ok(())
+                })
+                .map_err(|error| AliasError::State(error.to_string()))?;
+            Ok(Vec::new())
+        }
+        Err(error) => Ok(vec![format!("alias cleanup is pending: {error}")]),
+    }
+}
+
+pub(crate) fn list_aliases(store: &Store) -> Result<Vec<Alias>, AliasError> {
+    store
+        .mutate(|registry| Ok(registry.aliases.values().cloned().collect()))
+        .map_err(|error| AliasError::State(error.to_string()))
+}
+
+fn pending_owner(kind: &PendingOperationKind) -> Option<Uuid> {
+    match kind {
+        PendingOperationKind::InstallRoute { owner_id, .. }
+        | PendingOperationKind::RestoreRoute { owner_id, .. }
+        | PendingOperationKind::RemoveRoute { owner_id, .. }
+        | PendingOperationKind::StartProcess { owner_id, .. } => Some(*owner_id),
+        PendingOperationKind::FinalizeLease { lease_id } => Some(*lease_id),
+    }
 }
 
 pub(crate) fn reconcile(
@@ -189,6 +397,7 @@ fn route_for_lease(lease: &Lease) -> RouteSpec {
         scheme: lease.scheme,
         tls: lease.tls,
         replace_existing: false,
+        preserve_host: false,
     }
 }
 
@@ -200,6 +409,7 @@ fn route_for_alias(alias: &Alias) -> RouteSpec {
         scheme: alias.scheme,
         tls: alias.tls,
         replace_existing: false,
+        preserve_host: alias.preserve_host,
     }
 }
 
@@ -266,7 +476,10 @@ fn deduplicate_pending(registry: &mut Registry) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{RouteBackend, RouteError, RouteSpec, reconcile, reconcile_store};
+    use super::{
+        AliasError, AliasRequest, RouteBackend, RouteError, RouteSpec, list_aliases, reconcile,
+        reconcile_store, remove_alias, set_alias,
+    };
     use crate::process::Liveness;
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme, Store, decode};
     use uuid::Uuid;
@@ -386,6 +599,92 @@ mod tests {
         assert!(!persisted.leases.contains_key(&owner));
         assert_eq!(persisted.pending_operations.len(), 1);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn alias_is_persisted_listed_and_requires_force_to_replace() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let created = set_alias(&store, &mut routes, alias_request(false)).unwrap();
+        let aliases = list_aliases(&store).unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0], created.alias);
+        assert!(matches!(
+            set_alias(&store, &mut routes, alias_request(false)),
+            Err(AliasError::Conflict(hostname)) if hostname == "alias.localhost"
+        ));
+        let replacement = set_alias(&store, &mut routes, alias_request(true)).unwrap();
+        assert_eq!(replacement.warnings.len(), 1);
+        assert_eq!(routes.owners["alias.localhost"], replacement.alias.id);
+        assert_eq!(list_aliases(&store).unwrap(), [replacement.alias]);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn alias_removal_is_idempotent_and_cannot_remove_a_foreign_owner() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let created = set_alias(&store, &mut routes, alias_request(false)).unwrap();
+        let foreign_owner = Uuid::new_v4();
+        routes
+            .owners
+            .insert(created.alias.hostname.clone(), foreign_owner);
+        assert!(
+            remove_alias(&store, &mut routes, "alias.localhost")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            remove_alias(&store, &mut routes, "alias.localhost")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(routes.owners["alias.localhost"], foreign_owner);
+        assert!(list_aliases(&store).unwrap().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_alias_cleanup_is_journaled_without_restoring_the_alias() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        set_alias(&store, &mut routes, alias_request(false)).unwrap();
+        routes.unavailable = true;
+        assert_eq!(
+            remove_alias(&store, &mut routes, "alias.localhost")
+                .unwrap()
+                .len(),
+            1
+        );
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(registry.aliases.is_empty());
+        assert_eq!(registry.pending_operations.len(), 1);
+        routes.unavailable = false;
+        reconcile_store(&store, &mut routes, |_| Liveness::Dead).unwrap();
+        assert!(
+            decode(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .pending_operations
+                .is_empty()
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn alias_request(force: bool) -> AliasRequest {
+        AliasRequest {
+            hostname: "alias.localhost".into(),
+            target: "http://127.0.0.1:9".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            preserve_host: false,
+            force,
+        }
+    }
+
+    fn temporary_store() -> (Store, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!("nook-alias-{}", Uuid::new_v4()));
+        let path = directory.join("state.json");
+        (Store::new(path.clone()), path)
     }
 
     fn alias(hostname: &str) -> Alias {
