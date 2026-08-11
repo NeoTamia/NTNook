@@ -19,6 +19,14 @@ pub(crate) struct CaddyHarness {
 
 impl CaddyHarness {
     pub(crate) fn start() -> Self {
+        Self::start_with_ports(available_port(), available_port(), false)
+    }
+
+    pub(crate) fn start_on_standard_ports() -> Self {
+        Self::start_with_ports(80, 443, true)
+    }
+
+    fn start_with_ports(http_port: u16, https_port: u16, trust_test_certificate: bool) -> Self {
         assert_supported_version();
         let root = std::env::temp_dir().join(format!(
             "nook-caddy-{}-{}",
@@ -29,9 +37,10 @@ impl CaddyHarness {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
+        if trust_test_certificate {
+            generate_test_certificate(&root);
+        }
         let admin_port = available_port();
-        let http_port = available_port();
-        let https_port = available_port();
         let config = root.join("Caddyfile");
         fs::write(
             &config,
@@ -42,7 +51,11 @@ impl CaddyHarness {
         .unwrap();
         let stdout = File::create(root.join("stdout.log")).unwrap();
         let stderr = File::create(root.join("stderr.log")).unwrap();
-        let child = isolated_command(&root)
+        let mut command = isolated_command(&root);
+        if trust_test_certificate {
+            command.env("SSL_CERT_FILE", root.join("test-upstream.crt"));
+        }
+        let child = command
             .args(["run", "--config"])
             .arg(&config)
             .args(["--adapter", "caddyfile"])
@@ -138,6 +151,31 @@ impl CaddyHarness {
         let log = fs::read_to_string(self.root.join("stderr.log")).unwrap_or_default();
         panic!("isolated Caddy did not start:\n{log}");
     }
+}
+
+fn generate_test_certificate(root: &Path) {
+    let status = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
+        .arg("-keyout")
+        .arg(root.join("test-upstream.key"))
+        .arg("-out")
+        .arg(root.join("test-upstream.crt"))
+        .args([
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-days",
+            "1",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("OpenSSL is required for integration tests");
+    assert!(
+        status.success(),
+        "failed to generate trusted test certificate"
+    );
 }
 
 impl Drop for CaddyHarness {

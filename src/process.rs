@@ -30,6 +30,7 @@ pub(crate) enum Liveness {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcIdentity {
+    state: u8,
     pgid: i32,
     start_time_ticks: u64,
 }
@@ -85,19 +86,21 @@ impl ManagedChild {
 
     pub(crate) fn wait(&mut self) -> Result<i32, Error> {
         let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(Error::Spawn)?;
-        let handle = signals.handle();
-        let pgid = self.pgid;
-        let forwarder = thread::spawn(move || {
-            for signal in signals.forever() {
-                let _ = send_group_signal(pgid, signal);
+        self.wait_with_signals(&mut signals)
+    }
+
+    fn wait_with_signals(&mut self, signals: &mut Signals) -> Result<i32, Error> {
+        loop {
+            for signal in signals.pending() {
+                let _ = send_group_signal(self.pgid, signal);
             }
-        });
-        let status = self.child.wait().map_err(Error::Spawn)?;
-        handle.close();
-        let _ = forwarder.join();
-        Ok(status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+            if let Some(status) = self.child.try_wait().map_err(Error::Spawn)? {
+                return Ok(status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn has_exited(&mut self) -> Result<bool, Error> {
@@ -165,6 +168,7 @@ pub(crate) struct RunningChild {
     pub(crate) warning: Option<String>,
     tls: bool,
     readiness_warn_after: Duration,
+    signals: Signals,
 }
 
 pub(crate) fn start_run(
@@ -181,6 +185,7 @@ fn start_run_with_hook(
     routes: &mut impl RouteBackend,
     after_release: impl FnOnce(u16),
 ) -> Result<RunningChild, RunError> {
+    let signals = Signals::new([SIGINT, SIGTERM]).map_err(Error::Spawn)?;
     let _operations = store.lock_operations()?;
     let conflicts = store.mutate(|registry| {
         let aliases = registry
@@ -340,6 +345,7 @@ fn start_run_with_hook(
         warning,
         tls: config.tls,
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
+        signals,
     })
 }
 
@@ -362,6 +368,9 @@ impl RunningChild {
         let started = Instant::now();
         let mut warned = false;
         loop {
+            for signal in self.signals.pending() {
+                self.child.signal_group(signal)?;
+            }
             if TcpStream::connect_timeout(
                 &SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port).into(),
                 Duration::from_millis(100),
@@ -395,7 +404,7 @@ impl RunningChild {
         store: &Store,
         routes: &mut impl RouteBackend,
     ) -> Result<RunOutcome, RunError> {
-        let exit_code = self.child.wait()?;
+        let exit_code = self.child.wait_with_signals(&mut self.signals)?;
         let _operations = store.lock_operations()?;
         let cleanup = routes.remove_if_owned(&self.hostname, self.lease_id, self.tls);
         let mut warnings = Vec::new();
@@ -699,13 +708,9 @@ pub(crate) fn child_environment(port: u16, hostname: &str, tls: bool) -> [(OsStr
 pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     match fs::read_to_string(format!("/proc/{}/stat", lease.pid)) {
         Ok(stat) => match parse_stat(&stat) {
-            Some(identity)
-                if identity.pgid == lease.pgid
-                    && identity.start_time_ticks == lease.process_start_time_ticks =>
-            {
-                Liveness::Alive
+            Some(identity) => {
+                identity_liveness(identity, lease.pgid, lease.process_start_time_ticks)
             }
-            Some(_) => Liveness::Dead,
             None => Liveness::Indeterminate,
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Liveness::Dead,
@@ -713,10 +718,22 @@ pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     }
 }
 
+fn identity_liveness(identity: ProcIdentity, pgid: i32, start_time_ticks: u64) -> Liveness {
+    if matches!(identity.state, b'Z' | b'X')
+        || identity.pgid != pgid
+        || identity.start_time_ticks != start_time_ticks
+    {
+        Liveness::Dead
+    } else {
+        Liveness::Alive
+    }
+}
+
 fn parse_stat(stat: &str) -> Option<ProcIdentity> {
     let command_end = stat.rfind(')')?;
     let fields: Vec<_> = stat.get(command_end + 1..)?.split_whitespace().collect();
     Some(ProcIdentity {
+        state: *fields.first()?.as_bytes().first()?,
         pgid: fields.get(2)?.parse().ok()?,
         start_time_ticks: fields.get(19)?.parse().ok()?,
     })
@@ -730,8 +747,9 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::{
-        Error, Liveness, ProcIdentity, StopError, StopSystem, child_environment, parse_stat,
-        reserve_port, spawn_child, start_run, start_run_with_hook, stop_managed, substitute_port,
+        Error, Liveness, ProcIdentity, StopError, StopSystem, child_environment, identity_liveness,
+        parse_stat, reserve_port, spawn_child, start_run, start_run_with_hook, stop_managed,
+        substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -777,6 +795,7 @@ mod tests {
         assert_eq!(
             parse_stat(stat),
             Some(ProcIdentity {
+                state: b'S',
                 pgid: 77,
                 start_time_ticks: 98765
             })
@@ -787,6 +806,38 @@ mod tests {
     fn malformed_or_truncated_proc_data_is_indeterminate() {
         assert_eq!(parse_stat("42 (worker) S 1"), None);
         assert_eq!(parse_stat("not proc stat"), None);
+    }
+
+    #[test]
+    fn zombie_and_reused_process_identities_are_dead() {
+        let identity = ProcIdentity {
+            state: b'Z',
+            pgid: 77,
+            start_time_ticks: 98765,
+        };
+        assert_eq!(identity_liveness(identity, 77, 98765), Liveness::Dead);
+        assert_eq!(
+            identity_liveness(
+                ProcIdentity {
+                    state: b'S',
+                    ..identity
+                },
+                77,
+                98765,
+            ),
+            Liveness::Alive
+        );
+        assert_eq!(
+            identity_liveness(
+                ProcIdentity {
+                    state: b'S',
+                    ..identity
+                },
+                77,
+                1,
+            ),
+            Liveness::Dead
+        );
     }
 
     #[test]

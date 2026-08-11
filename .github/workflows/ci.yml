@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system test dependencies
-        run: sudo apt-get update && sudo apt-get install --yes ca-certificates curl openssl python3
+        run: sudo apt-get update && sudo apt-get install --yes ca-certificates curl iproute2 openssl python3 util-linux
 
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
@@ -42,7 +42,9 @@ jobs:
         run: cargo check --locked
 
       - name: Test
-        run: cargo test --locked -- --test-threads=1
+        run: |
+          sudo sysctl --write net.ipv4.ip_unprivileged_port_start=0
+          NOOK_E2E_DIRECT=1 cargo test --locked -- --test-threads=1
 
       - name: Lint
         run: cargo clippy --locked --all-targets --all-features -- -D warnings

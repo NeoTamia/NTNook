@@ -129,6 +129,6 @@ cargo test -- --test-threads=1
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Les intégrations requièrent Caddy `2.11.x` et OpenSSL. Elles utilisent uniquement des ports loopback et des répertoires temporaires, désactivent l’installation de confiance et nettoient leurs processus et fichiers.
+Les intégrations requièrent Caddy `2.11.x`, OpenSSL, Python 3, curl avec HTTP/2, `unshare` et `ip`. Elles utilisent uniquement des ports loopback et des répertoires temporaires, désactivent l’installation de confiance et nettoient leurs processus et fichiers. Le test complet Nook/Caddy ouvre `:80` et `:443` dans un namespace réseau utilisateur isolé ; la CI effectue le même test sur son runner jetable.
 
 La CI Linux applique cette porte avec la toolchain épinglée dans `rust-toolchain.toml`, puis produit un artefact x86-64 et sa somme SHA-256. Voir [la traçabilité](docs/TRACEABILITY.md) et [les notes de release](RELEASE.md).

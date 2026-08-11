@@ -16,7 +16,7 @@ Cette version fournit un unique binaire Linux `nook`. L’artefact CI `nook-linu
 - Caddy `2.11.x` installé et démarré séparément, avec Admin API accessible ;
 - serveurs Caddy non ambigus sur `:443` et, pour `--no-tls`, sur `:80`.
 
-La compilation reproductible utilise Rust `1.97.1` et `Cargo.lock`. OpenSSL, Python 3 et curl avec HTTP/2 sont uniquement requis par les tests d’intégration, pas par le binaire.
+La compilation reproductible utilise Rust `1.97.1` et `Cargo.lock`. OpenSSL, Python 3, curl avec HTTP/2, util-linux et iproute2 sont uniquement requis par les tests d’intégration, pas par le binaire.
 
 ## Hors périmètre
 

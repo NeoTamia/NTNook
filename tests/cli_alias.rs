@@ -43,7 +43,7 @@ fn alias_shortcuts_persist_list_and_remove_idempotently() {
 
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 11));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 25));
 
     let set = nook(&config_home, &state_home, &["alias", "api", "3000"]);
     assert_success(&set);
@@ -137,7 +137,7 @@ fn run_preserves_child_exit_when_cleanup_becomes_unavailable() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 3));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 4));
     let script = "import os,socket,time;s=socket.socket();s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(.1);raise SystemExit(7)";
     let run = nook(
         &config_home,
@@ -194,7 +194,7 @@ fn stop_command_targets_the_current_managed_process_group() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 5));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 9));
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .args(["run", "--name", "sleeper", "--", "/bin/sleep", "10"])
         .env("XDG_CONFIG_HOME", &config_home)
@@ -236,7 +236,7 @@ fn sigint_is_forwarded_and_the_route_is_cleaned_up() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 5));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
     let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .args([
@@ -268,13 +268,82 @@ fn sigint_is_forwarded_and_the_route_is_cleaned_up() {
 }
 
 #[test]
+fn sigint_during_starting_is_forwarded_and_cleaned_up() {
+    let (directory, config_home, state_home) = temporary_homes("sigint-starting");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args(["run", "--name", "starting", "--", "/bin/sleep", "10"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_lease_state(&state_home, "starting.localhost", "starting");
+    let signal = Command::new("kill")
+        .args(["-INT", &running.id().to_string()])
+        .output()
+        .unwrap();
+    assert_success(&signal);
+    let outcome = running.wait().unwrap();
+    server.join().unwrap();
+    assert_eq!(outcome.code(), Some(130));
+    assert!(routes.lock().unwrap().is_empty());
+    assert!(
+        !fs::read_to_string(state_home.join("nook/state.json"))
+            .unwrap()
+            .contains("starting.localhost")
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn force_stop_kills_a_group_that_ignores_sigterm() {
+    let (directory, config_home, state_home) = temporary_homes("force-stop");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, listener.local_addr().unwrap());
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let server_routes = Arc::clone(&routes);
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 9));
+    let script = "import os,signal,socket,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
+    let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args([
+            "run",
+            "--name",
+            "stubborn",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+        ])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_lease(&state_home, "stubborn.localhost");
+    let stop = nook(&config_home, &state_home, &["stop", "stubborn", "--force"]);
+    assert_success(&stop);
+    let outcome = running.wait().unwrap();
+    server.join().unwrap();
+    assert_eq!(outcome.code(), Some(137));
+    assert!(routes.lock().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn prune_recovers_after_the_supervising_cli_is_killed() {
     let (directory, config_home, state_home) = temporary_homes("crash-prune");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 7));
     let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .args([
@@ -315,7 +384,7 @@ fn external_reload_is_reconciled_on_prune() {
     let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     write_global_config(&config_home, first_listener.local_addr().unwrap());
     let first_routes = Arc::clone(&routes);
-    let first_server = thread::spawn(move || serve_caddy(first_listener, first_routes, 3));
+    let first_server = thread::spawn(move || serve_caddy(first_listener, first_routes, 4));
     assert_success(&nook(&config_home, &state_home, &["alias", "api", "3000"]));
     first_server.join().unwrap();
     routes.lock().unwrap().clear();
@@ -345,6 +414,38 @@ fn external_reload_is_reconciled_on_prune() {
 }
 
 #[test]
+fn ordinary_list_reconciles_reload_and_records_synchronization() {
+    let (directory, config_home, state_home) = temporary_homes("automatic-reconcile");
+    let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, first_listener.local_addr().unwrap());
+    let first_routes = Arc::clone(&routes);
+    let first_server = thread::spawn(move || serve_caddy(first_listener, first_routes, 4));
+    assert_success(&nook(&config_home, &state_home, &["alias", "api", "3000"]));
+    first_server.join().unwrap();
+    routes.lock().unwrap().clear();
+
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    write_global_config(&config_home, second_listener.local_addr().unwrap());
+    let second_routes = Arc::clone(&routes);
+    let second_server = thread::spawn(move || serve_caddy(second_listener, second_routes, 3));
+    let list = nook(&config_home, &state_home, &["list"]);
+    assert_success(&list);
+    assert!(
+        String::from_utf8(list.stdout)
+            .unwrap()
+            .contains("api.localhost")
+    );
+    second_server.join().unwrap();
+    assert!(!routes.lock().unwrap().is_empty());
+    let state: Value =
+        serde_json::from_slice(&fs::read(state_home.join("nook/state.json")).unwrap()).unwrap();
+    assert_eq!(state["selected_servers"]["https"], "https");
+    assert!(state["last_synchronized_at_unix_ms"].as_u64().is_some());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn force_refuses_a_foreign_caddy_route_without_mutating_it() {
     let (directory, config_home, state_home) = temporary_homes("foreign");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -355,7 +456,7 @@ fn force_refuses_a_foreign_caddy_route_without_mutating_it() {
     });
     let routes = Arc::new(Mutex::new(vec![foreign.clone()]));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 2));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 3));
     let set = nook(
         &config_home,
         &state_home,
@@ -375,7 +476,7 @@ fn concurrent_clis_create_and_remove_aliases_without_lost_updates() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 12));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 29));
     let create: Vec<_> = [("one", "3001"), ("two", "3002")]
         .into_iter()
         .map(|(name, port)| {
@@ -438,17 +539,21 @@ fn write_global_config(config_home: &Path, address: std::net::SocketAddr) {
 }
 
 fn wait_for_lease(state_home: &Path, hostname: &str) {
+    wait_for_lease_state(state_home, hostname, "ready");
+}
+
+fn wait_for_lease_state(state_home: &Path, hostname: &str, state_name: &str) {
     let state_path = state_home.join("nook/state.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        if fs::read_to_string(&state_path)
-            .is_ok_and(|state| state.contains(hostname) && state.contains("\"state\": \"ready\""))
-        {
+        if fs::read_to_string(&state_path).is_ok_and(|state| {
+            state.contains(hostname) && state.contains(&format!("\"state\": \"{state_name}\""))
+        }) {
             return;
         }
         thread::sleep(std::time::Duration::from_millis(20));
     }
-    panic!("lease {hostname} did not become ready");
+    panic!("lease {hostname} did not become {state_name}");
 }
 
 fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
@@ -495,7 +600,7 @@ fn serve_caddy(listener: TcpListener, routes: Arc<Mutex<Vec<Value>>>, requests: 
             );
         } else if first_line.starts_with("GET /config/apps/http/servers/https/routes ") {
             respond_json(&mut stream, &json!(*routes.lock().unwrap()), Some("\"v1\""));
-        } else if first_line.starts_with("PUT /config/apps/http/servers/https/routes ") {
+        } else if first_line.starts_with("PATCH /config/apps/http/servers/https/routes ") {
             *routes.lock().unwrap() = serde_json::from_slice(&request[header_end..]).unwrap();
             respond_json(&mut stream, &json!({}), None);
         } else {

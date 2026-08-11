@@ -200,7 +200,7 @@ impl Client {
                     .map_err(|error| Error::AdminRequest(error.to_string()))?;
                 Ok((etag, routes))
             },
-            |etag, routes| match ureq::put(endpoint.as_str())
+            |etag, routes| match ureq::patch(endpoint.as_str())
                 .header("If-Match", etag)
                 .send_json(routes)
             {
@@ -1356,7 +1356,7 @@ mod tests {
                     )
                     .unwrap();
                 } else {
-                    assert!(request.starts_with("PUT /config/apps/http/servers/https/routes "));
+                    assert!(request.starts_with("PATCH /config/apps/http/servers/https/routes "));
                     assert!(request.to_ascii_lowercase().contains("if-match: \"v1\""));
                     assert!(request.contains(&expected_marker));
                     write!(

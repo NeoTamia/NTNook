@@ -121,6 +121,9 @@ pub(crate) fn run() -> crate::Result<i32> {
 }
 
 fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate::Result<i32> {
+    if !matches!(&cli.command, Command::Prune) {
+        reconcile_before_command(errors)?;
+    }
     match cli.command {
         Command::Alias(AliasArgs {
             command: AliasCommand::Set(arguments),
@@ -329,6 +332,7 @@ fn status_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Re
 
 fn prune_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
     let store = state_store()?;
+    let _operations = store.lock_operations()?;
     let registry = store.load()?;
     let global = crate::config::load_global()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
@@ -340,7 +344,6 @@ fn prune_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Res
         https_server: selection.https.as_deref(),
         http_server: selection.http.as_deref(),
     };
-    let _operations = store.lock_operations()?;
     let expected = expected_routes(&registry);
     let mut removed_orphans = 0;
     for observed in inspection.routes {
@@ -355,8 +358,7 @@ fn prune_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Res
             }
         }
     }
-    let report =
-        crate::reconcile::reconcile_store(&store, &mut routes, crate::process::lease_liveness)?;
+    let report = reconcile_and_record(&store, &mut routes, &selection)?;
     for warning in &report.warnings {
         writeln!(errors, "warning: {warning}")?;
     }
@@ -366,6 +368,45 @@ fn prune_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Res
         report.restored, report.removed_dead_leases, removed_orphans, report.completed_operations
     )?;
     Ok(())
+}
+
+fn reconcile_before_command(errors: &mut impl Write) -> crate::Result<()> {
+    let store = state_store()?;
+    let global = crate::config::load_global()?;
+    let client = crate::caddy::Client::new(&global.caddy_admin)?;
+    let config = client.fetch_config()?;
+    let selection = available_servers(&global, &config)?;
+    let mut routes = crate::caddy::ManagedCaddyRoutes {
+        client: &client,
+        https_server: selection.https.as_deref(),
+        http_server: selection.http.as_deref(),
+    };
+    let _operations = store.lock_operations()?;
+    let report = reconcile_and_record(&store, &mut routes, &selection)?;
+    for warning in report.warnings {
+        writeln!(errors, "warning: {warning}")?;
+    }
+    Ok(())
+}
+
+fn reconcile_and_record(
+    store: &crate::state::Store,
+    routes: &mut impl RouteBackend,
+    selection: &crate::caddy::ServerSelection,
+) -> crate::Result<crate::reconcile::Report> {
+    let synchronized_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    Ok(store.mutate(|registry| {
+        let report = crate::reconcile::reconcile(registry, routes, crate::process::lease_liveness);
+        registry.selected_servers.https = selection.https.clone();
+        registry.selected_servers.http = selection.http.clone();
+        registry.last_synchronized_at_unix_ms = Some(synchronized_at);
+        Ok(report)
+    })?)
 }
 
 fn state_store() -> crate::Result<crate::state::Store> {
