@@ -4,6 +4,7 @@
 use serde_json::Value;
 use serde_json::json;
 use std::fmt;
+use std::fs;
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
@@ -38,6 +39,7 @@ pub(crate) enum Error {
     ConcurrentMutation,
     InvalidOwnedRoute,
     MissingSelectedServer(&'static str),
+    InvalidLocalCa,
 }
 
 impl fmt::Display for Error {
@@ -101,6 +103,10 @@ impl fmt::Display for Error {
                 formatter,
                 "no selected Caddy {kind} server is available for this route; configure a compatible listener or server override"
             ),
+            Self::InvalidLocalCa => write!(
+                formatter,
+                "Caddy returned an invalid local CA certificate; inspect the `local` PKI authority"
+            ),
         }
     }
 }
@@ -148,6 +154,31 @@ impl Client {
             .map_err(|error| Error::AdminRequest(error.to_string()))
     }
 
+    pub(crate) fn fetch_local_ca(&self) -> Result<String, Error> {
+        let endpoint = self
+            .admin
+            .join("/pki/ca/local")
+            .map_err(|error| Error::AdminUrl(error.to_string()))?;
+        let mut response = ureq::get(endpoint.as_str())
+            .call()
+            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| Error::AdminRequest(error.to_string()))
+    }
+
+    pub(crate) fn trust_command(&self) -> String {
+        let host = self.admin.host_str().unwrap_or("127.0.0.1");
+        let port = self.admin.port_or_known_default().unwrap_or(2019);
+        let address = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        format!("caddy trust --address {address}")
+    }
+
     pub(crate) fn mutate_server_routes(
         &self,
         server: &str,
@@ -191,6 +222,47 @@ impl Client {
             .extend(["config", "apps", "http", "servers", server, "routes"]);
         Ok(endpoint)
     }
+}
+
+pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
+    let certificate = pem_certificates(pem)
+        .into_iter()
+        .next()
+        .ok_or(Error::InvalidLocalCa)?;
+    for path in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/etc/ssl/ca-bundle.pem",
+    ] {
+        match fs::read_to_string(path) {
+            Ok(bundle) if pem_certificates(&bundle).contains(&certificate) => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+fn pem_certificates(contents: &str) -> Vec<String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut certificates = Vec::new();
+    let mut rest = contents;
+    while let Some(begin) = rest.find(BEGIN) {
+        rest = &rest[begin + BEGIN.len()..];
+        let Some(end) = rest.find(END) else {
+            break;
+        };
+        certificates.push(
+            rest[..end]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect(),
+        );
+        rest = &rest[end + END.len()..];
+    }
+    certificates
 }
 
 pub(crate) struct ManagedCaddyRoutes<'a> {
@@ -765,6 +837,22 @@ mod tests {
         assert_eq!(
             normalize_upstream("3000").unwrap().url.as_str(),
             "http://127.0.0.1:3000/"
+        );
+    }
+
+    #[test]
+    fn local_ca_diagnostic_parses_pem_and_builds_the_safe_trust_command() {
+        let pem = "-----BEGIN CERTIFICATE-----\nQUJD\nRA==\n-----END CERTIFICATE-----\n";
+        assert_eq!(super::pem_certificates(pem), ["QUJDRA=="]);
+        assert_eq!(
+            super::local_ca_is_trusted("not a certificate"),
+            Err(Error::InvalidLocalCa)
+        );
+        assert_eq!(
+            Client::new("http://127.0.0.1:2020")
+                .unwrap()
+                .trust_command(),
+            "caddy trust --address 127.0.0.1:2020"
         );
     }
 

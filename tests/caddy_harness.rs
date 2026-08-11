@@ -43,6 +43,13 @@ fn isolated_caddy_exposes_http_https_reload_and_concurrency() {
             .call()
             .is_ok()
     );
+    let root_pem = ureq::get(format!("{}/pki/ca/local", harness.admin_url()))
+        .call()
+        .unwrap()
+        .body_mut()
+        .read_to_string()
+        .unwrap();
+    assert!(root_pem.contains("BEGIN CERTIFICATE"));
     drop(harness);
     assert!(!fs::exists(root).unwrap());
 }

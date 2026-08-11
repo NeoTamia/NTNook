@@ -32,7 +32,7 @@ fn alias_shortcuts_persist_list_and_remove_idempotently() {
 
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 10));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 11));
 
     let set = nook(&config_home, &state_home, &["alias", "api", "3000"]);
     assert_success(&set);
@@ -61,6 +61,8 @@ fn alias_shortcuts_persist_list_and_remove_idempotently() {
     assert!(status_output.contains("caddy\tok\n"));
     assert!(status_output.contains("https_container\tpresent\n"));
     assert!(status_output.contains("drift\tclean\n"));
+    assert!(status_output.contains("local_ca\tnot trusted\n"));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("caddy trust --address"));
 
     let prune = nook(&config_home, &state_home, &["prune"]);
     assert_success(&prune);
@@ -274,6 +276,13 @@ fn serve_caddy(listener: TcpListener, routes: Arc<Mutex<Vec<Value>>>, requests: 
                 &json!({"apps":{"http":{"servers":{"https":{"listen":[":443"],"routes":current}}}}}),
                 None,
             );
+        } else if first_line.starts_with("GET /pki/ca/local ") {
+            respond_bytes(
+                &mut stream,
+                b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+                "application/pem-certificate-chain",
+                None,
+            );
         } else if first_line.starts_with("GET /config/apps/http/servers/https/routes ") {
             respond_json(&mut stream, &json!(*routes.lock().unwrap()), Some("\"v1\""));
         } else if first_line.starts_with("PUT /config/apps/http/servers/https/routes ") {
@@ -316,12 +325,16 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
 
 fn respond_json(stream: &mut TcpStream, value: &Value, etag: Option<&str>) {
     let body = serde_json::to_vec(value).unwrap();
+    respond_bytes(stream, &body, "application/json", etag);
+}
+
+fn respond_bytes(stream: &mut TcpStream, body: &[u8], content_type: &str, etag: Option<&str>) {
     let etag = etag.map_or(String::new(), |value| format!("ETag: {value}\r\n"));
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .unwrap();
-    stream.write_all(&body).unwrap();
+    stream.write_all(body).unwrap();
 }

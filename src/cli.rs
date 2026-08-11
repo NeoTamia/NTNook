@@ -302,6 +302,20 @@ fn status_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Re
     for warning in drift {
         writeln!(errors, "warning: {warning}")?;
     }
+    let local_ca = client.fetch_local_ca()?;
+    let trusted = crate::caddy::local_ca_is_trusted(&local_ca)?;
+    writeln!(
+        output,
+        "local_ca\t{}",
+        if trusted { "trusted" } else { "not trusted" }
+    )?;
+    if !trusted {
+        writeln!(
+            errors,
+            "warning: Caddy's local CA is not trusted; run `{}`",
+            client.trust_command()
+        )?;
+    }
     Ok(())
 }
 
@@ -490,7 +504,7 @@ mod tests {
 
     use clap::error::ErrorKind;
 
-    use super::{AliasCommand, Command, parse_from, write_registry_list};
+    use super::{AliasCommand, Command, drift_messages, parse_from, write_registry_list};
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
     use uuid::Uuid;
 
@@ -652,6 +666,39 @@ mod tests {
         assert!(output.contains("run\tstarting\tstarting.localhost"));
         assert!(output.contains("run\tready\tready.localhost"));
         assert!(output.contains("alias\tpersistent\talias.localhost"));
+    }
+
+    #[test]
+    fn status_drift_identifies_missing_and_orphaned_routes() {
+        let mut registry = Registry::empty();
+        let alias = Alias {
+            id: Uuid::new_v4(),
+            hostname: "missing.localhost".into(),
+            target: "http://127.0.0.1:4000".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            preserve_host: false,
+        };
+        registry.aliases.insert(alias.hostname.clone(), alias);
+        let inspection = crate::caddy::ManagedInspection {
+            routes: vec![crate::caddy::ManagedObservation {
+                owner_id: Uuid::new_v4(),
+                hostname: "orphan.localhost".into(),
+                tls: true,
+            }],
+            ..crate::caddy::ManagedInspection::default()
+        };
+        let messages = drift_messages(&registry, &inspection);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("missing.localhost"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("orphan.localhost"))
+        );
     }
 
     fn parse(arguments: &[&str]) -> super::Cli {
