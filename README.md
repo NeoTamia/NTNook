@@ -109,6 +109,15 @@ caddy_admin = "unix//run/caddy/admin.socket"
 
 L’utilisateur qui exécute Nook doit avoir le droit de traverser le répertoire et de lire/écrire sur le socket. La forme URI `unix:///run/caddy/admin.socket` est également acceptée.
 
+Pour un remplacement ponctuel sans modifier ce fichier, passez directement le chemin du socket :
+
+```sh
+nook --caddy-socket /run/caddy/admin.socket status
+nook run --caddy-socket /run/caddy/admin.socket --name api --app-port 3000 -- command
+```
+
+L’option est globale, peut être placée avant ou après la sous-commande et prime sur `caddy_admin`.
+
 L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallback `~/.local/state/nook/state.json`. Les écritures sont atomiques et verrouillées ; il ne faut pas éditer ce registre pendant l’exécution de Nook.
 
 ## Dépannage

@@ -76,12 +76,29 @@ https://localhost:443 {{
 	respond \"https-ok\"
 }}"
     ));
-    let status = nook(&config_home, &state_home, &["status"]);
+    let invalid_override = nook(
+        &config_home,
+        &state_home,
+        &["--caddy-socket", "/does/not/exist/admin.socket", "status"],
+    );
+    assert!(!invalid_override.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_override.stderr).contains("/does/not/exist/admin.socket")
+    );
+    let admin_address = harness.admin_url();
+    let admin_socket = admin_address
+        .strip_prefix("unix/")
+        .expect("standard-port harness must use a Unix admin socket");
+    let status = nook(
+        &config_home,
+        &state_home,
+        &["status", "--caddy-socket", admin_socket],
+    );
     assert_success(&status);
     assert!(String::from_utf8_lossy(&status.stdout).contains("caddy\tok"));
     assert!(
         String::from_utf8_lossy(&status.stderr)
-            .contains(&format!("caddy trust --address {}", harness.admin_url()))
+            .contains(&format!("caddy trust --address {}", admin_address))
     );
     let foreign_config = fetch_config(&harness);
     let rejected = nook(

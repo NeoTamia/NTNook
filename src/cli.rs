@@ -17,6 +17,9 @@ use crate::reconcile::RouteBackend;
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {
+    /// Use a Caddy Admin API Unix socket instead of the configured address.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) caddy_socket: Option<String>,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -121,32 +124,39 @@ pub(crate) fn run() -> crate::Result<i32> {
 }
 
 fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate::Result<i32> {
+    let mut global = crate::config::load_global()?;
+    if let Some(socket) = cli.caddy_socket {
+        global.caddy_admin = format!("unix/{socket}");
+    }
     if !matches!(&cli.command, Command::Prune) {
-        reconcile_before_command(errors)?;
+        reconcile_before_command(&global, errors)?;
     }
     match cli.command {
         Command::Alias(AliasArgs {
             command: AliasCommand::Set(arguments),
-        }) => set_alias_command(arguments, output, errors).map(|()| 0),
+        }) => set_alias_command(arguments, &global, output, errors).map(|()| 0),
         Command::Alias(AliasArgs {
             command: AliasCommand::Remove(arguments),
-        }) => remove_alias_command(arguments, output, errors).map(|()| 0),
+        }) => remove_alias_command(arguments, &global, output, errors).map(|()| 0),
         Command::Alias(AliasArgs {
             command: AliasCommand::List,
         }) => list_alias_command(output).map(|()| 0),
         Command::List => list_command(output).map(|()| 0),
-        Command::Status => status_command(output, errors).map(|()| 0),
-        Command::Prune => prune_command(output, errors).map(|()| 0),
-        Command::Run(arguments) => run_command(arguments, errors),
+        Command::Status => status_command(&global, output, errors).map(|()| 0),
+        Command::Prune => prune_command(&global, output, errors).map(|()| 0),
+        Command::Run(arguments) => run_command(arguments, &global, errors),
         Command::Stop(arguments) => stop_command(arguments, output).map(|()| 0),
     }
 }
 
-fn run_command(arguments: RunArgs, errors: &mut impl Write) -> crate::Result<i32> {
+fn run_command(
+    arguments: RunArgs,
+    global: &crate::config::GlobalConfig,
+    errors: &mut impl Write,
+) -> crate::Result<i32> {
     let config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
     let store = state_store()?;
-    let global = crate::config::load_global()?;
-    with_caddy_routes(&global, config.tls, !config.tls, |routes| {
+    with_caddy_routes(global, config.tls, !config.tls, |routes| {
         let mut running = crate::process::start_run(&config, &store, routes)?;
         if let Some(warning) = &running.warning {
             writeln!(errors, "warning: {warning}")?;
@@ -173,6 +183,7 @@ fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<(
 
 fn set_alias_command(
     arguments: AliasSetArgs,
+    global: &crate::config::GlobalConfig,
     output: &mut impl Write,
     errors: &mut impl Write,
 ) -> crate::Result<()> {
@@ -191,8 +202,7 @@ fn set_alias_command(
         force: arguments.force,
     };
     let store = crate::state::Store::new(crate::state::state_path()?);
-    let global = crate::config::load_global()?;
-    with_caddy_routes(&global, request.tls, !request.tls, |routes| {
+    with_caddy_routes(global, request.tls, !request.tls, |routes| {
         let outcome = crate::reconcile::set_alias(&store, routes, request)?;
         for warning in outcome.warnings {
             writeln!(errors, "warning: {warning}")?;
@@ -208,6 +218,7 @@ fn set_alias_command(
 
 fn remove_alias_command(
     arguments: AliasRemoveArgs,
+    global: &crate::config::GlobalConfig,
     output: &mut impl Write,
     errors: &mut impl Write,
 ) -> crate::Result<()> {
@@ -218,8 +229,7 @@ fn remove_alias_command(
         writeln!(output, "alias {hostname} is not configured")?;
         return Ok(());
     };
-    let global = crate::config::load_global()?;
-    with_caddy_routes(&global, alias.tls, !alias.tls, |routes| {
+    with_caddy_routes(global, alias.tls, !alias.tls, |routes| {
         for warning in crate::reconcile::remove_alias(&store, routes, &hostname)? {
             writeln!(errors, "warning: {warning}")?;
         }
@@ -264,12 +274,15 @@ fn write_registry_list(
     Ok(())
 }
 
-fn status_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
+fn status_command(
+    global: &crate::config::GlobalConfig,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> crate::Result<()> {
     let registry = state_store()?.load()?;
-    let global = crate::config::load_global()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let selection = available_servers(&global, &config)?;
+    let selection = available_servers(global, &config)?;
     let inspection = crate::caddy::inspect_managed(&config, &selection)?;
     writeln!(output, "caddy\tok")?;
     writeln!(
@@ -330,14 +343,17 @@ fn status_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Re
     Ok(())
 }
 
-fn prune_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
+fn prune_command(
+    global: &crate::config::GlobalConfig,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> crate::Result<()> {
     let store = state_store()?;
     let _operations = store.lock_operations()?;
     let registry = store.load()?;
-    let global = crate::config::load_global()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let selection = available_servers(&global, &config)?;
+    let selection = available_servers(global, &config)?;
     let inspection = crate::caddy::inspect_managed(&config, &selection)?;
     let mut routes = crate::caddy::ManagedCaddyRoutes {
         client: &client,
@@ -370,12 +386,14 @@ fn prune_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Res
     Ok(())
 }
 
-fn reconcile_before_command(errors: &mut impl Write) -> crate::Result<()> {
+fn reconcile_before_command(
+    global: &crate::config::GlobalConfig,
+    errors: &mut impl Write,
+) -> crate::Result<()> {
     let store = state_store()?;
-    let global = crate::config::load_global()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let selection = available_servers(&global, &config)?;
+    let selection = available_servers(global, &config)?;
     let mut routes = crate::caddy::ManagedCaddyRoutes {
         client: &client,
         https_server: selection.https.as_deref(),
@@ -658,6 +676,18 @@ mod tests {
             &["prune"][..],
         ] {
             parse(arguments);
+        }
+    }
+
+    #[test]
+    fn caddy_socket_is_a_global_option_before_or_after_the_command() {
+        for arguments in [
+            &["--caddy-socket", "/run/caddy/admin.socket", "status"][..],
+            &["status", "--caddy-socket", "/run/caddy/admin.socket"][..],
+        ] {
+            let cli = parse(arguments);
+            assert_eq!(cli.caddy_socket.as_deref(), Some("/run/caddy/admin.socket"));
+            assert!(matches!(cli.command, Command::Status));
         }
     }
 

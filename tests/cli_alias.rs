@@ -16,7 +16,7 @@ fn help_is_successful_and_never_reported_as_an_error() {
         .unwrap();
     assert_success(&output);
     assert!(output.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: nook <COMMAND>"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: nook [OPTIONS] <COMMAND>"));
 }
 
 #[test]
