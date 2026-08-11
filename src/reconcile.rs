@@ -242,7 +242,8 @@ pub(crate) fn remove_alias(
 
 pub(crate) fn list_aliases(store: &Store) -> Result<Vec<Alias>, AliasError> {
     store
-        .mutate(|registry| Ok(registry.aliases.values().cloned().collect()))
+        .load()
+        .map(|registry| registry.aliases.into_values().collect())
         .map_err(|error| AliasError::State(error.to_string()))
 }
 

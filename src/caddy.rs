@@ -311,37 +311,92 @@ pub(crate) struct ServerSelection {
     pub(crate) http: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ManagedObservation {
+    pub(crate) owner_id: Uuid,
+    pub(crate) hostname: String,
+    pub(crate) tls: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ManagedInspection {
+    pub(crate) https_container: bool,
+    pub(crate) http_container: bool,
+    pub(crate) routes: Vec<ManagedObservation>,
+}
+
+pub(crate) fn inspect_managed(
+    config: &Value,
+    selection: &ServerSelection,
+) -> Result<ManagedInspection, Error> {
+    let servers = config
+        .pointer("/apps/http/servers")
+        .and_then(Value::as_object)
+        .ok_or(Error::InvalidConfig("apps.http.servers is missing"))?;
+    let mut inspection = ManagedInspection::default();
+    for (server_name, container_id, tls) in [
+        (selection.https.as_deref(), HTTPS_CONTAINER_ID, true),
+        (selection.http.as_deref(), HTTP_CONTAINER_ID, false),
+    ] {
+        let Some(server_name) = server_name else {
+            continue;
+        };
+        let server = servers
+            .get(server_name)
+            .ok_or(Error::InvalidConfig("selected server is missing"))?;
+        let Some(routes) = server.get("routes") else {
+            continue;
+        };
+        let routes = routes.as_array().ok_or(Error::InvalidConfig(
+            "selected server routes are not an array",
+        ))?;
+        let Some(container) = routes
+            .iter()
+            .find(|route| route.get("@id").and_then(Value::as_str) == Some(container_id))
+        else {
+            continue;
+        };
+        if tls {
+            inspection.https_container = true;
+        } else {
+            inspection.http_container = true;
+        }
+        for route in container
+            .pointer("/handle/0/routes")
+            .and_then(Value::as_array)
+            .ok_or(Error::InvalidOwnedRoute)?
+        {
+            let owner_id = route
+                .get("@id")
+                .and_then(Value::as_str)
+                .and_then(parse_owner_route_id)
+                .ok_or(Error::InvalidOwnedRoute)?;
+            let hostname = route
+                .pointer("/match/0/host/0")
+                .and_then(Value::as_str)
+                .ok_or(Error::InvalidOwnedRoute)?
+                .to_owned();
+            inspection.routes.push(ManagedObservation {
+                owner_id,
+                hostname,
+                tls,
+            });
+        }
+    }
+    inspection
+        .routes
+        .sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    Ok(inspection)
+}
+
 pub(crate) fn discover_servers(
     config: &Value,
     overrides: ServerOverrides<'_>,
     need_https: bool,
     need_http: bool,
 ) -> Result<ServerSelection, Error> {
-    let servers = config
-        .pointer("/apps/http/servers")
-        .and_then(Value::as_object)
-        .ok_or(Error::InvalidConfig("apps.http.servers is missing"))?;
-    let candidates = |port| {
-        let mut names: Vec<String> = servers
-            .iter()
-            .filter(|(_, server)| {
-                server
-                    .get("listen")
-                    .and_then(Value::as_array)
-                    .is_some_and(|listeners| {
-                        listeners
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .any(|listener| listener_port(listener) == Some(port))
-                    })
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-        names.sort();
-        names
-    };
-    let https_candidates = candidates(443);
-    let http_candidates = candidates(80);
+    let https_candidates = server_candidates(config, 443)?;
+    let http_candidates = server_candidates(config, 80)?;
     Ok(ServerSelection {
         https: need_https
             .then(|| select_server("HTTPS", overrides.https, &https_candidates))
@@ -350,6 +405,51 @@ pub(crate) fn discover_servers(
             .then(|| select_server("HTTP", overrides.http, &http_candidates))
             .transpose()?,
     })
+}
+
+pub(crate) fn discover_available_servers(
+    config: &Value,
+    overrides: ServerOverrides<'_>,
+) -> Result<ServerSelection, Error> {
+    Ok(ServerSelection {
+        https: select_optional_server("HTTPS", overrides.https, &server_candidates(config, 443)?)?,
+        http: select_optional_server("HTTP", overrides.http, &server_candidates(config, 80)?)?,
+    })
+}
+
+fn server_candidates(config: &Value, port: u16) -> Result<Vec<String>, Error> {
+    let servers = config
+        .pointer("/apps/http/servers")
+        .and_then(Value::as_object)
+        .ok_or(Error::InvalidConfig("apps.http.servers is missing"))?;
+    let mut names: Vec<String> = servers
+        .iter()
+        .filter(|(_, server)| {
+            server
+                .get("listen")
+                .and_then(Value::as_array)
+                .is_some_and(|listeners| {
+                    listeners
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|listener| listener_port(listener) == Some(port))
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+fn select_optional_server(
+    kind: &'static str,
+    override_name: Option<&str>,
+    candidates: &[String],
+) -> Result<Option<String>, Error> {
+    if override_name.is_some() || candidates.len() > 1 {
+        return select_server(kind, override_name, candidates).map(Some);
+    }
+    Ok(candidates.first().cloned())
 }
 
 fn select_server(
@@ -743,6 +843,61 @@ mod tests {
             .as_deref(),
             Some("b")
         );
+    }
+
+    #[test]
+    fn available_server_discovery_allows_absent_http_but_rejects_ambiguity() {
+        let config = json!({"apps":{"http":{"servers":{
+            "https":{"listen":[":443"],"routes":[]}
+        }}}});
+        assert_eq!(
+            super::discover_available_servers(&config, ServerOverrides::default()).unwrap(),
+            ServerSelection {
+                https: Some("https".into()),
+                http: None
+            }
+        );
+        let ambiguous = json!({"apps":{"http":{"servers":{
+            "one":{"listen":[":443"]},
+            "two":{"listen":["127.0.0.1:443"]}
+        }}}});
+        assert!(matches!(
+            super::discover_available_servers(&ambiguous, ServerOverrides::default()),
+            Err(Error::AmbiguousServer { kind: "HTTPS", .. })
+        ));
+    }
+
+    #[test]
+    fn managed_inspection_reports_containers_and_owned_routes() {
+        let owner = uuid::Uuid::new_v4();
+        let upstream = url::Url::parse("http://127.0.0.1:3000").unwrap();
+        let route = super::build_proxy_route(
+            &super::owner_route_id(owner),
+            "api.localhost",
+            &upstream,
+            false,
+        );
+        let (container, _) = super::build_containers(&[super::ManagedRoute {
+            hostname: "api.localhost".into(),
+            no_tls: false,
+            route,
+        }]);
+        let config = json!({"apps":{"http":{"servers":{
+            "https":{"listen":[":443"],"routes":[container.unwrap()]}
+        }}}});
+        let inspection = super::inspect_managed(
+            &config,
+            &ServerSelection {
+                https: Some("https".into()),
+                http: None,
+            },
+        )
+        .unwrap();
+        assert!(inspection.https_container);
+        assert!(!inspection.http_container);
+        assert_eq!(inspection.routes.len(), 1);
+        assert_eq!(inspection.routes[0].owner_id, owner);
+        assert_eq!(inspection.routes[0].hostname, "api.localhost");
     }
 
     #[test]

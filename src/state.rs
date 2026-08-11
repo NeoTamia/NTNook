@@ -220,6 +220,30 @@ impl Store {
         Ok(OperationGuard { _file: file })
     }
 
+    pub(crate) fn load(&self) -> Result<Registry, Error> {
+        let parent = self.path.parent().ok_or_else(|| {
+            io_error(
+                &self.path,
+                io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"),
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+        let lock_path = self.path.with_extension("lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| io_error(&lock_path, source))?;
+        lock.lock().map_err(|source| io_error(&lock_path, source))?;
+        match fs::read(&self.path) {
+            Ok(contents) => decode(&contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Registry::empty()),
+            Err(source) => Err(io_error(&self.path, source)),
+        }
+    }
+
     pub(crate) fn mutate<T>(
         &self,
         operation: impl FnOnce(&mut Registry) -> Result<T, Error>,

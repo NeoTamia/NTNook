@@ -32,7 +32,7 @@ fn alias_shortcuts_persist_list_and_remove_idempotently() {
 
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 10));
 
     let set = nook(&config_home, &state_home, &["alias", "api", "3000"]);
     assert_success(&set);
@@ -46,6 +46,28 @@ fn alias_shortcuts_persist_list_and_remove_idempotently() {
     assert_eq!(
         String::from_utf8(list.stdout).unwrap(),
         "api.localhost -> http://127.0.0.1:3000/\n"
+    );
+
+    let managed = nook(&config_home, &state_home, &["list"]);
+    assert_success(&managed);
+    assert_eq!(
+        String::from_utf8(managed.stdout).unwrap(),
+        "alias\tpersistent\tapi.localhost\thttp://127.0.0.1:3000/\n"
+    );
+
+    let status = nook(&config_home, &state_home, &["status"]);
+    assert_success(&status);
+    let status_output = String::from_utf8(status.stdout).unwrap();
+    assert!(status_output.contains("caddy\tok\n"));
+    assert!(status_output.contains("https_container\tpresent\n"));
+    assert!(status_output.contains("drift\tclean\n"));
+
+    let prune = nook(&config_home, &state_home, &["prune"]);
+    assert_success(&prune);
+    assert!(
+        String::from_utf8(prune.stdout)
+            .unwrap()
+            .contains("restored=1")
     );
 
     let remove = nook(&config_home, &state_home, &["alias", "--remove", "api"]);
@@ -64,6 +86,34 @@ fn alias_shortcuts_persist_list_and_remove_idempotently() {
 
     server.join().unwrap();
     assert!(routes.lock().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn status_has_a_stable_failure_when_caddy_is_unavailable() {
+    let directory = std::env::temp_dir().join(format!(
+        "nook-cli-status-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_home = directory.join("config");
+    let state_home = directory.join("state");
+    fs::create_dir_all(config_home.join("nook")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let admin = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    fs::write(
+        config_home.join("nook/config.toml"),
+        format!("format_version = 1\ncaddy_admin = \"{admin}\"\n"),
+    )
+    .unwrap();
+
+    let status = nook(&config_home, &state_home, &["status"]);
+    assert_eq!(status.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("Caddy Admin API request failed"));
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -96,9 +146,10 @@ fn serve_caddy(listener: TcpListener, routes: Arc<Mutex<Vec<Value>>>, requests: 
         let head = String::from_utf8_lossy(&request[..header_end]);
         let first_line = head.lines().next().unwrap();
         if first_line.starts_with("GET /config/ ") {
+            let current = routes.lock().unwrap().clone();
             respond_json(
                 &mut stream,
-                &json!({"apps":{"http":{"servers":{"https":{"listen":[":443"],"routes":[]}}}}}),
+                &json!({"apps":{"http":{"servers":{"https":{"listen":[":443"],"routes":current}}}}}),
                 None,
             );
         } else if first_line.starts_with("GET /config/apps/http/servers/https/routes ") {

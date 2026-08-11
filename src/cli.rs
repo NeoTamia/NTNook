@@ -1,10 +1,13 @@
 //! Command-line parsing, terminal output, and exit-code policy.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+
+use crate::reconcile::RouteBackend;
 
 const ACCEPTED: &str = "Command accepted; operational behavior is not implemented yet.\n";
 
@@ -122,6 +125,9 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Alias(AliasArgs {
             command: AliasCommand::List,
         }) => list_alias_command(output),
+        Command::List => list_command(output),
+        Command::Status => status_command(output, errors),
+        Command::Prune => prune_command(output, errors),
         Command::Run(arguments) => {
             let _run_config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
             output.write_all(ACCEPTED.as_bytes())?;
@@ -199,6 +205,202 @@ fn list_alias_command(output: &mut impl Write) -> crate::Result<()> {
     Ok(())
 }
 
+fn list_command(output: &mut impl Write) -> crate::Result<()> {
+    let registry = state_store()?.load()?;
+    write_registry_list(&registry, output)
+}
+
+fn write_registry_list(
+    registry: &crate::state::Registry,
+    output: &mut impl Write,
+) -> crate::Result<()> {
+    let mut leases: Vec<_> = registry.leases.values().collect();
+    leases.sort_by(|left, right| left.hostname.cmp(&right.hostname));
+    for lease in leases {
+        let state = match lease.state {
+            crate::state::LeaseState::Starting => "starting",
+            crate::state::LeaseState::Ready => "ready",
+        };
+        writeln!(output, "run\t{state}\t{}\t{}", lease.hostname, lease.target)?;
+    }
+    for alias in registry.aliases.values() {
+        writeln!(
+            output,
+            "alias\tpersistent\t{}\t{}",
+            alias.hostname, alias.target
+        )?;
+    }
+    Ok(())
+}
+
+fn status_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
+    let registry = state_store()?.load()?;
+    let global = crate::config::load_global()?;
+    let client = crate::caddy::Client::new(&global.caddy_admin)?;
+    let config = client.fetch_config()?;
+    let selection = available_servers(&global, &config)?;
+    let inspection = crate::caddy::inspect_managed(&config, &selection)?;
+    writeln!(output, "caddy\tok")?;
+    writeln!(
+        output,
+        "https_server\t{}",
+        selection.https.as_deref().unwrap_or("not required")
+    )?;
+    writeln!(
+        output,
+        "http_server\t{}",
+        selection.http.as_deref().unwrap_or("not required")
+    )?;
+    writeln!(
+        output,
+        "https_container\t{}",
+        if inspection.https_container {
+            "present"
+        } else {
+            "absent"
+        }
+    )?;
+    writeln!(
+        output,
+        "http_container\t{}",
+        if inspection.http_container {
+            "present"
+        } else {
+            "absent"
+        }
+    )?;
+    let drift = drift_messages(&registry, &inspection);
+    writeln!(
+        output,
+        "drift\t{}",
+        if drift.is_empty() {
+            "clean"
+        } else {
+            "detected"
+        }
+    )?;
+    for warning in drift {
+        writeln!(errors, "warning: {warning}")?;
+    }
+    Ok(())
+}
+
+fn prune_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
+    let store = state_store()?;
+    let registry = store.load()?;
+    let global = crate::config::load_global()?;
+    let client = crate::caddy::Client::new(&global.caddy_admin)?;
+    let config = client.fetch_config()?;
+    let selection = available_servers(&global, &config)?;
+    let inspection = crate::caddy::inspect_managed(&config, &selection)?;
+    let mut routes = crate::caddy::ManagedCaddyRoutes {
+        client: &client,
+        https_server: selection.https.as_deref(),
+        http_server: selection.http.as_deref(),
+    };
+    let _operations = store.lock_operations()?;
+    let expected = expected_routes(&registry);
+    let mut removed_orphans = 0;
+    for observed in inspection.routes {
+        if !expected.contains_key(&observed.owner_id) {
+            match routes.remove_if_owned(&observed.hostname, observed.owner_id, observed.tls) {
+                Ok(()) => removed_orphans += 1,
+                Err(error) => writeln!(
+                    errors,
+                    "warning: cleanup of {} is pending: {error}",
+                    observed.hostname
+                )?,
+            }
+        }
+    }
+    let report =
+        crate::reconcile::reconcile_store(&store, &mut routes, crate::process::lease_liveness)?;
+    for warning in &report.warnings {
+        writeln!(errors, "warning: {warning}")?;
+    }
+    writeln!(
+        output,
+        "restored={} removed_dead={} removed_orphans={} completed_operations={}",
+        report.restored, report.removed_dead_leases, removed_orphans, report.completed_operations
+    )?;
+    Ok(())
+}
+
+fn state_store() -> crate::Result<crate::state::Store> {
+    Ok(crate::state::Store::new(crate::state::state_path()?))
+}
+
+fn select_servers(
+    global: &crate::config::GlobalConfig,
+    config: &serde_json::Value,
+    need_https: bool,
+    need_http: bool,
+) -> crate::Result<crate::caddy::ServerSelection> {
+    Ok(crate::caddy::discover_servers(
+        config,
+        crate::caddy::ServerOverrides {
+            https: global.https_server.as_deref(),
+            http: global.http_server.as_deref(),
+        },
+        need_https,
+        need_http,
+    )?)
+}
+
+fn available_servers(
+    global: &crate::config::GlobalConfig,
+    config: &serde_json::Value,
+) -> crate::Result<crate::caddy::ServerSelection> {
+    Ok(crate::caddy::discover_available_servers(
+        config,
+        crate::caddy::ServerOverrides {
+            https: global.https_server.as_deref(),
+            http: global.http_server.as_deref(),
+        },
+    )?)
+}
+
+fn expected_routes(registry: &crate::state::Registry) -> BTreeMap<uuid::Uuid, (&str, bool)> {
+    registry
+        .aliases
+        .values()
+        .map(|alias| (alias.id, (alias.hostname.as_str(), alias.tls)))
+        .chain(
+            registry
+                .leases
+                .values()
+                .map(|lease| (lease.id, (lease.hostname.as_str(), lease.tls))),
+        )
+        .collect()
+}
+
+fn drift_messages(
+    registry: &crate::state::Registry,
+    inspection: &crate::caddy::ManagedInspection,
+) -> Vec<String> {
+    let expected = expected_routes(registry);
+    let observed: BTreeMap<_, _> = inspection
+        .routes
+        .iter()
+        .map(|route| (route.owner_id, (route.hostname.as_str(), route.tls)))
+        .collect();
+    let mut messages = Vec::new();
+    for (owner, route) in &expected {
+        if observed.get(owner) != Some(route) {
+            messages.push(format!(
+                "route {} is missing or differs from the registry",
+                route.0
+            ));
+        }
+    }
+    for (owner, route) in observed {
+        if !expected.contains_key(&owner) {
+            messages.push(format!("route {} has no registry owner", route.0));
+        }
+    }
+    messages
+}
+
 fn with_caddy_routes<T>(
     global: &crate::config::GlobalConfig,
     need_https: bool,
@@ -207,15 +409,7 @@ fn with_caddy_routes<T>(
 ) -> crate::Result<T> {
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let selection = crate::caddy::discover_servers(
-        &config,
-        crate::caddy::ServerOverrides {
-            https: global.https_server.as_deref(),
-            http: global.http_server.as_deref(),
-        },
-        need_https,
-        need_http,
-    )?;
+    let selection = select_servers(global, &config, need_https, need_http)?;
     let mut routes = crate::caddy::ManagedCaddyRoutes {
         client: &client,
         https_server: selection.https.as_deref(),
@@ -276,7 +470,9 @@ mod tests {
 
     use clap::error::ErrorKind;
 
-    use super::{AliasCommand, Command, parse_from};
+    use super::{AliasCommand, Command, parse_from, write_registry_list};
+    use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
+    use uuid::Uuid;
 
     #[test]
     fn parses_name_before_run_and_all_run_options() {
@@ -396,6 +592,46 @@ mod tests {
         let error = try_parse(&["run", "--strict-port", "--", "server"])
             .expect_err("arguments should be rejected");
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn list_output_distinguishes_starting_ready_and_persistent_aliases() {
+        let mut registry = Registry::empty();
+        for (hostname, state) in [
+            ("starting.localhost", LeaseState::Starting),
+            ("ready.localhost", LeaseState::Ready),
+        ] {
+            let id = Uuid::new_v4();
+            registry.leases.insert(
+                id,
+                Lease {
+                    id,
+                    hostname: hostname.into(),
+                    target: "http://127.0.0.1:3000".into(),
+                    scheme: Scheme::Http,
+                    tls: true,
+                    pid: 1,
+                    pgid: 1,
+                    process_start_time_ticks: 1,
+                    state,
+                },
+            );
+        }
+        let alias = Alias {
+            id: Uuid::new_v4(),
+            hostname: "alias.localhost".into(),
+            target: "http://127.0.0.1:4000".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            preserve_host: false,
+        };
+        registry.aliases.insert(alias.hostname.clone(), alias);
+        let mut output = Vec::new();
+        write_registry_list(&registry, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("run\tstarting\tstarting.localhost"));
+        assert!(output.contains("run\tready\tready.localhost"));
+        assert!(output.contains("alias\tpersistent\talias.localhost"));
     }
 
     fn parse(arguments: &[&str]) -> super::Cli {
