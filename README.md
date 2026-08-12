@@ -6,7 +6,7 @@ Nook est une CLI Linux qui expose des applications locales sous des domaines sta
 
 - Linux ;
 - Rust stable pour compiler Nook ;
-- Caddy `2.11.x`, déjà installé, démarré et accessible par son Admin API ;
+- Caddy `2.11.x`, natif ou dans Docker, déjà démarré et accessible par son Admin API ;
 - des serveurs Caddy non ambigus écoutant sur `:443` pour HTTPS et, si `--no-tls` est utilisé, sur `:80` pour HTTP.
 
 ```sh
@@ -16,6 +16,8 @@ nook --help
 ```
 
 Nook ne démarre ni n’installe Caddy. Il ne lance jamais `sudo`, ne modifie pas `/etc/hosts` et n’installe pas la CA locale. Les noms sous `.localhost` sont résolus nativement vers loopback par les navigateurs et systèmes compatibles.
+
+Pour exécuter Caddy dans Docker sans installer son binaire sur l’hôte, utilisez le [guide Docker](docs/DOCKER.md). L’image officielle est supportée ; `caddy-docker-proxy` fait l’objet d’un test de compatibilité avec une réserve sur ses reloads.
 
 ## Préparer Caddy pour Nook
 
@@ -88,7 +90,7 @@ Options de `run` :
 - `--readiness-warn-after <seconds>` règle le délai du warning de readiness ;
 - les arguments après `--` sont transmis directement, sans shell implicite.
 
-Nook remplace littéralement `{port}` dans chaque argument et injecte `PORT`, `HOST=127.0.0.1` et `NOOK_URL`. Le processus reçoit stdin/stdout/stderr du terminal et son code de sortie est conservé, même si le cleanup Caddy doit être réessayé plus tard.
+Nook remplace littéralement `{port}` dans chaque argument et injecte `PORT`, `HOST` (la valeur de `run_bind_address`, `127.0.0.1` par défaut) et `NOOK_URL`. Le processus reçoit stdin/stdout/stderr du terminal et son code de sortie est conservé, même si le cleanup Caddy doit être réessayé plus tard.
 
 Après la réservation de la route et le lancement du processus, Nook affiche toujours le domaine, l’URL publique et le port applicatif effectivement retenus, y compris lorsque le nom et le port sont inférés :
 
@@ -154,6 +156,9 @@ Le fichier global est `$XDG_CONFIG_HOME/nook/config.toml`, avec fallback `~/.con
 ```toml
 format_version = 1
 caddy_admin = "http://127.0.0.1:2019"
+run_bind_address = "127.0.0.1"
+caddy_loopback_host = "127.0.0.1"
+caddy_client_ip_ranges = ["127.0.0.0/8", "::1"]
 
 # À définir seulement si la découverte est ambiguë.
 # https_server = "https"
@@ -177,6 +182,19 @@ nook run --caddy-socket /run/caddy/admin.socket --name api --app-port 3000 -- co
 
 L’option est globale, peut être placée avant ou après la sous-commande et prime sur `caddy_admin`.
 
+`run_bind_address` choisit l’interface utilisée pour réserver le port, sonder la readiness et injecter `HOST`. `caddy_loopback_host` remplace uniquement l’adresse de connexion des upstreams locaux vus par Caddy. `caddy_client_ip_ranges` contrôle le matcher `remote_ip` ajouté à chaque route Nook. Les valeurs par défaut conservent le comportement natif loopback.
+
+## Exporter la CA locale
+
+Lorsque Caddy n’est pas installé sur l’hôte, exportez son certificat public via l’Admin API :
+
+```sh
+nook ca export caddy-local-ca.pem
+nook ca export caddy-local-ca.pem --force
+```
+
+Nook affiche l’empreinte SHA-256, refuse l’écrasement par défaut et n’installe jamais le certificat. Avec Caddy dans Docker, la CA reste stable tant que le volume `/data` est conservé.
+
 L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallback `~/.local/state/nook/state.json`. Les écritures sont atomiques et verrouillées ; il ne faut pas éditer ce registre pendant l’exécution de Nook.
 
 ## Dépannage
@@ -195,7 +213,7 @@ L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallba
 
 Le MVP gère un seul service par projet, les routes Caddy locales, les aliases persistants, les processus Linux et leur récupération au prochain appel CLI.
 
-Sont hors périmètre : daemon permanent, IPC ou socket local, shell implicite, modification de `/etc/hosts`, installation/démarrage de Caddy, installation automatique de CA, Docker, LAN/mDNS, plusieurs services ou workspaces, Windows/macOS, Tailscale Serve/Funnel et toute exposition publique.
+Sont hors périmètre : daemon permanent, IPC ou socket local, shell implicite, modification de `/etc/hosts`, installation/démarrage de Caddy, installation automatique de CA, orchestration du cycle de vie Docker, LAN/mDNS, plusieurs services ou workspaces, Windows/macOS natifs, Tailscale Serve/Funnel et toute exposition publique.
 
 ## Développement
 

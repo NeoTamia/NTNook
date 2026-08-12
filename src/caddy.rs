@@ -1,6 +1,7 @@
 //! Caddy Admin API integration and canonical proxy targets.
 #![allow(dead_code)]
 
+use base64::Engine as _;
 use serde_json::Value;
 use serde_json::json;
 use std::fmt;
@@ -200,7 +201,7 @@ impl Client {
     }
 
     pub(crate) fn fetch_local_ca(&self) -> Result<String, Error> {
-        match &self.admin {
+        let response = match &self.admin {
             AdminEndpoint::Http(admin) => {
                 let endpoint = admin
                     .join("/pki/ca/local")
@@ -217,7 +218,8 @@ impl Client {
                 String::from_utf8(response.body)
                     .map_err(|error| Error::AdminRequest(error.to_string()))
             }
-        }
+        }?;
+        parse_local_ca_response(&response)
     }
 
     pub(crate) fn trust_command(&self) -> String {
@@ -321,6 +323,19 @@ impl Client {
             .extend(["config", "apps", "http", "servers", server, "routes"]);
         Ok(endpoint)
     }
+}
+
+fn parse_local_ca_response(response: &str) -> Result<String, Error> {
+    if response.trim_start().starts_with('{') {
+        let value: Value = serde_json::from_str(response)
+            .map_err(|error| Error::AdminRequest(error.to_string()))?;
+        return value
+            .get("root_certificate")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(Error::InvalidLocalCa);
+    }
+    Ok(response.to_owned())
 }
 
 fn server_routes_path(server: &str) -> String {
@@ -481,10 +496,8 @@ fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
-    let certificate = pem_certificates(pem)
-        .into_iter()
-        .next()
-        .ok_or(Error::InvalidLocalCa)?;
+    let (canonical, _) = canonical_local_ca(pem)?;
+    let certificate = pem_certificates(&canonical).remove(0);
     for path in [
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
@@ -498,6 +511,28 @@ pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
         }
     }
     Ok(false)
+}
+
+pub(crate) fn canonical_local_ca(pem: &str) -> Result<(String, Vec<u8>), Error> {
+    let encoded = pem_certificates(pem)
+        .into_iter()
+        .next()
+        .ok_or(Error::InvalidLocalCa)?;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(&encoded)
+        .map_err(|_| Error::InvalidLocalCa)?;
+    if der.is_empty() || der.first() != Some(&0x30) {
+        return Err(Error::InvalidLocalCa);
+    }
+    let mut wrapped = String::new();
+    for chunk in encoded.as_bytes().chunks(64) {
+        wrapped.push_str(std::str::from_utf8(chunk).map_err(|_| Error::InvalidLocalCa)?);
+        wrapped.push('\n');
+    }
+    Ok((
+        format!("-----BEGIN CERTIFICATE-----\n{wrapped}-----END CERTIFICATE-----\n"),
+        der,
+    ))
 }
 
 fn pem_certificates(contents: &str) -> Vec<String> {
@@ -525,6 +560,8 @@ pub(crate) struct ManagedCaddyRoutes<'a> {
     pub(crate) client: &'a Client,
     pub(crate) https_server: Option<&'a str>,
     pub(crate) http_server: Option<&'a str>,
+    pub(crate) loopback_host: &'a str,
+    pub(crate) client_ip_ranges: &'a [String],
 }
 
 impl ManagedCaddyRoutes<'_> {
@@ -547,11 +584,13 @@ impl RouteBackend for ManagedCaddyRoutes<'_> {
         let upstream = normalize_upstream(&route.target).map_err(route_error)?;
         let owner_id = route.owner_id;
         let hostname = route.hostname.clone();
-        let proxy = build_proxy_route(
+        let proxy = build_proxy_route_for_network(
             &owner_route_id(owner_id),
             &hostname,
             &upstream.url,
             route.preserve_host,
+            self.loopback_host,
+            self.client_ip_ranges,
         );
         self.client
             .mutate_server_routes(server, move |mut routes| {
@@ -879,29 +918,69 @@ pub(crate) fn build_proxy_route(
     upstream: &Url,
     preserve_host: bool,
 ) -> Value {
+    build_proxy_route_for_network(
+        id,
+        hostname,
+        upstream,
+        preserve_host,
+        "127.0.0.1",
+        &["127.0.0.0/8".to_owned(), "::1".to_owned()],
+    )
+}
+
+pub(crate) fn build_proxy_route_for_network(
+    id: &str,
+    hostname: &str,
+    upstream: &Url,
+    preserve_host: bool,
+    loopback_host: &str,
+    client_ip_ranges: &[String],
+) -> Value {
     let host = upstream.host_str().expect("validated upstream has a host");
     let port = upstream
         .port_or_known_default()
         .expect("HTTP(S) has a default port");
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    let dial_host = if local { loopback_host } else { host };
+    let default_host = if local && dial_host != host {
+        host_port(host, port)
+    } else {
+        "{http.reverse_proxy.upstream.hostport}".to_owned()
+    };
     let mut proxy = json!({
         "handler": "reverse_proxy",
-        "upstreams": [{ "dial": format!("{host}:{port}") }],
+        "upstreams": [{ "dial": host_port(dial_host, port) }],
         "headers": { "request": { "set": {
-            "Host": [if preserve_host { "{http.request.host}" } else { "{http.reverse_proxy.upstream.hostport}" }],
+            "Host": [if preserve_host { "{http.request.host}" } else { &default_host }],
             "X-Forwarded-Host": ["{http.request.host}"]
         } } }
     });
     if upstream.scheme() == "https" {
-        proxy["transport"] = json!({ "protocol": "http", "tls": {} });
+        let mut tls = json!({});
+        if local && dial_host != host {
+            tls["server_name"] = json!(host);
+        }
+        proxy["transport"] = json!({ "protocol": "http", "tls": tls });
     }
     json!({
         "@id": id,
         "match": [{
             "host": [hostname],
-            "remote_ip": { "ranges": ["127.0.0.0/8", "::1"] }
+            "remote_ip": { "ranges": client_ip_ranges }
         }],
         "handle": [proxy]
     })
+}
+
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 pub(crate) fn owner_route_id(owner_id: Uuid) -> String {
@@ -1443,6 +1522,35 @@ mod tests {
     }
 
     #[test]
+    fn docker_route_translates_only_the_connection_address() {
+        let upstream = url::Url::parse("https://127.0.0.1:8443").unwrap();
+        let route = super::build_proxy_route_for_network(
+            "nook_route_1",
+            "api.localhost",
+            &upstream,
+            false,
+            "host.docker.internal",
+            &["172.30.0.1/32".into()],
+        );
+        assert_eq!(
+            route.pointer("/handle/0/upstreams/0/dial"),
+            Some(&json!("host.docker.internal:8443"))
+        );
+        assert_eq!(
+            route.pointer("/handle/0/headers/request/set/Host/0"),
+            Some(&json!("127.0.0.1:8443"))
+        );
+        assert_eq!(
+            route.pointer("/handle/0/transport/tls/server_name"),
+            Some(&json!("127.0.0.1"))
+        );
+        assert_eq!(
+            route.pointer("/match/0/remote_ip/ranges"),
+            Some(&json!(["172.30.0.1/32"]))
+        );
+    }
+
+    #[test]
     fn https_proxy_enables_tls_without_disabling_verification() {
         let upstream = url::Url::parse("https://example.com").unwrap();
         let route = super::build_proxy_route("nook_route_1", "api.localhost", &upstream, false);
@@ -1686,6 +1794,8 @@ mod tests {
             client: &client,
             https_server: Some("https"),
             http_server: None,
+            loopback_host: "127.0.0.1",
+            client_ip_ranges: &["127.0.0.0/8".into(), "::1".into()],
         };
         backend
             .ensure(&RouteSpec {

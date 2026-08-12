@@ -631,7 +631,7 @@ fn serve_caddy(listener: TcpListener, routes: Arc<Mutex<Vec<Value>>>, requests: 
         } else if first_line.starts_with("GET /pki/ca/local ") {
             respond_bytes(
                 &mut stream,
-                b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+                b"-----BEGIN CERTIFICATE-----\nMAMCAQE=\n-----END CERTIFICATE-----\n",
                 "application/pem-certificate-chain",
                 None,
             );

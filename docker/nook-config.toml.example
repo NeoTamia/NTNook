@@ -1,0 +1,5 @@
+format_version = 1
+caddy_admin = "http://127.0.0.1:2019"
+run_bind_address = "172.30.0.1"
+caddy_loopback_host = "host.docker.internal"
+caddy_client_ip_ranges = ["172.30.0.1/32"]

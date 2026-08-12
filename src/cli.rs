@@ -2,10 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use sha2::{Digest, Sha256};
 
 use crate::reconcile::RouteBackend;
 
@@ -38,6 +41,29 @@ pub(crate) enum Command {
     Stop(StopArgs),
     /// Remove stale leases and reconcile routes.
     Prune,
+    /// Manage Caddy's local certificate authority.
+    Ca(CaArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CaArgs {
+    #[command(subcommand)]
+    pub(crate) command: CaCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CaCommand {
+    /// Export Caddy's public local CA certificate without installing it.
+    Export(CaExportArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CaExportArgs {
+    /// Destination PEM file; its parent directory must already exist.
+    pub(crate) path: PathBuf,
+    /// Replace an existing regular file.
+    #[arg(long)]
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -128,7 +154,7 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
     if let Some(socket) = cli.caddy_socket {
         global.caddy_admin = format!("unix/{socket}");
     }
-    if !matches!(&cli.command, Command::Prune) {
+    if !matches!(&cli.command, Command::Prune | Command::Ca(_)) {
         reconcile_before_command(&global, errors)?;
     }
     match cli.command {
@@ -146,7 +172,91 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Prune => prune_command(&global, output, errors).map(|()| 0),
         Command::Run(arguments) => run_command(arguments, &global, errors),
         Command::Stop(arguments) => stop_command(arguments, output).map(|()| 0),
+        Command::Ca(CaArgs {
+            command: CaCommand::Export(arguments),
+        }) => ca_export_command(arguments, &global, output).map(|()| 0),
     }
+}
+
+fn ca_export_command(
+    arguments: CaExportArgs,
+    global: &crate::config::GlobalConfig,
+    output: &mut impl Write,
+) -> crate::Result<()> {
+    let client = crate::caddy::Client::new(&global.caddy_admin)?;
+    let (pem, der) = crate::caddy::canonical_local_ca(&client.fetch_local_ca()?)?;
+    write_certificate(&arguments.path, pem.as_bytes(), arguments.force)?;
+    writeln!(
+        output,
+        "exported Caddy local CA to {}",
+        arguments.path.display()
+    )?;
+    writeln!(output, "sha256={:x}", Sha256::digest(&der))?;
+    Ok(())
+}
+
+fn write_certificate(path: &Path, contents: &[u8], force: bool) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "certificate parent directory {} does not exist",
+                parent.display()
+            ),
+        ));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !force {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists; use --force to replace it",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+    }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "certificate path has no filename",
+        )
+    })?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        if force {
+            fs::rename(&temporary, path)?;
+        } else {
+            fs::hard_link(&temporary, path)?;
+            fs::remove_file(&temporary)?;
+        }
+        Ok(())
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn run_command(
@@ -154,7 +264,8 @@ fn run_command(
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
-    let config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
+    let mut config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
+    config.bind_address = global.run_bind_address;
     let store = state_store()?;
     with_caddy_routes(global, config.tls, !config.tls, |routes| {
         let mut running = crate::process::start_run(&config, &store, routes)?;
@@ -291,6 +402,17 @@ fn status_command(
     let selection = available_servers(global, &config)?;
     let inspection = crate::caddy::inspect_managed(&config, &selection)?;
     writeln!(output, "caddy\tok")?;
+    writeln!(output, "run_bind_address\t{}", global.run_bind_address)?;
+    writeln!(
+        output,
+        "caddy_loopback_host\t{}",
+        global.caddy_loopback_host
+    )?;
+    writeln!(
+        output,
+        "caddy_client_ip_ranges\t{}",
+        global.caddy_client_ip_ranges.join(",")
+    )?;
     writeln!(
         output,
         "https_server\t{}",
@@ -333,6 +455,12 @@ fn status_command(
         writeln!(errors, "warning: {warning}")?;
     }
     let local_ca = client.fetch_local_ca()?;
+    let (_, local_ca_der) = crate::caddy::canonical_local_ca(&local_ca)?;
+    writeln!(
+        output,
+        "local_ca_sha256\t{:x}",
+        Sha256::digest(&local_ca_der)
+    )?;
     let trusted = crate::caddy::local_ca_is_trusted(&local_ca)?;
     writeln!(
         output,
@@ -342,8 +470,8 @@ fn status_command(
     if !trusted {
         writeln!(
             errors,
-            "warning: Caddy's local CA is not trusted; run `{}`",
-            client.trust_command()
+            "warning: Caddy's local CA is not trusted; export it with `nook ca export caddy-local-ca.pem` and install it explicitly (native Caddy users may run `{}`)",
+            client.trust_command(),
         )?;
     }
     Ok(())
@@ -365,6 +493,8 @@ fn prune_command(
         client: &client,
         https_server: selection.https.as_deref(),
         http_server: selection.http.as_deref(),
+        loopback_host: &global.caddy_loopback_host,
+        client_ip_ranges: &global.caddy_client_ip_ranges,
     };
     let expected = expected_routes(&registry);
     let mut removed_orphans = 0;
@@ -404,6 +534,8 @@ fn reconcile_before_command(
         client: &client,
         https_server: selection.https.as_deref(),
         http_server: selection.http.as_deref(),
+        loopback_host: &global.caddy_loopback_host,
+        client_ip_ranges: &global.caddy_client_ip_ranges,
     };
     let _operations = store.lock_operations()?;
     let report = reconcile_and_record(&store, &mut routes, &selection)?;
@@ -521,6 +653,8 @@ fn with_caddy_routes<T>(
         client: &client,
         https_server: selection.https.as_deref(),
         http_server: selection.http.as_deref(),
+        loopback_host: &global.caddy_loopback_host,
+        client_ip_ranges: &global.caddy_client_ip_ranges,
     };
     operation(&mut routes)
 }
@@ -555,7 +689,7 @@ fn normalize_shortcuts(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsS
 }
 
 fn is_command(value: &OsStr) -> bool {
-    ["run", "alias", "list", "status", "stop", "prune"]
+    ["run", "alias", "list", "status", "stop", "prune", "ca"]
         .iter()
         .any(|command| value == OsStr::new(command))
 }
@@ -577,7 +711,10 @@ mod tests {
 
     use clap::error::ErrorKind;
 
-    use super::{AliasCommand, Command, drift_messages, parse_from, write_registry_list};
+    use super::{
+        AliasCommand, CaCommand, Command, drift_messages, parse_from, write_certificate,
+        write_registry_list,
+    };
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
     use uuid::Uuid;
 
@@ -683,6 +820,26 @@ mod tests {
         ] {
             parse(arguments);
         }
+    }
+
+    #[test]
+    fn parses_ca_export_and_writes_without_unsafe_overwrite() {
+        let cli = parse(&["ca", "export", "/tmp/caddy-ca.pem", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Command::Ca(super::CaArgs {
+                command: CaCommand::Export(super::CaExportArgs { force: true, .. })
+            })
+        ));
+
+        let directory = std::env::temp_dir().join(format!("nook-ca-export-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("ca.pem");
+        write_certificate(&path, b"certificate", false).unwrap();
+        assert!(write_certificate(&path, b"other", false).is_err());
+        write_certificate(&path, b"replacement", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

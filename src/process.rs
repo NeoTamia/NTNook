@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
@@ -167,6 +167,7 @@ pub(crate) struct RunningChild {
     pub(crate) port: u16,
     pub(crate) warning: Option<String>,
     tls: bool,
+    bind_address: IpAddr,
     readiness_warn_after: Duration,
     signals: Signals,
 }
@@ -203,7 +204,7 @@ fn start_run_with_hook(
     if !conflicts.is_empty() && !config.force {
         return Err(RunError::Conflict(config.hostname.clone()));
     }
-    let reservation = reserve_port(config.app_port, config.strict_port)?;
+    let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
     let port = reservation.port;
     let owner_id = Uuid::new_v4();
     let operation_id = Uuid::new_v4();
@@ -278,7 +279,7 @@ fn start_run_with_hook(
     })?;
 
     let argv = substitute_port(&config.command, port);
-    let environment = child_environment(port, &config.hostname, config.tls);
+    let environment = child_environment(port, config.bind_address, &config.hostname, config.tls);
     let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
     if !conflicts.is_empty() {
         warnings.push(format!(
@@ -344,6 +345,7 @@ fn start_run_with_hook(
         port,
         warning,
         tls: config.tls,
+        bind_address: config.bind_address,
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
         signals,
     })
@@ -372,7 +374,7 @@ impl RunningChild {
                 self.child.signal_group(signal)?;
             }
             if TcpStream::connect_timeout(
-                &SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port).into(),
+                &SocketAddr::new(self.bind_address, self.port),
                 Duration::from_millis(100),
             )
             .is_ok()
@@ -620,11 +622,19 @@ impl PortReservation {
 }
 
 pub(crate) fn reserve_port(preferred: Option<u16>, strict: bool) -> Result<PortReservation, Error> {
+    reserve_port_on(IpAddr::V4(Ipv4Addr::LOCALHOST), preferred, strict)
+}
+
+pub(crate) fn reserve_port_on(
+    address: IpAddr,
+    preferred: Option<u16>,
+    strict: bool,
+) -> Result<PortReservation, Error> {
     if preferred == Some(0) {
         return Err(Error::InvalidPort);
     }
     if let Some(port) = preferred {
-        match bind(port) {
+        match bind(address, port) {
             Ok(listener) => {
                 return Ok(PortReservation {
                     listener,
@@ -636,7 +646,7 @@ pub(crate) fn reserve_port(preferred: Option<u16>, strict: bool) -> Result<PortR
                 return Err(Error::PortInUse(port));
             }
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                let listener = bind(0).map_err(Error::Bind)?;
+                let listener = bind(address, 0).map_err(Error::Bind)?;
                 let fallback = listener.local_addr().map_err(Error::Bind)?.port();
                 return Ok(PortReservation {
                     listener,
@@ -649,7 +659,7 @@ pub(crate) fn reserve_port(preferred: Option<u16>, strict: bool) -> Result<PortR
             Err(error) => return Err(Error::Bind(error)),
         }
     }
-    let listener = bind(0).map_err(Error::Bind)?;
+    let listener = bind(address, 0).map_err(Error::Bind)?;
     let port = listener.local_addr().map_err(Error::Bind)?.port();
     Ok(PortReservation {
         listener,
@@ -658,8 +668,8 @@ pub(crate) fn reserve_port(preferred: Option<u16>, strict: bool) -> Result<PortR
     })
 }
 
-fn bind(port: u16) -> io::Result<TcpListener> {
-    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+fn bind(address: IpAddr, port: u16) -> io::Result<TcpListener> {
+    TcpListener::bind(SocketAddr::new(address, port))
 }
 
 pub(crate) fn substitute_port(arguments: &[OsString], port: u16) -> Vec<OsString> {
@@ -691,10 +701,18 @@ fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     output
 }
 
-pub(crate) fn child_environment(port: u16, hostname: &str, tls: bool) -> [(OsString, OsString); 3] {
+pub(crate) fn child_environment(
+    port: u16,
+    bind_address: IpAddr,
+    hostname: &str,
+    tls: bool,
+) -> [(OsString, OsString); 3] {
     [
         (OsString::from("PORT"), OsString::from(port.to_string())),
-        (OsString::from("HOST"), OsString::from("127.0.0.1")),
+        (
+            OsString::from("HOST"),
+            OsString::from(bind_address.to_string()),
+        ),
         (
             OsString::from("NOOK_URL"),
             OsString::from(format!(
@@ -743,7 +761,7 @@ fn parse_stat(stat: &str) -> Option<ProcIdentity> {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpListener};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::{
@@ -886,7 +904,8 @@ mod tests {
 
     #[test]
     fn child_environment_replaces_required_values() {
-        let environment = child_environment(3000, "api.localhost", true);
+        let environment =
+            child_environment(3000, IpAddr::V4(Ipv4Addr::LOCALHOST), "api.localhost", true);
         assert_eq!(
             environment[0],
             (OsString::from("PORT"), OsString::from("3000"))
@@ -1207,6 +1226,7 @@ mod tests {
             strict_port: false,
             force: false,
             readiness_warn_after_seconds: readiness,
+            bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         }
     }
 

@@ -1,0 +1,14 @@
+{
+	admin 0.0.0.0:2019
+	auto_https disable_redirects
+	skip_install_trust
+}
+
+http://localhost:80 {
+	respond "nook-caddy-http"
+}
+
+https://localhost:443 {
+	tls internal
+	respond "nook-caddy-https"
+}

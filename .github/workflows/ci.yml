@@ -63,3 +63,37 @@ jobs:
           name: nook-linux-x86_64
           path: dist/
           if-no-files-found: error
+
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Validate Compose files
+        run: |
+          docker compose -f docker/compose.yaml config --quiet
+          docker compose -f docker/compose.caddy-docker-proxy.yaml config --quiet
+
+      - name: Test official Caddy image
+        env:
+          NOOK_DOCKER_E2E: "1"
+        run: tests/docker_e2e.sh
+
+      - name: Test caddy-docker-proxy compatibility
+        env:
+          NOOK_DOCKER_E2E: "1"
+          NOOK_DOCKER_COMPOSE: ${{ github.workspace }}/docker/compose.caddy-docker-proxy.yaml
+        run: tests/docker_e2e.sh
+
+      - name: Show Docker diagnostics
+        if: failure()
+        run: |
+          docker ps --all
+          docker network ls
+          docker volume ls

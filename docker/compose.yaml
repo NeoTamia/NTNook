@@ -1,0 +1,37 @@
+name: nook-caddy
+
+services:
+  caddy:
+    image: caddy:2.11.4-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    ports:
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443/tcp"
+      - "127.0.0.1:443:443/udp"
+      - "127.0.0.1:2019:2019"
+    extra_hosts:
+      - "host.docker.internal:172.30.0.1"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      nook:
+        ipv4_address: 172.30.0.2
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=-", "http://127.0.0.1:2019/config/"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
+networks:
+  nook:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -13,13 +13,15 @@ Cette version fournit un unique binaire Linux `nook`. L’artefact CI `nook-linu
 ## Plateforme et dépendances
 
 - Linux x86-64 ;
-- Caddy `2.11.x` installé et démarré séparément, avec Admin API accessible ;
+- Caddy `2.11.x` natif ou via l’image Docker officielle, démarré séparément avec Admin API accessible ;
 - serveurs Caddy non ambigus sur `:443` et, pour `--no-tls`, sur `:80`.
 
 La compilation reproductible utilise Rust `1.97.1` et `Cargo.lock`. OpenSSL, Python 3, curl avec HTTP/2, util-linux et iproute2 sont uniquement requis par les tests d’intégration, pas par le binaire.
 
 ## Hors périmètre
 
-Le binaire ne fournit aucun daemon, IPC, socket local, serveur embarqué, shell implicite, modification de `/etc/hosts`, installation ou démarrage de Caddy, installation automatique de CA, intégration Docker, LAN/mDNS, multi-service, support Windows/macOS, Tailscale Serve/Funnel ou exposition publique.
+Le binaire ne fournit aucun daemon, IPC, socket local, serveur embarqué, shell implicite, modification de `/etc/hosts`, installation ou démarrage de Caddy, installation automatique de CA, orchestration Docker, LAN/mDNS, multi-service, support Windows/macOS natif, Tailscale Serve/Funnel ou exposition publique.
+
+Le dépôt fournit un Compose Caddy officiel supporté sous Linux et une compatibilité testée avec caddy-docker-proxy. `nook ca export` permet de récupérer la CA publique sans exécutable Caddy sur l’hôte. Voir `docs/DOCKER.md`.
 
 Avant publication, l’artefact doit provenir d’une exécution CI verte et sa somme doit être vérifiée avec `sha256sum --check nook.sha256` depuis son répertoire.

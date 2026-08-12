@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::net::IpAddr;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,6 +17,18 @@ use crate::cli::RunArgs;
 const FORMAT_VERSION: u32 = 1;
 const DEFAULT_CADDY_ADMIN: &str = "http://127.0.0.1:2019";
 const DEFAULT_READINESS_WARN_AFTER_SECONDS: u64 = 30;
+
+fn default_run_bind_address() -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn default_caddy_loopback_host() -> String {
+    "127.0.0.1".to_owned()
+}
+
+fn default_caddy_client_ip_ranges() -> Vec<String> {
+    vec!["127.0.0.0/8".to_owned(), "::1".to_owned()]
+}
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -37,6 +50,10 @@ pub(crate) enum Error {
     InvalidName {
         name: String,
         reason: &'static str,
+    },
+    InvalidGlobal {
+        field: &'static str,
+        reason: String,
     },
 }
 
@@ -66,6 +83,12 @@ impl fmt::Display for Error {
             Self::MissingName => write!(formatter, "cannot infer an application name"),
             Self::InvalidName { name, reason } => {
                 write!(formatter, "invalid application name `{name}`: {reason}")
+            }
+            Self::InvalidGlobal { field, reason } => {
+                write!(
+                    formatter,
+                    "invalid global configuration `{field}`: {reason}"
+                )
             }
         }
     }
@@ -101,6 +124,12 @@ pub(crate) struct GlobalConfig {
     pub(crate) caddy_admin: String,
     pub(crate) https_server: Option<String>,
     pub(crate) http_server: Option<String>,
+    #[serde(default = "default_run_bind_address")]
+    pub(crate) run_bind_address: IpAddr,
+    #[serde(default = "default_caddy_loopback_host")]
+    pub(crate) caddy_loopback_host: String,
+    #[serde(default = "default_caddy_client_ip_ranges")]
+    pub(crate) caddy_client_ip_ranges: Vec<String>,
 }
 
 impl Default for GlobalConfig {
@@ -110,6 +139,9 @@ impl Default for GlobalConfig {
             caddy_admin: DEFAULT_CADDY_ADMIN.to_owned(),
             https_server: None,
             http_server: None,
+            run_bind_address: default_run_bind_address(),
+            caddy_loopback_host: default_caddy_loopback_host(),
+            caddy_client_ip_ranges: default_caddy_client_ip_ranges(),
         }
     }
 }
@@ -124,6 +156,7 @@ pub(crate) struct ResolvedRunConfig {
     pub(crate) strict_port: bool,
     pub(crate) force: bool,
     pub(crate) readiness_warn_after_seconds: u64,
+    pub(crate) bind_address: IpAddr,
 }
 
 pub(crate) fn load_global() -> Result<GlobalConfig, Error> {
@@ -133,7 +166,44 @@ pub(crate) fn load_global() -> Result<GlobalConfig, Error> {
     };
     let config: GlobalConfig = parse(&path, &contents)?;
     validate_version(&path, config.format_version)?;
+    validate_global(&config)?;
     Ok(config)
+}
+
+fn validate_global(config: &GlobalConfig) -> Result<(), Error> {
+    let valid_ip = config.caddy_loopback_host.parse::<IpAddr>().is_ok();
+    if !valid_ip
+        && (config.caddy_loopback_host.is_empty()
+            || config.caddy_loopback_host.contains(['/', ':'])
+            || config.caddy_loopback_host.split('.').any(|label| {
+                label.is_empty()
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }))
+    {
+        return Err(Error::InvalidGlobal {
+            field: "caddy_loopback_host",
+            reason: "expected an IP address or DNS hostname without scheme or port".into(),
+        });
+    }
+    if config.caddy_client_ip_ranges.is_empty() {
+        return Err(Error::InvalidGlobal {
+            field: "caddy_client_ip_ranges",
+            reason: "at least one IP address or CIDR is required".into(),
+        });
+    }
+    for range in &config.caddy_client_ip_ranges {
+        if range.parse::<ipnet::IpNet>().is_err() && range.parse::<IpAddr>().is_err() {
+            return Err(Error::InvalidGlobal {
+                field: "caddy_client_ip_ranges",
+                reason: format!("`{range}` is not an IP address or CIDR"),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_run(
@@ -209,6 +279,7 @@ fn merge_run(
             .readiness_warn_after
             .or(project.readiness_warn_after_seconds)
             .unwrap_or(DEFAULT_READINESS_WARN_AFTER_SECONDS),
+        bind_address: default_run_bind_address(),
     })
 }
 
@@ -354,7 +425,7 @@ fn validate_version(path: &Path, version: u32) -> Result<(), Error> {
 mod tests {
     use super::{
         Error, GlobalConfig, ProjectConfig, global_config_path_with, merge_run, normalize_hostname,
-        resolve_hostname,
+        resolve_hostname, validate_global,
     };
     use crate::cli::{Cli, Command};
     use clap::Parser;
@@ -383,6 +454,25 @@ mod tests {
         let config = GlobalConfig::default();
         assert_eq!(config.caddy_admin, "http://127.0.0.1:2019");
         assert!(config.https_server.is_none() && config.http_server.is_none());
+        assert_eq!(config.run_bind_address.to_string(), "127.0.0.1");
+        assert_eq!(config.caddy_loopback_host, "127.0.0.1");
+        assert_eq!(config.caddy_client_ip_ranges, ["127.0.0.0/8", "::1"]);
+    }
+
+    #[test]
+    fn docker_network_settings_are_validated() {
+        let mut config = GlobalConfig {
+            run_bind_address: "172.30.0.1".parse().unwrap(),
+            caddy_loopback_host: "host.docker.internal".into(),
+            caddy_client_ip_ranges: vec!["172.30.0.1/32".into()],
+            ..GlobalConfig::default()
+        };
+        validate_global(&config).unwrap();
+        config.caddy_client_ip_ranges = vec!["not-a-range".into()];
+        assert!(matches!(
+            validate_global(&config),
+            Err(Error::InvalidGlobal { .. })
+        ));
     }
 
     #[test]

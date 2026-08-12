@@ -25,6 +25,12 @@ Cette matrice relie les exigences produit aux tickets d’implémentation et aux
 | `list`, `status`, `stop`, `stop --force` et `prune` sûrs | NOOK-33, NOOK-36, NOOK-38 | tests CLI/process/reconcile, stop forcé réel et harness reload/restauration |
 | Diagnostic de dérive et confiance CA sans exécuter de commande privilégiée | NOOK-36 | tests `status_drift_*`, `local_ca_diagnostic_*`; intégration CA non approuvée |
 | Routes réellement produites par Nook : run/alias HTTPS et HTTP-only, reload, concurrence et protection étrangère | NOOK-38, NOOK-41 | `tests/nook_caddy_e2e.rs` sur vraie Admin API Caddy et ports `:80`/`:443` |
+| Bind hôte configurable, traduction des upstreams loopback et plages clientes Docker | NOOK-45 | tests `docker_network_settings_*`, `docker_route_translates_*`, processus et `tests/docker_e2e.sh` |
+| Export public et empreinte de la CA sans binaire Caddy | NOOK-46 | tests CLI `ca export`, validation E2E avec `curl --cacert` |
+| Compose officiel sécurisé et volumes persistants | NOOK-47 | `docker/compose.yaml`, `docker/Caddyfile`, `docker compose config`, E2E restart/empreinte |
+| Coexistence caddy-docker-proxy et restauration après reload | NOOK-48 | `docker/compose.caddy-docker-proxy.yaml`, scénario labels/réconciliation |
+| Porte CI Docker officielle/proxy | NOOK-49 | job `docker` dans `.github/workflows/ci.yml` |
+| Documentation Docker et matrice cross-platform | NOOK-51, NOOK-50 | `docs/DOCKER.md`, README, release et spécification YouTrack |
 | Host préservé, forwarded headers, WebSocket, SSE, streaming, HTTP/2, 502 et TLS upstream | NOOK-41 | `tests/proxy_protocols.rs`; `tests/alias_tls.rs` |
 | Documentation des prérequis, garde-fous, dépannage et hors-périmètre | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
 | Porte Linux compile/format/lint/tests/intégrations et produit un binaire vérifiable | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43 | `.github/workflows/ci.yml`; `nook.sha256` dans l’artefact |
