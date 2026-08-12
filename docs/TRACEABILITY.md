@@ -6,7 +6,7 @@ Cette matrice relie les exigences produit aux tickets d’implémentation et aux
 | --- | --- | --- |
 | Un crate binaire Rust Linux, modules internes et erreurs publiques cohérentes | NOOK-10, NOOK-11 | `cargo check`; `src/main.rs` et modules |
 | CLI `run`, forme courte, arguments opaques et aide stable | NOOK-12, NOOK-32 | tests `cli::tests::*`; `cli_alias::help_is_successful_*` |
-| Configuration globale/projet versionnée et précédence CLI → projet → défauts | NOOK-14 | tests `config::tests::*` |
+| Configuration globale/projet versionnée, gestion via `nook config` et précédence CLI → projet → défauts | NOOK-14 | tests `config::tests::*`, `cli::tests::parses_global_configuration_commands`, `cli_config` |
 | Nom normalisé en label DNS avec fallback projet/Git/répertoire | NOOK-15 | `config::tests::name_priority_*`, `normalizes_valid_names`, `rejects_invalid_dns_labels` |
 | Registre XDG versionné, sans argv, écrit atomiquement et verrouillé | NOOK-16, NOOK-38 | tests `state::tests::*`, dont concurrence et récupération du fichier temporaire |
 | Client Admin API sans lancement de Caddy et erreurs exploitables | NOOK-17, NOOK-18 | `caddy::tests::admin_client_*`; `cli_alias::status_has_a_stable_failure_*` |

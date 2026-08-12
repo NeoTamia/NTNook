@@ -153,6 +153,24 @@ Sans commande après `--`, `command` est obligatoire. Le nom suit la priorité :
 
 Le fichier global est `$XDG_CONFIG_HOME/nook/config.toml`, avec fallback `~/.config/nook/config.toml` :
 
+Nook peut le créer, afficher sa configuration effective et modifier une valeur :
+
+```sh
+nook config init
+nook config init --caddy-socket /run/caddy/admin.socket
+nook config show
+nook config path
+nook config set caddy-admin unix:///run/caddy/admin.socket
+```
+
+`config init` refuse d’écraser un fichier existant sans `--force`. `config set` accepte les clés
+`caddy-admin`, `https-server`, `http-server`, `run-bind-address`, `caddy-loopback-host` et
+`caddy-client-ip-ranges`. Utilisez `auto` comme valeur d’un serveur pour supprimer son override,
+et séparez plusieurs plages IP par des virgules.
+`config show` affiche la configuration effective en ajoutant les valeurs par défaut des champs
+absents. `config path` affiche uniquement le chemin du fichier brut, ce qui permet par exemple
+`bat "$(nook config path)"`.
+
 ```toml
 format_version = 1
 caddy_admin = "http://127.0.0.1:2019"
@@ -177,10 +195,13 @@ Pour un remplacement ponctuel sans modifier ce fichier, passez directement le ch
 
 ```sh
 nook --caddy-socket /run/caddy/admin.socket status
-nook run --caddy-socket /run/caddy/admin.socket --name api --app-port 3000 -- command
+nook --caddy-socket /run/caddy/admin.socket run --name api --app-port 3000 -- command
 ```
 
-L’option est globale, peut être placée avant ou après la sous-commande et prime sur `caddy_admin`.
+Pour les commandes opérationnelles, l’option peut se placer avant ou après la sous-commande et
+prime ponctuellement sur `caddy_admin`. Pour enregistrer le socket dans la configuration, utilisez
+`nook config init --caddy-socket PATH` ou
+`nook config set caddy-admin unix:///chemin/admin.socket`.
 
 `run_bind_address` choisit l’interface utilisée pour réserver le port, sonder la readiness et injecter `HOST`. `caddy_loopback_host` remplace uniquement l’adresse de connexion des upstreams locaux vus par Caddy. `caddy_client_ip_ranges` contrôle le matcher `remote_ip` ajouté à chaque route Nook. Les valeurs par défaut conservent le comportement natif loopback.
 

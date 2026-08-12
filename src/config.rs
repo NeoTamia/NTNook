@@ -7,10 +7,11 @@ use std::fs;
 use std::io;
 use std::net::IpAddr;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::RunArgs;
 
@@ -37,6 +38,10 @@ pub(crate) enum Error {
         path: PathBuf,
         source: io::Error,
     },
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
     Parse {
         path: PathBuf,
         source: toml::de::Error,
@@ -55,6 +60,7 @@ pub(crate) enum Error {
         field: &'static str,
         reason: String,
     },
+    Serialize(toml::ser::Error),
 }
 
 impl fmt::Display for Error {
@@ -65,6 +71,9 @@ impl fmt::Display for Error {
             }
             Self::Read { path, source } => {
                 write!(formatter, "cannot read {}: {source}", path.display())
+            }
+            Self::Write { path, source } => {
+                write!(formatter, "cannot write {}: {source}", path.display())
             }
             Self::Parse { path, source } => write!(
                 formatter,
@@ -90,6 +99,9 @@ impl fmt::Display for Error {
                     "invalid global configuration `{field}`: {reason}"
                 )
             }
+            Self::Serialize(error) => {
+                write!(formatter, "cannot serialize global configuration: {error}")
+            }
         }
     }
 }
@@ -97,8 +109,9 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Read { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
+            Self::Serialize(error) => Some(error),
             _ => None,
         }
     }
@@ -116,7 +129,7 @@ struct ProjectConfig {
     readiness_warn_after_seconds: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub(crate) struct GlobalConfig {
@@ -130,6 +143,32 @@ pub(crate) struct GlobalConfig {
     pub(crate) caddy_loopback_host: String,
     #[serde(default = "default_caddy_client_ip_ranges")]
     pub(crate) caddy_client_ip_ranges: Vec<String>,
+}
+
+impl GlobalConfig {
+    pub(crate) fn set_caddy_admin(&mut self, value: String) {
+        self.caddy_admin = value;
+    }
+
+    pub(crate) fn set_https_server(&mut self, value: Option<String>) {
+        self.https_server = value;
+    }
+
+    pub(crate) fn set_http_server(&mut self, value: Option<String>) {
+        self.http_server = value;
+    }
+
+    pub(crate) fn set_run_bind_address(&mut self, value: IpAddr) {
+        self.run_bind_address = value;
+    }
+
+    pub(crate) fn set_caddy_loopback_host(&mut self, value: String) {
+        self.caddy_loopback_host = value;
+    }
+
+    pub(crate) fn set_caddy_client_ip_ranges(&mut self, value: Vec<String>) {
+        self.caddy_client_ip_ranges = value;
+    }
 }
 
 impl Default for GlobalConfig {
@@ -168,6 +207,82 @@ pub(crate) fn load_global() -> Result<GlobalConfig, Error> {
     validate_version(&path, config.format_version)?;
     validate_global(&config)?;
     Ok(config)
+}
+
+pub(crate) fn global_config_path() -> Result<PathBuf, Error> {
+    global_config_path_with(|key| env::var_os(key))
+}
+
+pub(crate) fn format_global(config: &GlobalConfig) -> Result<String, Error> {
+    validate_global(config)?;
+    toml::to_string_pretty(config).map_err(Error::Serialize)
+}
+
+pub(crate) fn write_global(config: &GlobalConfig, force: bool) -> Result<PathBuf, Error> {
+    let path = global_config_path()?;
+    write_global_at(&path, config, force)?;
+    Ok(path)
+}
+
+fn write_global_at(path: &Path, config: &GlobalConfig, force: bool) -> Result<(), Error> {
+    let contents = format_global(config)?;
+    let parent = path.parent().ok_or_else(|| Error::Write {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path has no parent",
+        ),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| Error::Write {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !force {
+            return Err(Error::Write {
+                path: path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "configuration already exists; use --force to replace it",
+                ),
+            });
+        }
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Write {
+                path: path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configuration path is not a regular file",
+                ),
+            });
+        }
+    }
+    let temporary = parent.join(format!(".config.toml.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        use std::io::Write;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        if force {
+            fs::rename(&temporary, path)?;
+        } else {
+            fs::hard_link(&temporary, path)?;
+            fs::remove_file(&temporary)?;
+        }
+        Ok::<(), io::Error>(())
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|source| Error::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn validate_global(config: &GlobalConfig) -> Result<(), Error> {
@@ -424,8 +539,8 @@ fn validate_version(path: &Path, version: u32) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, GlobalConfig, ProjectConfig, global_config_path_with, merge_run, normalize_hostname,
-        resolve_hostname, validate_global,
+        Error, GlobalConfig, ProjectConfig, format_global, global_config_path_with, merge_run,
+        normalize_hostname, resolve_hostname, validate_global, write_global_at,
     };
     use crate::cli::{Cli, Command};
     use clap::Parser;
@@ -457,6 +572,29 @@ mod tests {
         assert_eq!(config.run_bind_address.to_string(), "127.0.0.1");
         assert_eq!(config.caddy_loopback_host, "127.0.0.1");
         assert_eq!(config.caddy_client_ip_ranges, ["127.0.0.0/8", "::1"]);
+    }
+
+    #[test]
+    fn global_configuration_is_serialized_and_written_safely() {
+        let directory = temporary_directory();
+        let path = directory.join("nested/config.toml");
+        let config = GlobalConfig::default();
+
+        write_global_at(&path, &config, false).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, format_global(&config).unwrap());
+        assert!(contents.contains("caddy_admin = \"http://127.0.0.1:2019\""));
+        assert!(write_global_at(&path, &config, false).is_err());
+
+        let mut replacement = GlobalConfig::default();
+        replacement.set_caddy_admin("unix//run/caddy/admin.socket".into());
+        write_global_at(&path, &replacement, true).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("unix//run/caddy/admin.socket")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

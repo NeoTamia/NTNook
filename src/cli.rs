@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 
 use crate::reconcile::RouteBackend;
@@ -21,7 +21,7 @@ use crate::reconcile::RouteBackend;
 )]
 pub(crate) struct Cli {
     /// Use a Caddy Admin API Unix socket instead of the configured address.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, value_name = "PATH")]
     pub(crate) caddy_socket: Option<String>,
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -43,6 +43,53 @@ pub(crate) enum Command {
     Prune,
     /// Manage Caddy's local certificate authority.
     Ca(CaArgs),
+    /// Create and inspect Nook's global configuration.
+    Config(ConfigArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConfigArgs {
+    #[command(subcommand)]
+    pub(crate) command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Create the global configuration with safe defaults.
+    Init(ConfigInitArgs),
+    /// Print the effective global configuration with defaults applied.
+    Show,
+    /// Print the path to the global configuration file.
+    Path,
+    /// Set one global configuration value.
+    Set(ConfigSetArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConfigInitArgs {
+    /// Configure Caddy's Admin API Unix socket.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) caddy_socket: Option<String>,
+    /// Replace an existing regular configuration file.
+    #[arg(long)]
+    pub(crate) force: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ConfigSetArgs {
+    pub(crate) key: ConfigKey,
+    /// New value. Use `auto` to clear a server override; separate IP ranges with commas.
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ConfigKey {
+    CaddyAdmin,
+    HttpsServer,
+    HttpServer,
+    RunBindAddress,
+    CaddyLoopbackHost,
+    CaddyClientIpRanges,
 }
 
 #[derive(Debug, Args)]
@@ -150,14 +197,31 @@ pub(crate) fn run() -> crate::Result<i32> {
 }
 
 fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate::Result<i32> {
+    let Cli {
+        caddy_socket,
+        command,
+    } = cli;
+    let command = match command {
+        Command::Config(arguments) => {
+            if caddy_socket.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--caddy-socket must be placed after `config init` for configuration commands",
+                )
+                .into());
+            }
+            return config_command(arguments, output).map(|()| 0);
+        }
+        command => command,
+    };
     let mut global = crate::config::load_global()?;
-    if let Some(socket) = cli.caddy_socket {
+    if let Some(socket) = caddy_socket {
         global.caddy_admin = format!("unix/{socket}");
     }
-    if !matches!(&cli.command, Command::Prune | Command::Ca(_)) {
+    if !matches!(&command, Command::Prune | Command::Ca(_)) {
         reconcile_before_command(&global, errors)?;
     }
-    match cli.command {
+    match command {
         Command::Alias(AliasArgs {
             command: AliasCommand::Set(arguments),
         }) => set_alias_command(arguments, &global, output, errors).map(|()| 0),
@@ -175,7 +239,68 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Ca(CaArgs {
             command: CaCommand::Export(arguments),
         }) => ca_export_command(arguments, &global, output).map(|()| 0),
+        Command::Config(_) => unreachable!("configuration commands return before loading Caddy"),
     }
+}
+
+fn config_command(arguments: ConfigArgs, output: &mut impl Write) -> crate::Result<()> {
+    match arguments.command {
+        ConfigCommand::Init(arguments) => {
+            let mut config = crate::config::GlobalConfig::default();
+            if let Some(socket) = arguments.caddy_socket {
+                config.set_caddy_admin(format!("unix/{socket}"));
+            }
+            let path = crate::config::write_global(&config, arguments.force)?;
+            writeln!(output, "created {}", path.display())?;
+        }
+        ConfigCommand::Show => {
+            let config = crate::config::load_global()?;
+            write!(output, "{}", crate::config::format_global(&config)?)?;
+        }
+        ConfigCommand::Path => {
+            writeln!(output, "{}", crate::config::global_config_path()?.display())?;
+        }
+        ConfigCommand::Set(arguments) => {
+            let mut config = crate::config::load_global()?;
+            set_config_value(&mut config, arguments)?;
+            let path = crate::config::write_global(&config, true)?;
+            writeln!(output, "updated {}", path.display())?;
+        }
+    }
+    Ok(())
+}
+
+fn set_config_value(
+    config: &mut crate::config::GlobalConfig,
+    arguments: ConfigSetArgs,
+) -> crate::Result<()> {
+    let ConfigSetArgs { key, value } = arguments;
+    match key {
+        ConfigKey::CaddyAdmin => config.set_caddy_admin(value),
+        ConfigKey::HttpsServer => config.set_https_server(server_override(value)),
+        ConfigKey::HttpServer => config.set_http_server(server_override(value)),
+        ConfigKey::RunBindAddress => config.set_run_bind_address(value.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "run-bind-address must be an IP address",
+            )
+        })?),
+        ConfigKey::CaddyLoopbackHost => config.set_caddy_loopback_host(value),
+        ConfigKey::CaddyClientIpRanges => config.set_caddy_client_ip_ranges(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|range| !range.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ),
+    }
+    crate::config::format_global(config)?;
+    Ok(())
+}
+
+fn server_override(value: String) -> Option<String> {
+    (!matches!(value.as_str(), "auto" | "none")).then_some(value)
 }
 
 fn ca_export_command(
@@ -666,6 +791,17 @@ fn parse_from(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, clap
 fn normalize_shortcuts(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     let mut arguments: Vec<_> = arguments.into_iter().collect();
 
+    if !arguments.get(1).is_some_and(|value| value == "config")
+        && let Some(index) = arguments
+            .iter()
+            .position(|value| value == "--caddy-socket")
+            .filter(|index| *index > 1 && *index + 1 < arguments.len())
+    {
+        let option = arguments.remove(index);
+        let value = arguments.remove(index);
+        arguments.splice(1..1, [option, value]);
+    }
+
     if arguments.get(2).is_some_and(|value| value == "run")
         && arguments.get(1).is_some_and(|value| !is_command(value))
     {
@@ -689,9 +825,11 @@ fn normalize_shortcuts(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsS
 }
 
 fn is_command(value: &OsStr) -> bool {
-    ["run", "alias", "list", "status", "stop", "prune", "ca"]
-        .iter()
-        .any(|command| value == OsStr::new(command))
+    [
+        "run", "alias", "list", "status", "stop", "prune", "ca", "config",
+    ]
+    .iter()
+    .any(|command| value == OsStr::new(command))
 }
 
 fn is_alias_command(value: &OsStr) -> bool {
@@ -712,8 +850,8 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        AliasCommand, CaCommand, Command, drift_messages, parse_from, write_certificate,
-        write_registry_list,
+        AliasCommand, CaCommand, Command, ConfigCommand, ConfigKey, ConfigSetArgs, drift_messages,
+        parse_from, set_config_value, write_certificate, write_registry_list,
     };
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
     use uuid::Uuid;
@@ -843,7 +981,72 @@ mod tests {
     }
 
     #[test]
-    fn caddy_socket_is_a_global_option_before_or_after_the_command() {
+    fn parses_global_configuration_commands() {
+        let init = parse(&[
+            "config",
+            "init",
+            "--caddy-socket",
+            "/run/caddy/admin.socket",
+            "--force",
+        ]);
+        assert!(matches!(
+            init.command,
+            Command::Config(super::ConfigArgs {
+                command: ConfigCommand::Init(super::ConfigInitArgs {
+                    caddy_socket: Some(ref socket),
+                    force: true
+                })
+            }) if socket == "/run/caddy/admin.socket"
+        ));
+        assert!(matches!(
+            parse(&["config", "show"]).command,
+            Command::Config(super::ConfigArgs {
+                command: ConfigCommand::Show
+            })
+        ));
+        assert!(matches!(
+            parse(&["config", "path"]).command,
+            Command::Config(super::ConfigArgs {
+                command: ConfigCommand::Path
+            })
+        ));
+
+        let set = parse(&["config", "set", "caddy-admin", "unix:///run/caddy.sock"]);
+        let Command::Config(super::ConfigArgs {
+            command: ConfigCommand::Set(set),
+        }) = set.command
+        else {
+            panic!("expected config set");
+        };
+        assert!(matches!(set.key, ConfigKey::CaddyAdmin));
+    }
+
+    #[test]
+    fn configuration_values_are_typed_and_validated() {
+        let mut config = crate::config::GlobalConfig::default();
+        set_config_value(
+            &mut config,
+            ConfigSetArgs {
+                key: ConfigKey::CaddyClientIpRanges,
+                value: "127.0.0.1/32, ::1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(config.caddy_client_ip_ranges, ["127.0.0.1/32", "::1"]);
+        assert!(
+            set_config_value(
+                &mut config,
+                ConfigSetArgs {
+                    key: ConfigKey::RunBindAddress,
+                    value: "not-an-ip".into(),
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn caddy_socket_is_accepted_around_operational_commands() {
         for arguments in [
             &["--caddy-socket", "/run/caddy/admin.socket", "status"][..],
             &["status", "--caddy-socket", "/run/caddy/admin.socket"][..],
@@ -852,6 +1055,8 @@ mod tests {
             assert_eq!(cli.caddy_socket.as_deref(), Some("/run/caddy/admin.socket"));
             assert!(matches!(cli.command, Command::Status));
         }
+
+        assert!(try_parse(&["config", "show", "--caddy-socket", "/tmp/caddy.sock"]).is_err());
     }
 
     #[test]
