@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Install system test dependencies
         run: sudo apt-get update && sudo apt-get install --yes ca-certificates curl iproute2 openssl python3 util-linux
@@ -58,7 +58,7 @@ jobs:
           sha256sum nook > nook.sha256
 
       - name: Upload Linux release candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: nook-linux-x86_64
           path: dist/
@@ -70,7 +70,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
