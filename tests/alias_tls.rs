@@ -62,21 +62,20 @@ struct Certificate {
 
 impl Certificate {
     fn generate(root: &Path, name: &str, hostname: &str, expired: bool) -> Self {
-        let cert = root.join(format!("{name}.crt"));
+        let mut cert = root.join(format!("{name}.crt"));
         let key = root.join(format!("{name}.key"));
+        if expired {
+            cert.set_extension("csr");
+        }
         let mut command = Command::new("openssl");
-        command.args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"]);
+        command.args(["req", "-newkey", "rsa:2048", "-nodes"]);
+        if !expired {
+            command.arg("-x509");
+        }
         command.arg("-keyout").arg(&key).arg("-out").arg(&cert);
         command.args(["-subj", &format!("/CN={hostname}")]);
-        command.args(["-addext", &format!("subjectAltName=DNS:{hostname}")]);
-        if expired {
-            command.args([
-                "-not_before",
-                "20000101000000Z",
-                "-not_after",
-                "20010101000000Z",
-            ]);
-        } else {
+        if !expired {
+            command.args(["-addext", &format!("subjectAltName=DNS:{hostname}")]);
             command.args(["-days", "1"]);
         }
         let status = command
@@ -85,6 +84,50 @@ impl Certificate {
             .status()
             .expect("OpenSSL is required for TLS integration tests");
         assert!(status.success(), "failed to generate {name} certificate");
+
+        if expired {
+            let index = root.join(format!("{name}.index"));
+            let serial = root.join(format!("{name}.serial"));
+            let config = root.join(format!("{name}.cnf"));
+            let signed_cert = root.join(format!("{name}.crt"));
+            std::fs::write(&index, []).unwrap();
+            std::fs::write(&serial, b"01\n").unwrap();
+            std::fs::write(
+                &config,
+                format!(
+                    "[ca]\ndefault_ca=CA_default\n[CA_default]\ndatabase={}\nnew_certs_dir={}\nserial={}\ndefault_md=sha256\npolicy=policy_any\n[policy_any]\ncommonName=supplied\n[v3_req]\nsubjectAltName=DNS:{hostname}\n",
+                    index.display(),
+                    root.display(),
+                    serial.display(),
+                ),
+            )
+            .unwrap();
+            let output = Command::new("openssl")
+                .args(["ca", "-selfsign", "-batch", "-config"])
+                .arg(&config)
+                .arg("-keyfile")
+                .arg(&key)
+                .arg("-in")
+                .arg(&cert)
+                .arg("-out")
+                .arg(&signed_cert)
+                .args([
+                    "-startdate",
+                    "20000101000000Z",
+                    "-enddate",
+                    "20010101000000Z",
+                    "-extensions",
+                    "v3_req",
+                ])
+                .output()
+                .expect("OpenSSL is required for TLS integration tests");
+            assert!(
+                output.status.success(),
+                "failed to sign {name} certificate: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            cert = signed_cert;
+        }
         Self { cert, key }
     }
 }
