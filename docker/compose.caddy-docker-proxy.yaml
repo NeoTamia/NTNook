@@ -2,7 +2,7 @@ name: nook-caddy-proxy
 
 services:
   caddy:
-    image: lucaslorentz/caddy-docker-proxy:2.13.1-alpine
+    image: lucaslorentz/caddy-docker-proxy:2.13.1-alpine@sha256:3e6cf4a6382da0cd14108a69929d7f8cc59e9a59cae4c9795071fa392ffa8036
     environment:
       CADDY_DOCKER_CADDYFILE_PATH: /etc/caddy/Caddyfile
       CADDY_INGRESS_NETWORKS: nook
