@@ -1,24 +1,24 @@
 {
-  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
   extends: [
     // https://docs.renovatebot.com/presets-config/#configbest-practices
-    "config:best-practices",
-    ":semanticCommitTypeAll(build)",
-    ":docker",
+    'config:best-practices',
+    ':semanticCommitTypeAll(build)',
+    ':docker',
   ],
-  useBaseBranchConfig: "merge",
-  baseBranchPatterns: ["dev"],
+  useBaseBranchConfig: 'merge',
+  baseBranchPatterns: [
+    'dev',
+  ],
   major: {
     dependencyDashboardApproval: true,
   },
-  packageRules: [
-    {
-      matchPackageNames: ["typescript"],
-      allowedVersions: "<7",
-    },
-  ],
   dependencyDashboardApproval: false,
-  dependencyDashboardLabels: ["📌 dependencies"],
-  labels: ["📌 dependencies"],
-  semanticCommits: "enabled",
+  dependencyDashboardLabels: [
+    '📌 dependencies',
+  ],
+  labels: [
+    '📌 dependencies',
+  ],
+  semanticCommits: 'enabled',
 }
