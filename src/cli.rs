@@ -148,6 +148,9 @@ pub(crate) struct RunArgs {
     /// Explicit project configuration file.
     #[arg(long, value_name = "PATH")]
     pub(crate) config: Option<PathBuf>,
+    /// Apply nook.local.toml next to the explicit project configuration.
+    #[arg(long, requires = "config")]
+    pub(crate) local: bool,
     /// Seconds before warning that the application is not ready.
     #[arg(long, value_name = "SECONDS")]
     pub(crate) readiness_warn_after: Option<u64>,
@@ -423,6 +426,13 @@ fn run_command(
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
     let mut config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
+    if let Some(path) = &config.ignored_local_config {
+        writeln!(
+            errors,
+            "warning: ignoring local configuration {}; add --local to apply it",
+            path.display()
+        )?;
+    }
     config.bind_address = global.run_bind_address;
     let store = state_store()?;
     with_caddy_routes(global, config.tls, !config.tls, |routes| {
@@ -927,6 +937,7 @@ mod tests {
             "--force",
             "--config",
             "custom.toml",
+            "--local",
             "--readiness-warn-after",
             "12",
             "--",
@@ -946,6 +957,7 @@ mod tests {
             run.config.as_deref(),
             Some(std::path::Path::new("custom.toml"))
         );
+        assert!(run.local);
         assert_eq!(run.readiness_warn_after, Some(12));
         assert_eq!(run.command, ["bun", "dev"]);
     }
@@ -958,6 +970,12 @@ mod tests {
         };
         assert_eq!(run.name.as_deref(), Some("api"));
         assert_eq!(run.command, ["server", "--flag"]);
+    }
+
+    #[test]
+    fn local_requires_an_explicit_project_configuration() {
+        assert!(try_parse(&["run", "--local", "--", "server"]).is_err());
+        assert!(try_parse(&["run", "--config", "custom.toml", "--local"]).is_ok());
     }
 
     #[test]

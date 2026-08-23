@@ -1227,6 +1227,7 @@ mod tests {
             force: false,
             readiness_warn_after_seconds: readiness,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ignored_local_config: None,
         }
     }
 

@@ -6,3 +6,6 @@
 **/*.rs.bk
 
 .idea/
+
+# Per-developer Nook overrides
+/nook.local.toml
