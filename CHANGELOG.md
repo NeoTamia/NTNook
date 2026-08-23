@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/NeoTamia/NTNook/compare/v0.2.0...v0.3.0) (2026-08-23)
+
+
+### ✨ Features
+
+* **cli:** Add bash and zsh completions ([4971178](https://github.com/NeoTamia/NTNook/commit/49711787de7a481cf5a47927d07a6c46c185d1e8))
+
+
+### 🐛 Bug Fixes
+
+* **ci:** Publish crate from clean checkout ([7086332](https://github.com/NeoTamia/NTNook/commit/708633243d31b243625110c6476a9184cd2b36b2))
+* **cli:** Address completion review feedback ([ce3995c](https://github.com/NeoTamia/NTNook/commit/ce3995c869391637fd6a4ec0688fdf5d5e13c9ef))
+
+
+### 🔧 Build System
+
+* **deps:** Update actions/attest digest to 1e69f48 ([e94a3a2](https://github.com/NeoTamia/NTNook/commit/e94a3a20654d654a43567d9e383619c0ac628988))
+* **deps:** Update rust crate signal-hook to 0.4.0 ([#8](https://github.com/NeoTamia/NTNook/issues/8)) ([66cae6e](https://github.com/NeoTamia/NTNook/commit/66cae6e32b469febb22e013a2aff651c45324adb))
+
 ## [0.2.0](https://github.com/NeoTamia/NTNook/compare/v0.1.0...v0.2.0) (2026-08-23)
 
 
