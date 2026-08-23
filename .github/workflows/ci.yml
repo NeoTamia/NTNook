@@ -41,6 +41,9 @@ jobs:
       - name: Compile
         run: cargo check --locked
 
+      - name: Validate crates.io package
+        run: cargo package --locked
+
       - name: Test
         run: |
           sudo sysctl --write net.ipv4.ip_unprivileged_port_start=0

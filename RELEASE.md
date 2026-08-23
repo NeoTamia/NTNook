@@ -1,6 +1,22 @@
 # Nook 0.1.0 — notes de release MVP
 
-Cette version fournit un unique binaire Linux `nook`. L’artefact CI `nook-linux-x86_64` contient le binaire, sa somme SHA-256, le README et ces notes.
+Cette version fournit un unique binaire Linux `nook`. La GitHub Release contient une archive statique
+`nook-x86_64-unknown-linux-musl.tar.xz`, sa somme SHA-256 et l'installateur `nook-installer.sh`.
+Les sources prêtes à compiler sont également publiées sur crates.io sous le nom `ntnook`.
+
+## Initialisation crates.io pour les mainteneurs
+
+Le nom `nook` appartenant déjà à un autre projet, le paquet est publié sous le nom `ntnook` tout en
+installant la commande `nook`. Trusted Publishing nécessite une première publication manuelle :
+
+```sh
+cargo publish --locked
+```
+
+Ajoutez ensuite un Trusted Publisher GitHub Actions à la crate `ntnook` avec le dépôt
+`NeoTamia/NTNook`, le workflow `publish.yml` et l'environnement `release`. L'environnement GitHub
+`release` doit autoriser les tags `v*`. Après une première exécution réussie, crates.io peut être
+configuré en mode « Trusted Publishing only ».
 
 ## Fonctionnalités livrées
 
@@ -24,4 +40,5 @@ Le binaire ne fournit aucun daemon, IPC, socket local, serveur embarqué, shell 
 
 Le dépôt fournit un Compose Caddy officiel supporté sous Linux et une compatibilité testée avec caddy-docker-proxy. `nook ca export` permet de récupérer la CA publique sans exécutable Caddy sur l’hôte. Voir `docs/DOCKER.md`.
 
-Avant publication, l’artefact doit provenir d’une exécution CI verte et sa somme doit être vérifiée avec `sha256sum --check nook.sha256` depuis son répertoire.
+Avant publication, l’artefact doit provenir d’une exécution CI verte. Après téléchargement, vérifiez-le
+avec `sha256sum --check nook-x86_64-unknown-linux-musl.tar.xz.sha256` depuis son répertoire.

@@ -5,9 +5,26 @@ Nook est une CLI Linux qui expose des applications locales sous des domaines sta
 ## Prérequis et installation
 
 - Linux ;
-- Rust stable pour compiler Nook ;
 - Caddy `2.11.x`, natif ou dans Docker, déjà démarré et accessible par son Admin API ;
 - des serveurs Caddy non ambigus écoutant sur `:443` pour HTTPS et, si `--no-tls` est utilisé, sur `:80` pour HTTP.
+
+Installation recommandée du binaire précompilé Linux x86-64 :
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/NeoTamia/NTNook/releases/latest/download/nook-installer.sh | sh
+nook --help
+```
+
+Le script installe Nook dans `$XDG_BIN_HOME`, ou `~/.local/bin` par défaut, sans utiliser `sudo`.
+`NOOK_INSTALL_DIR` permet de choisir un autre répertoire et `NOOK_VERSION` d'installer une version
+précise. Les utilisateurs de Rust peuvent également compiler la version publiée sur crates.io :
+
+```sh
+cargo install ntnook --locked
+```
+
+Pour compiler le dépôt localement :
 
 ```sh
 caddy version
@@ -247,4 +264,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Les intégrations requièrent Caddy `2.11.x`, OpenSSL, Python 3, curl avec HTTP/2, `unshare` et `ip`. Elles utilisent uniquement des ports loopback et des répertoires temporaires, désactivent l’installation de confiance et nettoient leurs processus et fichiers. Le test complet Nook/Caddy ouvre `:80` et `:443` dans un namespace réseau utilisateur isolé ; la CI effectue le même test sur son runner jetable.
 
-La CI Linux applique cette porte avec la toolchain épinglée dans `rust-toolchain.toml`, puis produit un artefact x86-64 et sa somme SHA-256. Voir [la traçabilité](docs/TRACEABILITY.md) et [les notes de release](RELEASE.md).
+La CI Linux applique cette porte avec la toolchain épinglée dans `rust-toolchain.toml`. Chaque tag
+`v*` produit ensuite un binaire statique Linux x86-64, sa somme SHA-256 et une attestation GitHub,
+puis publie le paquet source `ntnook` sur crates.io. Voir
+[la traçabilité](docs/TRACEABILITY.md) et [les notes de release](RELEASE.md).
