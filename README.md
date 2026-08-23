@@ -104,6 +104,7 @@ Options de `run` :
 - `--strict-port` refuse ce fallback et exige `--app-port` ;
 - `--force` transfère un hostname déjà possédé par Nook sans arrêter l’ancien processus ;
 - `--config <path>` choisit explicitement le fichier projet ;
+- `--local` applique le `nook.local.toml` voisin d'un fichier choisi avec `--config` ;
 - `--readiness-warn-after <seconds>` règle le délai du warning de readiness ;
 - les arguments après `--` sont transmis directement, sans shell implicite.
 
@@ -165,6 +166,66 @@ readiness_warn_after_seconds = 30
 ```
 
 Sans commande après `--`, `command` est obligatoire. Le nom suit la priorité : `--name`, fichier projet, basename de la racine Git, puis basename du répertoire courant. Les valeurs CLI remplacent celles du fichier.
+
+Chaque développeur peut ajouter un `nook.local.toml` dans le même répertoire. Ses champs
+remplacent ceux de `nook.toml` sans modifier la configuration partagée :
+
+```toml
+format_version = 1
+name = "api-alwyn"
+app_port = 5180
+strict_port = true
+```
+
+La priorité complète est : valeurs par défaut et inférence, `nook.toml`, `nook.local.toml`, puis
+options CLI. Le fichier local peut aussi être utilisé seul, sans `nook.toml`. Chaque fichier est
+validé séparément, doit déclarer `format_version = 1` et refuse les champs inconnus.
+
+Ce fichier étant propre au poste, ajoutez-le au `.gitignore` du projet :
+
+```gitignore
+/nook.local.toml
+```
+
+Nook ne modifie pas `.gitignore` et ne vérifie pas si le fichier est suivi par Git.
+
+`--config chemin/custom.toml` reste déterministe et ne charge que le fichier demandé. Si un
+`nook.local.toml` existe à côté, Nook signale qu'il est ignoré. Ajoutez explicitement `--local`
+pour le superposer :
+
+```sh
+nook run --config chemin/custom.toml --local
+```
+
+Dans ce mode, `--local` échoue si le fichier voisin est absent et ne peut pas être utilisé sans
+`--config`.
+
+### Fallback lorsque Nook n'est pas installé
+
+Pour qu'un script `dev` reste utilisable par un développeur qui n'a pas encore Nook, séparez la
+commande applicative brute et testez le binaire directement dans `dev`. Exemple avec pnpm :
+
+```json
+{
+  "scripts": {
+    "dev": "if command -v nook >/dev/null 2>&1; then exec nook run; else printf '%s\\n' 'warning: Nook is not installed; starting without the local domain proxy' >&2; exec pnpm run dev:app; fi",
+    "dev:app": "vite"
+  }
+}
+```
+
+Le `nook.toml` partagé référence alors la commande brute :
+
+```toml
+format_version = 1
+name = "app"
+command = ["pnpm", "run", "dev:app"]
+```
+
+Pour npm, Yarn ou Bun, remplacez les deux occurrences de `pnpm` par respectivement `npm`, `yarn`
+ou `bun`. Le fallback ne s'exécute que si le binaire est absent : une erreur de Nook, de Caddy ou
+de l'application conserve son code de sortie et ne relance pas le serveur hors proxy. Cette
+recette utilise le shell POSIX, comme Nook est actuellement limité à Linux.
 
 ## Configuration globale
 
