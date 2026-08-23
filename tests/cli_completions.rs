@@ -80,10 +80,17 @@ fn generated_bash_completion_has_valid_syntax() {
 
 fn nook(arguments: &[&str]) -> Output {
     let directory = std::env::temp_dir().join(format!("nook-completions-env-{}", Uuid::new_v4()));
-    Command::new(env!("CARGO_BIN_EXE_nook"))
-        .env("XDG_CONFIG_HOME", directory.join("config"))
+    let config_home = directory.join("config");
+    let config_directory = config_home.join("nook");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::write(config_directory.join("config.toml"), "invalid = [").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", directory.join("state"))
         .args(arguments)
         .output()
-        .unwrap()
+        .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+    output
 }

@@ -29,6 +29,8 @@ installée. Pour les charger uniquement dans la session courante :
 source <(nook completions bash)
 
 # Zsh
+autoload -Uz compinit
+compinit
 source <(nook completions zsh)
 ```
 

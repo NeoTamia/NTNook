@@ -8,7 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{Shell, generate};
+use clap_complete::{Generator, Shell};
 use sha2::{Digest, Sha256};
 
 use crate::reconcile::RouteBackend;
@@ -270,8 +270,10 @@ fn completions_command(arguments: CompletionsArgs, output: &mut impl Write) -> i
         CompletionShell::Bash => Shell::Bash,
         CompletionShell::Zsh => Shell::Zsh,
     };
-    generate(shell, &mut Cli::command(), "nook", output);
-    Ok(())
+    let mut command = Cli::command();
+    command.set_bin_name("nook");
+    command.build();
+    shell.try_generate(&command, output)
 }
 
 fn config_command(arguments: ConfigArgs, output: &mut impl Write) -> crate::Result<()> {
@@ -892,14 +894,15 @@ fn looks_like_option(value: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::{self, Write};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use clap::error::ErrorKind;
 
     use super::{
-        AliasCommand, CaCommand, Command, CompletionShell, ConfigCommand, ConfigKey, ConfigSetArgs,
-        drift_messages, parse_from, set_config_value, sha256_hex, write_certificate,
-        write_registry_list,
+        AliasCommand, CaCommand, Command, CompletionShell, CompletionsArgs, ConfigCommand,
+        ConfigKey, ConfigSetArgs, completions_command, drift_messages, parse_from,
+        set_config_value, sha256_hex, write_certificate, write_registry_list,
     };
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
     use uuid::Uuid;
@@ -1035,6 +1038,31 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidValue
         );
+    }
+
+    #[test]
+    fn completion_generation_propagates_output_errors() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("completion output failed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = completions_command(
+            CompletionsArgs {
+                shell: CompletionShell::Bash,
+            },
+            &mut FailingWriter,
+        )
+        .expect_err("completion write errors should be returned");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "completion output failed");
     }
 
     #[test]
