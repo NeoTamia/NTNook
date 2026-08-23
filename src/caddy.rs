@@ -1221,9 +1221,14 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 1024];
-            let size = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..size]).starts_with("GET /config/ "));
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0; 256];
+                let size = stream.read(&mut chunk).unwrap();
+                assert_ne!(size, 0, "request ended before its headers were complete");
+                request.extend_from_slice(&chunk[..size]);
+            }
+            assert!(String::from_utf8_lossy(&request).starts_with("GET /config/ "));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nf\r\n{\"apps\":{\"http\"\r\n11\r\n:{\"servers\":{}}}}\r\n0\r\n\r\n",
