@@ -24,6 +24,7 @@ configuré en mode « Trusted Publishing only ».
 - aliases persistants vers un port ou une URL HTTP(S) ;
 - mutation atomique et propriétaire des routes d’une instance Caddy existante ;
 - commandes `list`, `status`, `stop`, `prune` et récupération après interruption ;
+- génération de complétions statiques Bash et Zsh avec `nook completions` ;
 - vérification TLS des upstreams HTTPS et diagnostic de la CA locale Caddy.
 
 ## Plateforme et dépendances

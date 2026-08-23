@@ -36,6 +36,50 @@ Nook ne démarre ni n’installe Caddy. Il ne lance jamais `sudo`, ne modifie pa
 
 Pour exécuter Caddy dans Docker sans installer son binaire sur l’hôte, utilisez le [guide Docker](docs/DOCKER.md). L’image officielle est supportée ; `caddy-docker-proxy` fait l’objet d’un test de compatibilité avec une réserve sur ses reloads.
 
+## Complétion Bash et Zsh
+
+Nook génère des scripts de complétion synchronisés avec les commandes et options de la version
+installée. Pour les charger uniquement dans la session courante :
+
+```sh
+# Bash
+source <(nook completions bash)
+
+# Zsh
+autoload -Uz compinit
+compinit
+source <(nook completions zsh)
+```
+
+Pour une installation Bash persistante :
+
+```sh
+completion_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+mkdir -p "$completion_dir"
+nook completions bash > "$completion_dir/nook"
+```
+
+Pour Zsh, générez `_nook` dans un répertoire de fonctions :
+
+```sh
+completion_dir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+mkdir -p "$completion_dir"
+nook completions zsh > "$completion_dir/_nook"
+```
+
+Ajoutez ensuite ce répertoire à `fpath` dans `.zshrc`, avant l’appel à `compinit` :
+
+```zsh
+fpath=("${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions" $fpath)
+autoload -Uz compinit
+compinit
+```
+
+Régénérez le fichier après chaque mise à jour de Nook. Cette première version complète les formes
+canoniques, comme `nook run --name api` et `nook alias set api 3000`. Les raccourcis
+`nook api run` et `nook alias api 3000`, ainsi que les noms de runs ou aliases existants, ne sont
+pas encore complétés dynamiquement.
+
 ## Préparer Caddy pour Nook
 
 Nook ajoute ses routes à un serveur Caddy existant : il ne crée pas les listeners lui-même. Pour les routes HTTPS, le Caddyfile doit produire exactement un serveur écoutant explicitement sur `:443`. Par exemple, ajoutez ce site à votre configuration existante :
