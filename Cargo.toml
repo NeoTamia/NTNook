@@ -1,8 +1,19 @@
 [package]
-name = "nook"
-version = "0.1.0"
+name = "ntnook"
+version = "0.2.0"
 edition = "2024"
-publish = false
+rust-version = "1.97.1"
+description = "Expose local applications through stable *.localhost domains using Caddy"
+license = "LGPL-3.0-only"
+repository = "https://github.com/NeoTamia/NTNook"
+readme = "README.md"
+keywords = ["localhost", "caddy", "proxy", "development", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+publish = ["crates-io"]
+
+[[bin]]
+name = "nook"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5.45", features = ["derive"] }
@@ -16,4 +27,4 @@ libc = "0.2.175"
 signal-hook = "0.3.18"
 base64 = "0.23.1"
 ipnet = "2.11.0"
-sha2 = "0.10.9"
+sha2 = "0.11.0"

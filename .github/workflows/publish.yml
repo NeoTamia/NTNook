@@ -1,0 +1,114 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  RELEASE_TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  publish:
+    name: GitHub Release and crates.io
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify tag and package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq --raw-output '.packages[] | select(.name == "ntnook") | .version')"
+          test -n "$package_version"
+          test "$version" = "$package_version"
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$(git rev-parse HEAD)"
+
+      - name: Install musl build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add "$RELEASE_TARGET"
+
+      - name: Validate crates.io package
+        run: cargo package --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release --target "$RELEASE_TARGET"
+
+      - name: Package release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          archive="nook-${RELEASE_TARGET}.tar.xz"
+          install -D -m 0755 "target/${RELEASE_TARGET}/release/nook" dist/nook
+          cp README.md RELEASE.md LICENSE dist/
+          tar --create --xz --file "$archive" --directory dist nook README.md RELEASE.md LICENSE
+          sha256sum "$archive" > "${archive}.sha256"
+          install -m 0755 install.sh nook-installer.sh
+          mkdir release-assets
+          mv "$archive" "${archive}.sha256" nook-installer.sh release-assets/
+          "target/${RELEASE_TARGET}/release/nook" --version | grep --fixed-strings "nook ${version}"
+
+      - name: Attest release assets
+        if: ${{ github.event.repository.private == false }}
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-path: release-assets/*
+
+      - name: Upload GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          attempts=0
+          until gh release view "$RELEASE_TAG" >/dev/null 2>&1; do
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 12 ]; then
+              echo "GitHub Release $RELEASE_TAG was not created by Release Please" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Check crates.io version
+        id: crates-io-version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if cargo info "ntnook@${version}" --registry crates-io >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate with crates.io
+        if: steps.crates-io-version.outputs.published != 'true'
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish to crates.io
+        if: steps.crates-io-version.outputs.published != 'true'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
