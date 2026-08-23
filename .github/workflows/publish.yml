@@ -16,10 +16,9 @@ env:
   RELEASE_TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  publish:
-    name: GitHub Release and crates.io
+  release-assets:
+    name: GitHub Release assets
     runs-on: ubuntu-24.04
-    environment: release
     permissions:
       artifact-metadata: write
       attestations: write
@@ -89,6 +88,20 @@ jobs:
             sleep 5
           done
           gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+  crates-io:
+    name: crates.io
+    needs: release-assets
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check crates.io version
         id: crates-io-version
