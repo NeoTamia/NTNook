@@ -7,7 +7,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Generator, Shell};
 use sha2::{Digest, Sha256};
 
 use crate::reconcile::RouteBackend;
@@ -45,6 +46,20 @@ pub(crate) enum Command {
     Ca(CaArgs),
     /// Create and inspect Nook's global configuration.
     Config(ConfigArgs),
+    /// Generate shell completion scripts.
+    Completions(CompletionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CompletionsArgs {
+    /// Shell whose completion script should be generated.
+    pub(crate) shell: CompletionShell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CompletionShell {
+    Bash,
+    Zsh,
 }
 
 #[derive(Debug, Args)]
@@ -202,6 +217,10 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         command,
     } = cli;
     let command = match command {
+        Command::Completions(arguments) => {
+            completions_command(arguments, output)?;
+            return Ok(0);
+        }
         Command::Config(arguments) => {
             if caddy_socket.is_some() {
                 return Err(io::Error::new(
@@ -240,7 +259,21 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
             command: CaCommand::Export(arguments),
         }) => ca_export_command(arguments, &global, output).map(|()| 0),
         Command::Config(_) => unreachable!("configuration commands return before loading Caddy"),
+        Command::Completions(_) => {
+            unreachable!("completion commands return before loading Caddy")
+        }
     }
+}
+
+fn completions_command(arguments: CompletionsArgs, output: &mut impl Write) -> io::Result<()> {
+    let shell = match arguments.shell {
+        CompletionShell::Bash => Shell::Bash,
+        CompletionShell::Zsh => Shell::Zsh,
+    };
+    let mut command = Cli::command();
+    command.set_bin_name("nook");
+    command.build();
+    shell.try_generate(&command, output)
 }
 
 fn config_command(arguments: ConfigArgs, output: &mut impl Write) -> crate::Result<()> {
@@ -834,7 +867,15 @@ fn normalize_shortcuts(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsS
 
 fn is_command(value: &OsStr) -> bool {
     [
-        "run", "alias", "list", "status", "stop", "prune", "ca", "config",
+        "run",
+        "alias",
+        "list",
+        "status",
+        "stop",
+        "prune",
+        "ca",
+        "config",
+        "completions",
     ]
     .iter()
     .any(|command| value == OsStr::new(command))
@@ -853,13 +894,15 @@ fn looks_like_option(value: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::{self, Write};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use clap::error::ErrorKind;
 
     use super::{
-        AliasCommand, CaCommand, Command, ConfigCommand, ConfigKey, ConfigSetArgs, drift_messages,
-        parse_from, set_config_value, sha256_hex, write_certificate, write_registry_list,
+        AliasCommand, CaCommand, Command, CompletionShell, CompletionsArgs, ConfigCommand,
+        ConfigKey, ConfigSetArgs, completions_command, drift_messages, parse_from,
+        set_config_value, sha256_hex, write_certificate, write_registry_list,
     };
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
     use uuid::Uuid;
@@ -974,6 +1017,52 @@ mod tests {
         ] {
             parse(arguments);
         }
+    }
+
+    #[test]
+    fn parses_supported_completion_shells_and_rejects_others() {
+        for (shell, expected) in [
+            ("bash", CompletionShell::Bash),
+            ("zsh", CompletionShell::Zsh),
+        ] {
+            let cli = parse(&["completions", shell]);
+            let Command::Completions(arguments) = cli.command else {
+                panic!("expected completions command");
+            };
+            assert_eq!(arguments.shell, expected);
+        }
+
+        assert_eq!(
+            try_parse(&["completions", "fish"])
+                .expect_err("unsupported shells should be rejected")
+                .kind(),
+            ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn completion_generation_propagates_output_errors() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("completion output failed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = completions_command(
+            CompletionsArgs {
+                shell: CompletionShell::Bash,
+            },
+            &mut FailingWriter,
+        )
+        .expect_err("completion write errors should be returned");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "completion output failed");
     }
 
     #[test]
