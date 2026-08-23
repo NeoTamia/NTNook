@@ -316,7 +316,7 @@ fn ca_export_command(
         "exported Caddy local CA to {}",
         arguments.path.display()
     )?;
-    writeln!(output, "sha256={:x}", Sha256::digest(&der))?;
+    writeln!(output, "sha256={}", sha256_hex(&der))?;
     Ok(())
 }
 
@@ -581,11 +581,7 @@ fn status_command(
     }
     let local_ca = client.fetch_local_ca()?;
     let (_, local_ca_der) = crate::caddy::canonical_local_ca(&local_ca)?;
-    writeln!(
-        output,
-        "local_ca_sha256\t{:x}",
-        Sha256::digest(&local_ca_der)
-    )?;
+    writeln!(output, "local_ca_sha256\t{}", sha256_hex(&local_ca_der))?;
     let trusted = crate::caddy::local_ca_is_trusted(&local_ca)?;
     writeln!(
         output,
@@ -692,6 +688,18 @@ fn reconcile_and_record(
 
 fn state_store() -> crate::Result<crate::state::Store> {
     Ok(crate::state::Store::new(crate::state::state_path()?))
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(input);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn select_servers(
@@ -851,10 +859,18 @@ mod tests {
 
     use super::{
         AliasCommand, CaCommand, Command, ConfigCommand, ConfigKey, ConfigSetArgs, drift_messages,
-        parse_from, set_config_value, write_certificate, write_registry_list,
+        parse_from, set_config_value, sha256_hex, write_certificate, write_registry_list,
     };
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
     use uuid::Uuid;
+
+    #[test]
+    fn sha256_hex_uses_lowercase_fixed_width_encoding() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn parses_name_before_run_and_all_run_options() {
