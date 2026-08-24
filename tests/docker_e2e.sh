@@ -39,6 +39,7 @@ mkdir -p "$test_root/config/nook" "$test_root/state"
 cp docker/nook-config.toml.example "$test_root/config/nook/config.toml"
 export XDG_CONFIG_HOME="$test_root/config"
 export XDG_STATE_HOME="$test_root/state"
+export NOOK_DISABLE_UPDATE_CHECK=1
 
 target/debug/nook status >"$test_root/status.txt" 2>"$test_root/status.err"
 grep -q $'caddy\tok' "$test_root/status.txt"

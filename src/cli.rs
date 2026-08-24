@@ -48,6 +48,18 @@ pub(crate) enum Command {
     Config(ConfigArgs),
     /// Generate shell completion scripts.
     Completions(CompletionsArgs),
+    /// Update the nook binary from GitHub Releases.
+    Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UpdateArgs {
+    /// Report whether an update is available without installing it.
+    #[arg(long)]
+    pub(crate) check: bool,
+    /// Reinstall the latest release even if this version is already current.
+    #[arg(long)]
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -219,7 +231,13 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         caddy_socket,
         command,
     } = cli;
+    if !matches!(command, Command::Completions(_) | Command::Update(_)) {
+        crate::update::warn_if_available(errors);
+    }
     let command = match command {
+        Command::Update(arguments) => {
+            return update_command(arguments, output, errors);
+        }
         Command::Completions(arguments) => {
             completions_command(arguments, output)?;
             return Ok(0);
@@ -262,10 +280,23 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
             command: CaCommand::Export(arguments),
         }) => ca_export_command(arguments, &global, output).map(|()| 0),
         Command::Config(_) => unreachable!("configuration commands return before loading Caddy"),
-        Command::Completions(_) => {
-            unreachable!("completion commands return before loading Caddy")
+        Command::Completions(_) | Command::Update(_) => {
+            unreachable!("completion and update commands return before loading Caddy")
         }
     }
+}
+
+fn update_command(
+    arguments: UpdateArgs,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> crate::Result<i32> {
+    Ok(crate::update::perform(
+        arguments.check,
+        arguments.force,
+        output,
+        errors,
+    )?)
 }
 
 fn completions_command(arguments: CompletionsArgs, output: &mut impl Write) -> io::Result<()> {
@@ -886,6 +917,7 @@ fn is_command(value: &OsStr) -> bool {
         "ca",
         "config",
         "completions",
+        "update",
     ]
     .iter()
     .any(|command| value == OsStr::new(command))
@@ -911,7 +943,7 @@ mod tests {
 
     use super::{
         AliasCommand, CaCommand, Command, CompletionShell, CompletionsArgs, ConfigCommand,
-        ConfigKey, ConfigSetArgs, completions_command, drift_messages, parse_from,
+        ConfigKey, ConfigSetArgs, UpdateArgs, completions_command, drift_messages, parse_from,
         set_config_value, sha256_hex, write_certificate, write_registry_list,
     };
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme};
@@ -1032,9 +1064,24 @@ mod tests {
             &["status"][..],
             &["stop", "api", "--force"][..],
             &["prune"][..],
+            &["update"][..],
+            &["update", "--check"][..],
+            &["update", "--force"][..],
         ] {
             parse(arguments);
         }
+    }
+
+    #[test]
+    fn parses_update_flags() {
+        let cli = parse(&["update", "--check", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Command::Update(UpdateArgs {
+                check: true,
+                force: true
+            })
+        ));
     }
 
     #[test]

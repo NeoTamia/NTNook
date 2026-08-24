@@ -248,6 +248,7 @@ https://localhost:443 {{
 
     let script = "import os,http.server;http.server.ThreadingHTTPServer(('127.0.0.1',int(os.environ['PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -274,6 +275,7 @@ https://localhost:443 {{
     assert_eq!(running.wait().unwrap().code(), Some(130));
 
     let mut http_running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -323,6 +325,7 @@ https://localhost:443 {{
     );
 
     let mut http_only_running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -357,6 +360,7 @@ fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
         .args(arguments)
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", state_home)
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .output()
         .unwrap()
 }

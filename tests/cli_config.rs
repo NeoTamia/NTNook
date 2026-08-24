@@ -97,6 +97,7 @@ fn nook(config_home: &std::path::Path, state_home: &std::path::Path, arguments: 
     Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", state_home)
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(arguments)
         .output()
         .unwrap()
