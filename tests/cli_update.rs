@@ -198,11 +198,7 @@ fn update_refuses_development_and_cargo_binaries() {
 
     let cargo_bin = home.join(".cargo/bin");
     fs::create_dir_all(&cargo_bin).unwrap();
-    let cargo_nook = cargo_bin.join("nook");
-    fs::copy(env!("CARGO_BIN_EXE_nook"), &cargo_nook).unwrap();
-    let mut permissions = fs::metadata(&cargo_nook).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&cargo_nook, permissions).unwrap();
+    let cargo_nook = copy_nook(&cargo_bin);
     let cargo = Command::new(&cargo_nook)
         .args(["update"])
         .env("HOME", &home)
@@ -214,20 +210,71 @@ fn update_refuses_development_and_cargo_binaries() {
         .unwrap();
     assert!(!cargo.status.success(), "{}", stderr(&cargo));
     assert!(stderr(&cargo).contains("cargo install ntnook --locked --force"));
+
+    let foreign_dir = home.join("opt/tools/bin");
+    fs::create_dir_all(&foreign_dir).unwrap();
+    let foreign = copy_nook(&foreign_dir);
+    let unknown = Command::new(&foreign)
+        .args(["update"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success(), "{}", stderr(&unknown));
+    assert!(stderr(&unknown).contains("was not installed by the Nook installer"));
     fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
 fn update_replaces_a_managed_binary_from_a_verified_archive() {
     let home = test_home("replace");
-    let install_dir = home.join("bin");
+    let install_dir = home.join(".local/bin");
     fs::create_dir_all(&install_dir).unwrap();
-    let installed = install_dir.join("nook");
-    fs::copy(env!("CARGO_BIN_EXE_nook"), &installed).unwrap();
-    let mut permissions = fs::metadata(&installed).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&installed, permissions).unwrap();
+    let installed = copy_nook(&install_dir);
 
+    let (archive, checksum) = pack_replacement(&home);
+    let state = Arc::new(Mutex::new(ReleaseServer {
+        tag: "v99.0.0".into(),
+        archive,
+        checksum,
+        latest_status: 200,
+        hang: false,
+        hits: 0,
+    }));
+    let url = spawn_server(Arc::clone(&state));
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "umask 077; exec \"$0\" \"$@\"",
+            installed.to_str().unwrap(),
+            "update",
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("NOOK_UPDATE_RELEASES_URL", &url)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("updated nook from"));
+    let mode = fs::metadata(&installed).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+    let replaced = Command::new(&installed).output().unwrap();
+    assert!(replaced.status.success(), "{}", stderr(&replaced));
+    assert_eq!(stdout(&replaced).trim(), "nook 99.0.0");
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn update_replaces_a_binary_in_nook_install_dir() {
+    let home = test_home("install-dir");
+    let install_dir = home.join("custom/bin");
+    fs::create_dir_all(&install_dir).unwrap();
+    let installed = copy_nook(&install_dir);
     let (archive, checksum) = pack_replacement(&home);
     let state = Arc::new(Mutex::new(ReleaseServer {
         tag: "v99.0.0".into(),
@@ -244,15 +291,22 @@ fn update_replaces_a_managed_binary_from_a_verified_archive() {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("NOOK_INSTALL_DIR", &install_dir)
         .env("NOOK_UPDATE_RELEASES_URL", &url)
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("updated nook from"));
-    let replaced = Command::new(&installed).output().unwrap();
-    assert!(replaced.status.success(), "{}", stderr(&replaced));
-    assert_eq!(stdout(&replaced).trim(), "nook 99.0.0");
     fs::remove_dir_all(home).unwrap();
+}
+
+fn copy_nook(directory: &Path) -> PathBuf {
+    let installed = directory.join("nook");
+    fs::copy(env!("CARGO_BIN_EXE_nook"), &installed).unwrap();
+    let mut permissions = fs::metadata(&installed).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&installed, permissions).unwrap();
+    installed
 }
 
 fn pack_replacement(home: &Path) -> (Vec<u8>, String) {

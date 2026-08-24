@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -83,6 +83,7 @@ enum InstallKind {
     Cargo,
     Development,
     Managed,
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +176,12 @@ fn install_latest(force: bool, output: &mut impl Write) -> Result<i32, Error> {
         InstallKind::Development => {
             return Err(Error::InstallMethod(format!(
                 "refusing to replace a development binary at {}",
+                executable.display()
+            )));
+        }
+        InstallKind::Unknown => {
+            return Err(Error::InstallMethod(format!(
+                "refusing to replace {} because it was not installed by the Nook installer; re-run the installer or set NOOK_INSTALL_DIR",
                 executable.display()
             )));
         }
@@ -334,6 +341,11 @@ fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
             .open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
+        drop(file);
+        let mode = fs::metadata(destination)
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or(0o755);
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
         fs::rename(&temporary, destination)?;
         Ok(())
     })();
@@ -353,8 +365,10 @@ fn install_kind(path: &Path) -> InstallKind {
         InstallKind::Cargo
     } else if is_development_binary(path) {
         InstallKind::Development
-    } else {
+    } else if is_managed_install(path) {
         InstallKind::Managed
+    } else {
+        InstallKind::Unknown
     }
 }
 
@@ -374,6 +388,41 @@ fn is_cargo_install(path: &Path) -> bool {
         .parent()
         .and_then(Path::file_name)
         .is_some_and(|name| name == ".cargo")
+}
+
+fn is_managed_install(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    is_default_user_bin(parent)
+        || installer_directories()
+            .iter()
+            .any(|directory| paths_match(parent, directory))
+}
+
+fn is_default_user_bin(parent: &Path) -> bool {
+    parent.file_name() == Some(OsStr::new("bin"))
+        && parent
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".local")
+}
+
+fn installer_directories() -> Vec<PathBuf> {
+    ["NOOK_INSTALL_DIR", "XDG_BIN_HOME"]
+        .into_iter()
+        .filter_map(|key| env::var_os(key).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
 }
 
 fn is_development_binary(path: &Path) -> bool {
@@ -580,6 +629,10 @@ mod tests {
         assert_eq!(
             install_kind(Path::new("/home/user/.local/bin/nook")),
             InstallKind::Managed
+        );
+        assert_eq!(
+            install_kind(Path::new("/opt/tools/bin/nook")),
+            InstallKind::Unknown
         );
     }
 
