@@ -3,6 +3,7 @@ mod support;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -96,6 +97,14 @@ https://localhost:443 {{
         &["status", "--caddy-socket", admin_socket],
     );
     assert_success(&status);
+    assert_eq!(
+        fs::metadata(harness.admin_socket().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o660
+    );
     assert!(String::from_utf8_lossy(&status.stdout).contains("caddy\tok"));
     assert!(
         String::from_utf8_lossy(&status.stderr)
@@ -350,6 +359,15 @@ https://localhost:443 {{
     );
     assert_eq!(http_only_running.wait().unwrap().code(), Some(143));
     assert!(!fetch_config(&harness).contains(&http_only_run_host));
+    assert_eq!(
+        fs::metadata(harness.admin_socket().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o660,
+        "Caddy must preserve group access to its admin socket after Nook route cleanup"
+    );
 }
 
 fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {

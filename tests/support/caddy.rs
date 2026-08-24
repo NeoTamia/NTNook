@@ -27,6 +27,13 @@ impl AdminAddress {
     fn caddy_address(&self) -> String {
         match self {
             Self::Tcp(port) => format!("127.0.0.1:{port}"),
+            Self::Unix(socket) => format!("unix/{}|0660", socket.display()),
+        }
+    }
+
+    fn client_address(&self) -> String {
+        match self {
+            Self::Tcp(port) => format!("http://127.0.0.1:{port}"),
             Self::Unix(socket) => format!("unix/{}", socket.display()),
         }
     }
@@ -105,9 +112,13 @@ impl CaddyHarness {
     }
 
     pub(crate) fn admin_url(&self) -> String {
+        self.admin.client_address()
+    }
+
+    pub(crate) fn admin_socket(&self) -> Option<&Path> {
         match &self.admin {
-            AdminAddress::Tcp(port) => format!("http://127.0.0.1:{port}"),
-            AdminAddress::Unix(_) => self.admin.caddy_address(),
+            AdminAddress::Unix(socket) => Some(socket),
+            AdminAddress::Tcp(_) => None,
         }
     }
 

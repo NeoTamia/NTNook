@@ -97,7 +97,7 @@ Si l’Admin API doit utiliser le socket Unix standard, placez aussi cette direc
 
 ```caddyfile
 {
-	admin "unix//run/caddy/admin.socket"
+	admin "unix//run/caddy/admin.socket|0660"
 }
 ```
 
@@ -131,22 +131,12 @@ stat -c '%A %U:%G %n' /run/caddy/admin.socket
 ```
 
 Le groupe `caddy` doit avoir le droit d’écriture, par exemple
-`srw-rw---- caddy:caddy`. Certaines installations créent toutefois le socket en `0600`
-(`srw-------`), auquel cas l’appartenance au groupe ne suffit pas. Avec Caddy géré par systemd,
-ajoutez une permission persistante après chaque démarrage :
+`srw-rw---- caddy:caddy`. Le suffixe `|0660` de la directive `admin` demande à Caddy
+d'appliquer ce mode à chaque création du socket. Ne le remplacez pas par un simple
+`ExecStartPost=chmod` systemd : une modification via l'Admin API peut recréer le socket en
+`0200`, après le hook de démarrage, et couper immédiatement l'accès de Nook.
 
-```sh
-sudo systemctl edit caddy
-```
-
-Ajoutez cet override :
-
-```ini
-[Service]
-ExecStartPost=/usr/bin/chmod 0660 /run/caddy/admin.socket
-```
-
-Puis appliquez-le en redémarrant Caddy :
+Appliquez la configuration en redémarrant Caddy :
 
 ```sh
 sudo systemctl daemon-reload
@@ -379,7 +369,7 @@ L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallba
 
 ## Dépannage
 
-- `Caddy Admin API request failed` : vérifier que Caddy tourne et que `caddy_admin` est correct. Pour un socket Unix, vérifier aussi que la session possède le groupe `caddy` et que le socket accorde l’écriture à ce groupe, comme décrit dans « Préparer Caddy pour Nook ».
+- `Caddy Admin API request failed` : vérifier que Caddy tourne et que `caddy_admin` est correct. Pour un socket Unix, vérifier aussi que la session possède le groupe `caddy` et que la directive Caddy utilise `unix//run/caddy/admin.socket|0660`, comme décrit dans « Préparer Caddy pour Nook ». Un `ExecStartPost=chmod` seul ne résiste pas aux recréations du socket lors des changements de configuration.
 - `expected exactly one ... server; detected: none` : ajouter le listener `:443` ou `:80` correspondant dans Caddy.
 - plusieurs serveurs compatibles détectés : utiliser les candidats affichés pour définir `https_server` ou `http_server`.
 - `no selected Caddy HTTP server` : configurer un listener `:80` avant d’utiliser `--no-tls`.
