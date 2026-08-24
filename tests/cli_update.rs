@@ -178,6 +178,13 @@ fn disabled_check_and_http_errors_never_block_commands() {
     );
     assert!(errored.status.success(), "{}", stderr(&errored));
     assert!(!stderr(&errored).contains("warning: nook"));
+    let retried = nook(
+        &home,
+        &["config", "path"],
+        &[("NOOK_UPDATE_RELEASES_URL", &fail_url)],
+    );
+    assert!(retried.status.success(), "{}", stderr(&retried));
+    assert_eq!(failing.lock().unwrap().hits, 1);
     fs::remove_dir_all(home).unwrap();
 }
 

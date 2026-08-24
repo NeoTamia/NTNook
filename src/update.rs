@@ -165,6 +165,12 @@ fn check_latest(output: &mut impl Write, errors: &mut impl Write) -> Result<i32,
 }
 
 fn install_latest(force: bool, output: &mut impl Write) -> Result<i32, Error> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(Error::InstallMethod(
+            "self-update publishes x86_64 Linux binaries only; reinstall for this architecture"
+                .into(),
+        ));
+    }
     let executable = current_executable()?;
     match install_kind(&executable) {
         InstallKind::Cargo => {
@@ -225,14 +231,26 @@ fn cached_or_fetch() -> Option<String> {
     if let Some(cache) = load_cache()
         && cache_is_fresh(cache.checked_at_unix_ms, now)
     {
-        return Some(cache.latest);
+        return cached_latest(cache.latest);
     }
     match fetch_latest(PASSIVE_TIMEOUT) {
         Ok(release) => {
             let _ = store_cache(&release.version);
             Some(release.version)
         }
-        Err(_) => None,
+        Err(_) => {
+            let latest = load_cache().map(|cache| cache.latest).unwrap_or_default();
+            let _ = store_cache(&latest);
+            cached_latest(latest)
+        }
+    }
+}
+
+fn cached_latest(latest: String) -> Option<String> {
+    if latest.is_empty() {
+        None
+    } else {
+        Some(latest)
     }
 }
 
