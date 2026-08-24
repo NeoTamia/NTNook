@@ -120,7 +120,44 @@ Après reconnexion, vérifiez que la nouvelle session possède bien le groupe :
 id -nG
 ```
 
-La sortie doit contenir `caddy`. Ne lancez pas Nook avec `sudo` : ses fichiers de configuration et d’état appartiennent à votre utilisateur, et les processus applicatifs doivent conserver ses permissions normales.
+La sortie doit contenir `caddy`. Si `getent group caddy` mentionne l’utilisateur mais que
+`id -nG` ne contient pas `caddy`, la session courante n’a pas encore chargé la nouvelle
+appartenance : déconnectez-vous complètement puis reconnectez-vous.
+
+Vérifiez ensuite les permissions du socket :
+
+```sh
+stat -c '%A %U:%G %n' /run/caddy/admin.socket
+```
+
+Le groupe `caddy` doit avoir le droit d’écriture, par exemple
+`srw-rw---- caddy:caddy`. Certaines installations créent toutefois le socket en `0600`
+(`srw-------`), auquel cas l’appartenance au groupe ne suffit pas. Avec Caddy géré par systemd,
+ajoutez une permission persistante après chaque démarrage :
+
+```sh
+sudo systemctl edit caddy
+```
+
+Ajoutez cet override :
+
+```ini
+[Service]
+ExecStartPost=/usr/bin/chmod 0660 /run/caddy/admin.socket
+```
+
+Puis appliquez-le en redémarrant Caddy :
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart caddy
+nook status
+```
+
+L’accès au groupe `caddy` permet de modifier toute la configuration via l’Admin API ; ne
+l’accordez qu’aux utilisateurs de confiance. Ne lancez pas Nook avec `sudo` : ses fichiers de
+configuration et d’état appartiennent à votre utilisateur, et les processus applicatifs doivent
+conserver ses permissions normales.
 
 Caddy émet les certificats `*.localhost` avec sa CA locale. Installez explicitement cette CA depuis votre session utilisateur afin que le système et les navigateurs lui fassent confiance :
 
@@ -342,7 +379,7 @@ L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallba
 
 ## Dépannage
 
-- `Caddy Admin API request failed` : vérifier que Caddy tourne, que `caddy_admin` est correct et, pour un socket Unix, que ses permissions autorisent l’utilisateur courant.
+- `Caddy Admin API request failed` : vérifier que Caddy tourne et que `caddy_admin` est correct. Pour un socket Unix, vérifier aussi que la session possède le groupe `caddy` et que le socket accorde l’écriture à ce groupe, comme décrit dans « Préparer Caddy pour Nook ».
 - `expected exactly one ... server; detected: none` : ajouter le listener `:443` ou `:80` correspondant dans Caddy.
 - plusieurs serveurs compatibles détectés : utiliser les candidats affichés pour définir `https_server` ou `http_server`.
 - `no selected Caddy HTTP server` : configurer un listener `:80` avant d’utiliser `--no-tls`.
