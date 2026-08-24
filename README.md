@@ -224,6 +224,7 @@ nook stop api --force
 nook prune
 nook update
 nook update --check
+nook update --force
 ```
 
 - `list` distingue les runs `starting`/`ready` et les aliases persistants ;
@@ -232,6 +233,7 @@ nook update --check
 - `stop --force` attend au maximum deux secondes puis utilise SIGKILL si le même processus est encore vivant ;
 - `prune` nettoie les leases mortes et routes orphelines, rejoue les opérations en attente et restaure les routes manquantes ;
 - `update` télécharge la dernière release GitHub, vérifie le SHA-256 et remplace le binaire installé par le script d’installation ;
+- `update --force` réinstalle la dernière release même si la version installée est déjà à jour ;
 - `update --check` indique si une version plus récente existe, sans l’installer.
 
 Un binaire installé avec Cargo doit être mis à jour par `cargo install ntnook --locked --force`. Nook prévient sur stderr lorsqu’une mise à jour est disponible ; `NOOK_DISABLE_UPDATE_CHECK=1` désactive ce contrôle.

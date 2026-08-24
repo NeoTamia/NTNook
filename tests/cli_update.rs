@@ -162,6 +162,18 @@ fn disabled_check_and_http_errors_never_block_commands() {
     assert!(started.elapsed() < Duration::from_millis(400));
     assert_eq!(hanging.lock().unwrap().hits, 0);
 
+    let hanging_started = Instant::now();
+    let timed_out = nook(
+        &home,
+        &["config", "path"],
+        &[("NOOK_UPDATE_RELEASES_URL", &hang_url)],
+    );
+    assert!(timed_out.status.success(), "{}", stderr(&timed_out));
+    assert!(!stderr(&timed_out).contains("warning: nook"));
+    assert!(hanging_started.elapsed() < Duration::from_millis(2500));
+    assert_eq!(hanging.lock().unwrap().hits, 1);
+    fs::remove_file(home.join("cache/nook/update-check.json")).unwrap();
+
     let failing = Arc::new(Mutex::new(ReleaseServer {
         tag: "v99.0.0".into(),
         archive: Vec::new(),
@@ -273,6 +285,48 @@ fn update_replaces_a_managed_binary_from_a_verified_archive() {
     let replaced = Command::new(&installed).output().unwrap();
     assert!(replaced.status.success(), "{}", stderr(&replaced));
     assert_eq!(stdout(&replaced).trim(), "nook 99.0.0");
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn update_rejects_a_checksum_mismatch_without_replacing() {
+    let home = test_home("checksum");
+    let install_dir = home.join(".local/bin");
+    fs::create_dir_all(&install_dir).unwrap();
+    let installed = copy_nook(&install_dir);
+    let before = fs::read(&installed).unwrap();
+    let (archive, _) = pack_replacement(&home);
+    let checksum = format!(
+        "0000000000000000000000000000000000000000000000000000000000000000  {ARCHIVE_NAME}\n"
+    );
+    let state = Arc::new(Mutex::new(ReleaseServer {
+        tag: "v99.0.0".into(),
+        archive,
+        checksum,
+        latest_status: 200,
+        hang: false,
+        hits: 0,
+    }));
+    let url = spawn_server(Arc::clone(&state));
+    let output = Command::new(&installed)
+        .args(["update"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("NOOK_UPDATE_RELEASES_URL", &url)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("checksum mismatch"));
+    assert_eq!(fs::read(&installed).unwrap(), before);
+    let unchanged = Command::new(&installed)
+        .args(["--version"])
+        .output()
+        .unwrap();
+    assert!(unchanged.status.success(), "{}", stderr(&unchanged));
+    assert!(stdout(&unchanged).contains(env!("CARGO_PKG_VERSION")));
+    assert!(!stdout(&unchanged).contains("99.0.0"));
     fs::remove_dir_all(home).unwrap();
 }
 
