@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.4.0](https://github.com/NeoTamia/NTNook/compare/v0.3.0...v0.4.0) (2026-08-26)
+
+
+### ✨ Features
+
+* **cli:** Add GitHub self-update and launch-time update notice ([508162b](https://github.com/NeoTamia/NTNook/commit/508162ba27e90efaf18e7617797d8e06482c4157))
+* **cli:** Add GitHub self-update and launch-time update notice ([d336d2b](https://github.com/NeoTamia/NTNook/commit/d336d2b732522390c6b135f0736b49c8b24185fb))
+* Support local project configuration ([5054097](https://github.com/NeoTamia/NTNook/commit/5054097dbfef509469d316b3d270971e45e2717a))
+
+
+### 🐛 Bug Fixes
+
+* **caddy:** Preserve Unix admin socket permissions ([89c2ae9](https://github.com/NeoTamia/NTNook/commit/89c2ae95c6c7ae7a8f9a1fcbefe8b4a38689ac7a))
+* **update:** Address remaining review follow-ups ([b5fed72](https://github.com/NeoTamia/NTNook/commit/b5fed727ebe12d7d52b4a5966c81f2727e27425c))
+* **update:** Replace only installer-owned binaries ([27b6ac5](https://github.com/NeoTamia/NTNook/commit/27b6ac5f06ef01942f21add1dba8f1c0b115c8fb))
+* **update:** Require HOME for .local/bin and bound archive extraction ([a0d54ed](https://github.com/NeoTamia/NTNook/commit/a0d54ed7feffdd27a54a375082037308b11a2907))
+
+
+### 📚 Documentation
+
+* **readme:** Improve guidance on Caddy group permissions and socket configuration ([8aa095b](https://github.com/NeoTamia/NTNook/commit/8aa095b5bb32e6aba67c3efa46cf4cacbe3a873e))
+
+
+### 🧪 Tests
+
+* **update:** Cover checksum rejection and passive-check timeout ([8fb214a](https://github.com/NeoTamia/NTNook/commit/8fb214ab0c165a705f1d5ef72515f45e9fec4232))
+
+
+### 🔧 Build System
+
+* **deps:** Lock file maintenance ([#20](https://github.com/NeoTamia/NTNook/issues/20)) ([fb64a70](https://github.com/NeoTamia/NTNook/commit/fb64a7020ea5ed5f95aa48b1d88a04ec2a1b1496))
+* **deps:** Update rust crate toml to v1 ([a6f402c](https://github.com/NeoTamia/NTNook/commit/a6f402c51665ff663447d777fe6f92a156a77087))
+* **deps:** Update rust to v1.98.0 ([#10](https://github.com/NeoTamia/NTNook/issues/10)) ([d639cc3](https://github.com/NeoTamia/NTNook/commit/d639cc39eb8d58aa8cd4d0918c23f8c75e14320c))
+
 ## [0.3.0](https://github.com/NeoTamia/NTNook/compare/v0.2.0...v0.3.0) (2026-08-23)
 
 

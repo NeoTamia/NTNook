@@ -3,6 +3,7 @@ mod support;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -96,6 +97,14 @@ https://localhost:443 {{
         &["status", "--caddy-socket", admin_socket],
     );
     assert_success(&status);
+    assert_eq!(
+        fs::metadata(harness.admin_socket().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o660
+    );
     assert!(String::from_utf8_lossy(&status.stdout).contains("caddy\tok"));
     assert!(
         String::from_utf8_lossy(&status.stderr)
@@ -248,6 +257,7 @@ https://localhost:443 {{
 
     let script = "import os,http.server;http.server.ThreadingHTTPServer(('127.0.0.1',int(os.environ['PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -274,6 +284,7 @@ https://localhost:443 {{
     assert_eq!(running.wait().unwrap().code(), Some(130));
 
     let mut http_running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -323,6 +334,7 @@ https://localhost:443 {{
     );
 
     let mut http_only_running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -350,6 +362,15 @@ https://localhost:443 {{
     );
     assert_eq!(http_only_running.wait().unwrap().code(), Some(143));
     assert!(!fetch_config(&harness).contains(&http_only_run_host));
+    assert_eq!(
+        fs::metadata(harness.admin_socket().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o660,
+        "Caddy must preserve group access to its admin socket after Nook route cleanup"
+    );
 }
 
 fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
@@ -357,6 +378,7 @@ fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
         .args(arguments)
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", state_home)
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .output()
         .unwrap()
 }

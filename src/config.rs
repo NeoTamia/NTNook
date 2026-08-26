@@ -196,6 +196,7 @@ pub(crate) struct ResolvedRunConfig {
     pub(crate) force: bool,
     pub(crate) readiness_warn_after_seconds: u64,
     pub(crate) bind_address: IpAddr,
+    pub(crate) ignored_local_config: Option<PathBuf>,
 }
 
 pub(crate) fn load_global() -> Result<GlobalConfig, Error> {
@@ -325,29 +326,74 @@ pub(crate) fn resolve_run(
     arguments: &RunArgs,
     current_directory: &Path,
 ) -> Result<ResolvedRunConfig, Error> {
-    let project = load_project(arguments.config.as_deref(), current_directory)?;
+    let (project, ignored_local_config) = load_project(arguments, current_directory)?;
     let git_root = find_git_root(current_directory);
-    merge_run(arguments, project, git_root.as_deref(), current_directory)
+    let mut resolved = merge_run(arguments, project, git_root.as_deref(), current_directory)?;
+    resolved.ignored_local_config = ignored_local_config;
+    Ok(resolved)
 }
 
 fn load_project(
-    explicit_path: Option<&Path>,
+    arguments: &RunArgs,
     current_directory: &Path,
-) -> Result<Option<ProjectConfig>, Error> {
-    let path = explicit_path
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| current_directory.join("nook.toml"));
-    let contents = if explicit_path.is_some() {
-        Some(read_required(&path)?)
+) -> Result<(Option<ProjectConfig>, Option<PathBuf>), Error> {
+    if let Some(path) = arguments.config.as_deref() {
+        let base = load_project_file(path, true)?;
+        let local_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("nook.local.toml");
+        if local_path == path {
+            return Ok((base, None));
+        }
+        if arguments.local {
+            let local = load_project_file(&local_path, true)?;
+            return Ok((merge_project(base, local), None));
+        }
+        let ignored = local_path.exists().then_some(local_path);
+        return Ok((base, ignored));
+    }
+
+    let base = load_project_file(&current_directory.join("nook.toml"), false)?;
+    let local = load_project_file(&current_directory.join("nook.local.toml"), false)?;
+    Ok((merge_project(base, local), None))
+}
+
+fn load_project_file(path: &Path, required: bool) -> Result<Option<ProjectConfig>, Error> {
+    let contents = if required {
+        Some(read_required(path)?)
     } else {
-        read_optional(&path)?
+        read_optional(path)?
     };
     let Some(contents) = contents else {
         return Ok(None);
     };
-    let config: ProjectConfig = parse(&path, &contents)?;
-    validate_version(&path, config.format_version)?;
+    let config: ProjectConfig = parse(path, &contents)?;
+    validate_version(path, config.format_version)?;
     Ok(Some(config))
+}
+
+fn merge_project(
+    base: Option<ProjectConfig>,
+    local: Option<ProjectConfig>,
+) -> Option<ProjectConfig> {
+    let Some(local) = local else {
+        return base;
+    };
+    let Some(base) = base else {
+        return Some(local);
+    };
+    Some(ProjectConfig {
+        format_version: local.format_version,
+        name: local.name.or(base.name),
+        command: local.command.or(base.command),
+        tls: local.tls.or(base.tls),
+        app_port: local.app_port.or(base.app_port),
+        strict_port: local.strict_port.or(base.strict_port),
+        readiness_warn_after_seconds: local
+            .readiness_warn_after_seconds
+            .or(base.readiness_warn_after_seconds),
+    })
 }
 
 fn merge_run(
@@ -395,6 +441,7 @@ fn merge_run(
             .or(project.readiness_warn_after_seconds)
             .unwrap_or(DEFAULT_READINESS_WARN_AFTER_SECONDS),
         bind_address: default_run_bind_address(),
+        ignored_local_config: None,
     })
 }
 
@@ -691,6 +738,140 @@ mod tests {
         assert!(matches!(
             super::resolve_run(&run, &directory),
             Err(Error::UnsupportedVersion { version: 2, .. })
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn conventional_local_configuration_overrides_base_fields() {
+        let directory = temporary_directory();
+        fs::write(
+            directory.join("nook.toml"),
+            concat!(
+                "format_version = 1\n",
+                "name = \"base\"\n",
+                "command = [\"base-command\"]\n",
+                "tls = true\n",
+                "app_port = 8000\n",
+                "strict_port = true\n",
+                "readiness_warn_after_seconds = 20\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("nook.local.toml"),
+            concat!(
+                "format_version = 1\n",
+                "name = \"local\"\n",
+                "command = [\"local-command\"]\n",
+                "tls = false\n",
+                "strict_port = false\n",
+                "readiness_warn_after_seconds = 5\n",
+            ),
+        )
+        .unwrap();
+
+        let resolved = super::resolve_run(&run_args(&["run"]), &directory).unwrap();
+        assert_eq!(resolved.hostname, "local.localhost");
+        assert_eq!(resolved.command, ["local-command"]);
+        assert!(!resolved.tls);
+        assert_eq!(resolved.app_port, Some(8000));
+        assert!(!resolved.strict_port);
+        assert_eq!(resolved.readiness_warn_after_seconds, 5);
+        assert!(resolved.ignored_local_config.is_none());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn conventional_local_configuration_can_exist_without_base() {
+        let directory = temporary_directory();
+        fs::write(
+            directory.join("nook.local.toml"),
+            "format_version = 1\nname = \"local-only\"\ncommand = [\"server\"]\n",
+        )
+        .unwrap();
+
+        let resolved = super::resolve_run(&run_args(&["run"]), &directory).unwrap();
+        assert_eq!(resolved.hostname, "local-only.localhost");
+        assert_eq!(resolved.command, ["server"]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_configuration_ignores_or_applies_its_local_neighbor() {
+        let directory = temporary_directory();
+        let base = directory.join("custom.toml");
+        let local = directory.join("nook.local.toml");
+        fs::write(
+            &base,
+            "format_version = 1\nname = \"base\"\ncommand = [\"server\"]\n",
+        )
+        .unwrap();
+        fs::write(&local, "format_version = 1\nname = \"local\"\n").unwrap();
+
+        let base_path = base.to_str().unwrap();
+        let ignored =
+            super::resolve_run(&run_args(&["run", "--config", base_path]), &directory).unwrap();
+        assert_eq!(ignored.hostname, "base.localhost");
+        assert_eq!(
+            ignored.ignored_local_config.as_deref(),
+            Some(local.as_path())
+        );
+
+        let applied = super::resolve_run(
+            &run_args(&["run", "--config", base_path, "--local"]),
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(applied.hostname, "local.localhost");
+        assert!(applied.ignored_local_config.is_none());
+
+        fs::remove_file(&local).unwrap();
+        assert!(matches!(
+            super::resolve_run(
+                &run_args(&["run", "--config", base_path, "--local"]),
+                &directory
+            ),
+            Err(Error::Read { path, .. }) if path == local
+        ));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_local_file_is_not_loaded_twice() {
+        let directory = temporary_directory();
+        let local = directory.join("nook.local.toml");
+        fs::write(
+            &local,
+            "format_version = 1\nname = \"local\"\ncommand = [\"server\"]\n",
+        )
+        .unwrap();
+        let resolved = super::resolve_run(
+            &run_args(&["run", "--config", local.to_str().unwrap(), "--local"]),
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(resolved.hostname, "local.localhost");
+        assert!(resolved.ignored_local_config.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_local_configuration_reports_its_own_path() {
+        let directory = temporary_directory();
+        let local = directory.join("nook.local.toml");
+        fs::write(&local, "format_version = 2\ncommand = [\"server\"]\n").unwrap();
+        assert!(matches!(
+            super::resolve_run(&run_args(&["run"]), &directory),
+            Err(Error::UnsupportedVersion { path, version: 2 }) if path == local
+        ));
+        fs::write(&local, "format_version = 1\nunknown = true\n").unwrap();
+        assert!(matches!(
+            super::resolve_run(&run_args(&["run", "--", "server"]), &directory),
+            Err(Error::Parse { path, .. }) if path == local
         ));
         fs::remove_dir_all(directory).unwrap();
     }

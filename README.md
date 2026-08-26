@@ -97,7 +97,7 @@ Si l’Admin API doit utiliser le socket Unix standard, placez aussi cette direc
 
 ```caddyfile
 {
-	admin "unix//run/caddy/admin.socket"
+	admin "unix//run/caddy/admin.socket|0660"
 }
 ```
 
@@ -120,7 +120,34 @@ Après reconnexion, vérifiez que la nouvelle session possède bien le groupe :
 id -nG
 ```
 
-La sortie doit contenir `caddy`. Ne lancez pas Nook avec `sudo` : ses fichiers de configuration et d’état appartiennent à votre utilisateur, et les processus applicatifs doivent conserver ses permissions normales.
+La sortie doit contenir `caddy`. Si `getent group caddy` mentionne l’utilisateur mais que
+`id -nG` ne contient pas `caddy`, la session courante n’a pas encore chargé la nouvelle
+appartenance : déconnectez-vous complètement puis reconnectez-vous.
+
+Vérifiez ensuite les permissions du socket :
+
+```sh
+stat -c '%A %U:%G %n' /run/caddy/admin.socket
+```
+
+Le groupe `caddy` doit avoir le droit d’écriture, par exemple
+`srw-rw---- caddy:caddy`. Le suffixe `|0660` de la directive `admin` demande à Caddy
+d'appliquer ce mode à chaque création du socket. Ne le remplacez pas par un simple
+`ExecStartPost=chmod` systemd : une modification via l'Admin API peut recréer le socket en
+`0200`, après le hook de démarrage, et couper immédiatement l'accès de Nook.
+
+Appliquez la configuration en redémarrant Caddy :
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart caddy
+nook status
+```
+
+L’accès au groupe `caddy` permet de modifier toute la configuration via l’Admin API ; ne
+l’accordez qu’aux utilisateurs de confiance. Ne lancez pas Nook avec `sudo` : ses fichiers de
+configuration et d’état appartiennent à votre utilisateur, et les processus applicatifs doivent
+conserver ses permissions normales.
 
 Caddy émet les certificats `*.localhost` avec sa CA locale. Installez explicitement cette CA depuis votre session utilisateur afin que le système et les navigateurs lui fassent confiance :
 
@@ -148,6 +175,7 @@ Options de `run` :
 - `--strict-port` refuse ce fallback et exige `--app-port` ;
 - `--force` transfère un hostname déjà possédé par Nook sans arrêter l’ancien processus ;
 - `--config <path>` choisit explicitement le fichier projet ;
+- `--local` applique le `nook.local.toml` voisin d'un fichier choisi avec `--config` ;
 - `--readiness-warn-after <seconds>` règle le délai du warning de readiness ;
 - les arguments après `--` sont transmis directement, sans shell implicite.
 
@@ -184,13 +212,21 @@ nook status
 nook stop api
 nook stop api --force
 nook prune
+nook update
+nook update --check
+nook update --force
 ```
 
 - `list` distingue les runs `starting`/`ready` et les aliases persistants ;
 - `status` vérifie l’Admin API, les serveurs, les conteneurs Nook, les dérives et la confiance de la CA locale ;
 - `stop` envoie SIGTERM au groupe du run actuellement géré ;
 - `stop --force` attend au maximum deux secondes puis utilise SIGKILL si le même processus est encore vivant ;
-- `prune` nettoie les leases mortes et routes orphelines, rejoue les opérations en attente et restaure les routes manquantes.
+- `prune` nettoie les leases mortes et routes orphelines, rejoue les opérations en attente et restaure les routes manquantes ;
+- `update` télécharge la dernière release GitHub, vérifie le SHA-256 et remplace le binaire installé par le script d’installation ;
+- `update --force` réinstalle la dernière release même si la version installée est déjà à jour ;
+- `update --check` indique si une version plus récente existe, sans l’installer.
+
+Un binaire installé avec Cargo doit être mis à jour par `cargo install ntnook --locked --force`. Nook prévient sur stderr lorsqu’une mise à jour est disponible ; `NOOK_DISABLE_UPDATE_CHECK=1` désactive ce contrôle.
 
 Nook ne modifie jamais une route Caddy étrangère, même avec `--force`. Les routes Nook portent un owner UUID ; un ancien processus ne peut donc pas supprimer la route de son remplaçant.
 
@@ -209,6 +245,66 @@ readiness_warn_after_seconds = 30
 ```
 
 Sans commande après `--`, `command` est obligatoire. Le nom suit la priorité : `--name`, fichier projet, basename de la racine Git, puis basename du répertoire courant. Les valeurs CLI remplacent celles du fichier.
+
+Chaque développeur peut ajouter un `nook.local.toml` dans le même répertoire. Ses champs
+remplacent ceux de `nook.toml` sans modifier la configuration partagée :
+
+```toml
+format_version = 1
+name = "api-alwyn"
+app_port = 5180
+strict_port = true
+```
+
+La priorité complète est : valeurs par défaut et inférence, `nook.toml`, `nook.local.toml`, puis
+options CLI. Le fichier local peut aussi être utilisé seul, sans `nook.toml`. Chaque fichier est
+validé séparément, doit déclarer `format_version = 1` et refuse les champs inconnus.
+
+Ce fichier étant propre au poste, ajoutez-le au `.gitignore` du projet :
+
+```gitignore
+/nook.local.toml
+```
+
+Nook ne modifie pas `.gitignore` et ne vérifie pas si le fichier est suivi par Git.
+
+`--config chemin/custom.toml` reste déterministe et ne charge que le fichier demandé. Si un
+`nook.local.toml` existe à côté, Nook signale qu'il est ignoré. Ajoutez explicitement `--local`
+pour le superposer :
+
+```sh
+nook run --config chemin/custom.toml --local
+```
+
+Dans ce mode, `--local` échoue si le fichier voisin est absent et ne peut pas être utilisé sans
+`--config`.
+
+### Fallback lorsque Nook n'est pas installé
+
+Pour qu'un script `dev` reste utilisable par un développeur qui n'a pas encore Nook, séparez la
+commande applicative brute et testez le binaire directement dans `dev`. Exemple avec pnpm :
+
+```json
+{
+  "scripts": {
+    "dev": "if command -v nook >/dev/null 2>&1; then exec nook run; else printf '%s\\n' 'warning: Nook is not installed; starting without the local domain proxy' >&2; exec pnpm run dev:app; fi",
+    "dev:app": "vite"
+  }
+}
+```
+
+Le `nook.toml` partagé référence alors la commande brute :
+
+```toml
+format_version = 1
+name = "app"
+command = ["pnpm", "run", "dev:app"]
+```
+
+Pour npm, Yarn ou Bun, remplacez les deux occurrences de `pnpm` par respectivement `npm`, `yarn`
+ou `bun`. Le fallback ne s'exécute que si le binaire est absent : une erreur de Nook, de Caddy ou
+de l'application conserve son code de sortie et ne relance pas le serveur hors proxy. Cette
+recette utilise le shell POSIX, comme Nook est actuellement limité à Linux.
 
 ## Configuration globale
 
@@ -281,7 +377,7 @@ L’état versionné réside dans `$XDG_STATE_HOME/nook/state.json`, avec fallba
 
 ## Dépannage
 
-- `Caddy Admin API request failed` : vérifier que Caddy tourne, que `caddy_admin` est correct et, pour un socket Unix, que ses permissions autorisent l’utilisateur courant.
+- `Caddy Admin API request failed` : vérifier que Caddy tourne et que `caddy_admin` est correct. Pour un socket Unix, vérifier aussi que la session possède le groupe `caddy` et que la directive Caddy utilise `unix//run/caddy/admin.socket|0660`, comme décrit dans « Préparer Caddy pour Nook ». Un `ExecStartPost=chmod` seul ne résiste pas aux recréations du socket lors des changements de configuration.
 - `expected exactly one ... server; detected: none` : ajouter le listener `:443` ou `:80` correspondant dans Caddy.
 - plusieurs serveurs compatibles détectés : utiliser les candidats affichés pour définir `https_server` ou `http_server`.
 - `no selected Caddy HTTP server` : configurer un listener `:80` avant d’utiliser `--no-tls`.

@@ -11,6 +11,7 @@ compose_file="${NOOK_DOCKER_COMPOSE:-$repo_root/docker/compose.yaml}"
 project_name="nook-e2e-${RANDOM}-$$"
 test_root="$(mktemp -d)"
 run_pid=""
+kill_pid=""
 
 cleanup() {
   result=$?
@@ -23,6 +24,10 @@ cleanup() {
   if [[ -n "$run_pid" ]]; then
     kill -TERM "$run_pid" 2>/dev/null || true
     wait "$run_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$kill_pid" ]]; then
+    kill -TERM "$kill_pid" 2>/dev/null || true
+    wait "$kill_pid" 2>/dev/null || true
   fi
   docker compose -p "$project_name" -f "$compose_file" down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$test_root"
@@ -39,6 +44,7 @@ mkdir -p "$test_root/config/nook" "$test_root/state"
 cp docker/nook-config.toml.example "$test_root/config/nook/config.toml"
 export XDG_CONFIG_HOME="$test_root/config"
 export XDG_STATE_HOME="$test_root/state"
+export NOOK_DISABLE_UPDATE_CHECK=1
 
 target/debug/nook status >"$test_root/status.txt" 2>"$test_root/status.err"
 grep -q $'caddy\tok' "$test_root/status.txt"
@@ -64,6 +70,25 @@ done
 
 curl --silent --fail --cacert "$test_root/caddy-local-ca.pem" \
   --resolve docker-run.localhost:443:127.0.0.1 https://docker-run.localhost/ >/dev/null
+
+target/debug/nook run --name docker-kill --app-port 38081 --strict-port -- \
+  python3 -c 'import http.server,os; http.server.ThreadingHTTPServer((os.environ["HOST"],int(os.environ["PORT"])),http.server.SimpleHTTPRequestHandler).serve_forever()' \
+  >"$test_root/kill.out" 2>"$test_root/kill.err" &
+kill_pid=$!
+for _ in {1..100}; do
+  if curl --silent --fail --cacert "$test_root/caddy-local-ca.pem" \
+    --resolve docker-kill.localhost:443:127.0.0.1 \
+    https://docker-kill.localhost/ >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+curl --silent --fail --cacert "$test_root/caddy-local-ca.pem" \
+  --resolve docker-kill.localhost:443:127.0.0.1 \
+  https://docker-kill.localhost/ >/dev/null
+kill -TERM "$kill_pid"
+wait "$kill_pid" || [[ "$?" -eq 143 ]]
+target/debug/nook status >/dev/null 2>"$test_root/status-after-kill.err"
 
 target/debug/nook alias set docker-http 38080 --no-tls >/dev/null
 curl --silent --fail --resolve docker-http.localhost:80:127.0.0.1 \

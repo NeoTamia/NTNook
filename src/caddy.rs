@@ -382,12 +382,8 @@ fn unix_request(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<UnixResponse, Error> {
-    let mut stream = UnixStream::connect(socket).map_err(|error| {
-        Error::AdminRequest(format!(
-            "cannot connect to Unix socket {}: {error}",
-            socket.display()
-        ))
-    })?;
+    let mut stream =
+        UnixStream::connect(socket).map_err(|error| unix_connect_error(socket, error))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| Error::AdminRequest(error.to_string()))?;
@@ -422,6 +418,21 @@ fn unix_request(
         .read_to_end(&mut bytes)
         .map_err(|error| Error::AdminRequest(error.to_string()))?;
     parse_http_response(&bytes)
+}
+
+fn unix_connect_error(socket: &Path, error: std::io::Error) -> Error {
+    let remediation = if error.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "; configure Caddy's admin listener as `unix/{}|0660` so its group permissions survive API configuration changes (an ExecStartPost chmod alone is not persistent)",
+            socket.display()
+        )
+    } else {
+        String::new()
+    };
+    Error::AdminRequest(format!(
+        "cannot connect to Unix socket {}: {error}{remediation}",
+        socket.display()
+    ))
 }
 
 fn parse_http_response(bytes: &[u8]) -> Result<UnixResponse, Error> {
@@ -1242,6 +1253,17 @@ mod tests {
         assert!(config.pointer("/apps/http/servers").is_some());
         server.join().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unix_permission_error_explains_persistent_caddy_listener_mode() {
+        let error = super::unix_connect_error(
+            std::path::Path::new("/run/caddy/admin.socket"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let message = error.to_string();
+        assert!(message.contains("unix//run/caddy/admin.socket|0660"));
+        assert!(message.contains("ExecStartPost chmod alone is not persistent"));
     }
 
     #[test]

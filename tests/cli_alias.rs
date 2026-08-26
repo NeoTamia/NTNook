@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 #[test]
 fn help_is_successful_and_never_reported_as_an_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .arg("--help")
         .output()
         .unwrap();
@@ -172,6 +173,7 @@ fn run_reports_inferred_domain_url_and_effective_port() {
     let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
     let script = "import os,socket,time;s=socket.socket();s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(.1)";
     let run = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(["run", "--", "/usr/bin/python3", "-c", script])
         .current_dir(&project)
         .env("XDG_CONFIG_HOME", &config_home)
@@ -233,6 +235,7 @@ fn stop_command_targets_the_current_managed_process_group() {
     let server_routes = Arc::clone(&routes);
     let server = thread::spawn(move || serve_caddy(listener, server_routes, 9));
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(["run", "--name", "sleeper", "--", "/bin/sleep", "10"])
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
@@ -276,6 +279,7 @@ fn sigint_is_forwarded_and_the_route_is_cleaned_up() {
     let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
     let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -313,6 +317,7 @@ fn sigint_during_starting_is_forwarded_and_cleaned_up() {
     let server_routes = Arc::clone(&routes);
     let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(["run", "--name", "starting", "--", "/bin/sleep", "10"])
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_STATE_HOME", &state_home)
@@ -348,6 +353,7 @@ fn force_stop_kills_a_group_that_ignores_sigterm() {
     let server = thread::spawn(move || serve_caddy(listener, server_routes, 9));
     let script = "import os,signal,socket,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -383,6 +389,7 @@ fn prune_recovers_after_the_supervising_cli_is_killed() {
     let server = thread::spawn(move || serve_caddy(listener, server_routes, 7));
     let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
             "run",
             "--name",
@@ -595,6 +602,7 @@ fn wait_for_lease_state(state_home: &Path, hostname: &str, state_name: &str) {
 
 fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(arguments)
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", state_home)
