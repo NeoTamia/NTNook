@@ -8,7 +8,12 @@ fn completion_scripts_are_generated_without_configuration_or_caddy() {
     for (shell, markers) in [
         (
             "bash",
-            &["_nook()", "complete -F _nook", "--readiness-warn-after"][..],
+            &[
+                "_nook()",
+                "complete -F _nook",
+                "--readiness-warn-after",
+                "update",
+            ][..],
         ),
         (
             "zsh",
@@ -16,6 +21,7 @@ fn completion_scripts_are_generated_without_configuration_or_caddy() {
                 "#compdef nook",
                 "compdef _nook nook",
                 "--readiness-warn-after",
+                "update",
             ][..],
         ),
     ] {
@@ -88,6 +94,7 @@ fn nook(arguments: &[&str]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", directory.join("state"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(arguments)
         .output()
         .unwrap();

@@ -32,6 +32,7 @@ Cette matrice relie les exigences produit aux tickets d’implémentation et aux
 | Porte CI Docker officielle/proxy | NOOK-49 | job `docker` dans `.github/workflows/ci.yml` |
 | Documentation Docker et matrice cross-platform | NOOK-51, NOOK-50 | `docs/DOCKER.md`, README, release et spécification YouTrack |
 | Host préservé, forwarded headers, WebSocket, SSE, streaming, HTTP/2, 502 et TLS upstream | NOOK-41 | `tests/proxy_protocols.rs`; `tests/alias_tls.rs` |
+| `nook update` remplace le binaire GitHub après vérification SHA-256 ; un contrôle mis en cache prévient si une version plus récente existe | post-MVP | tests `update::tests::*`, `cli_update` |
 | Documentation des prérequis, garde-fous, dépannage et hors-périmètre | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
 | Porte Linux compile/format/lint/tests/intégrations et produit un binaire vérifiable | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43 | `.github/workflows/ci.yml`; archive, SHA-256 et attestation via `.github/workflows/publish.yml` |
 
