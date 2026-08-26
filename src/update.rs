@@ -307,10 +307,10 @@ fn http_agent(timeout: Duration) -> ureq::Agent {
 }
 
 fn extract_nook(archive: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut decompressed = Vec::new();
+    let mut decompressed = LimitedBuffer::new(ARCHIVE_SIZE_LIMIT);
     lzma_rs::xz_decompress(&mut Cursor::new(archive), &mut decompressed)
         .map_err(|error| Error::Archive(error.to_string()))?;
-    let mut tar = tar::Archive::new(Cursor::new(decompressed));
+    let mut tar = tar::Archive::new(Cursor::new(decompressed.data));
     for entry in tar
         .entries()
         .map_err(|error| Error::Archive(error.to_string()))?
@@ -325,15 +325,59 @@ fn extract_nook(archive: &[u8]) -> Result<Vec<u8>, Error> {
         if path.file_name() != Some(OsStr::new("nook")) {
             continue;
         }
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|error| Error::Archive(error.to_string()))?;
-        return Ok(bytes);
+        return read_limited(&mut entry, ARCHIVE_SIZE_LIMIT)
+            .map_err(|error| Error::Archive(error.to_string()));
     }
     Err(Error::Archive(
         "archive does not contain a nook binary".into(),
     ))
+}
+
+struct LimitedBuffer {
+    data: Vec<u8>,
+    limit: u64,
+}
+
+impl LimitedBuffer {
+    fn new(limit: u64) -> Self {
+        Self {
+            data: Vec::new(),
+            limit,
+        }
+    }
+}
+
+impl Write for LimitedBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let used = u64::try_from(self.data.len()).unwrap_or(u64::MAX);
+        let added = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+        if used.saturating_add(added) > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed archive exceeds size limit",
+            ));
+        }
+        self.data.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_limited(reader: &mut impl Read, limit: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "nook binary exceeds size limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
@@ -419,11 +463,10 @@ fn is_managed_install(path: &Path) -> bool {
 }
 
 fn is_default_user_bin(parent: &Path) -> bool {
-    parent.file_name() == Some(OsStr::new("bin"))
-        && parent
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == ".local")
+    let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    paths_match(parent, &PathBuf::from(home).join(".local/bin"))
 }
 
 fn installer_directories() -> Vec<PathBuf> {
@@ -592,10 +635,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InstallKind, cache_is_fresh, install_kind, parse_sha256_file, parse_version,
-        version_is_newer,
+        InstallKind, LimitedBuffer, cache_is_fresh, install_kind, parse_sha256_file, parse_version,
+        read_limited, version_is_newer,
     };
-    use std::path::Path;
+    use std::env;
+    use std::io::{self, Cursor, Write};
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     #[test]
@@ -644,13 +689,37 @@ mod tests {
             )),
             InstallKind::Development
         );
+        let home = env::var("HOME").expect("HOME must be set");
         assert_eq!(
-            install_kind(Path::new("/home/user/.local/bin/nook")),
+            install_kind(&PathBuf::from(home).join(".local/bin/nook")),
             InstallKind::Managed
         );
         assert_eq!(
             install_kind(Path::new("/opt/tools/bin/nook")),
             InstallKind::Unknown
+        );
+        assert_eq!(
+            install_kind(Path::new("/opt/other/.local/bin/nook")),
+            InstallKind::Unknown
+        );
+    }
+
+    #[test]
+    fn extraction_limits_reject_oversized_output() {
+        let mut writer = LimitedBuffer::new(4);
+        assert!(writer.write_all(b"abcd").is_ok());
+        assert_eq!(
+            writer.write_all(b"e").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let within = read_limited(&mut Cursor::new(b"nook"), 4).unwrap();
+        assert_eq!(within, b"nook");
+        assert_eq!(
+            read_limited(&mut Cursor::new(b"nook!"), 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
         );
     }
 
