@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/NeoTamia/NTNook/compare/v0.4.0...v0.4.1) (2026-08-27)
+
+
+### 📚 Documentation
+
+* Rewrite everything in english ([a7a603c](https://github.com/NeoTamia/NTNook/commit/a7a603c72197f4a1dd623ee737f7b8b4c0d8ca9f))
+
 ## [0.4.0](https://github.com/NeoTamia/NTNook/compare/v0.3.0...v0.4.0) (2026-08-26)
 
 
