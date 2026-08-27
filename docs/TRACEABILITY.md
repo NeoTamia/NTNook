@@ -1,44 +1,44 @@
-# Traçabilité du MVP
+# MVP traceability
 
-Cette matrice relie les exigences produit aux tickets d’implémentation et aux vérifications suivies dans le dépôt. Les tickets post-MVP en attente ne font pas partie de la porte de sortie.
+This matrix links product requirements to implementation tickets and checks tracked in the repository. Pending post-MVP tickets are not part of the release gate.
 
-| Exigence vérifiable | Tickets | Test ou vérification |
+| Verifiable requirement | Tickets | Test or verification |
 | --- | --- | --- |
-| Un crate binaire Rust Linux, modules internes et erreurs publiques cohérentes | NOOK-10, NOOK-32 | `cargo check`; `src/main.rs` et modules |
-| CLI `run`, forme courte, arguments opaques et aide stable | NOOK-11, NOOK-32 | tests `cli::tests::*`; `cli_alias::help_is_successful_*` |
-| Configuration globale/projet versionnée, gestion via `nook config` et précédence CLI → projet → défauts | NOOK-12 | tests `config::tests::*`, `cli::tests::parses_global_configuration_commands`, `cli_config` |
-| Nom normalisé en label DNS avec fallback projet/Git/répertoire | NOOK-17 | `config::tests::name_priority_*`, `normalizes_valid_names`, `rejects_invalid_dns_labels` |
-| Registre XDG versionné, sans argv, écrit atomiquement et verrouillé | NOOK-15, NOOK-16, NOOK-38 | tests `state::tests::*`, dont concurrence et récupération du fichier temporaire |
-| Client Admin API sans lancement de Caddy et erreurs exploitables | NOOK-18, NOOK-32 | `caddy::tests::admin_client_*`; `cli_alias::status_has_a_stable_failure_*` |
-| Découverte sûre des serveurs `:443`/`:80`, overrides et ambiguïtés | NOOK-18 | tests `discovers_*`, `available_server_*`, `ambiguity_*`, `no_tls_*` |
-| Conteneurs Nook placés avant catch-all sans altérer les routes étrangères | NOOK-19, NOOK-20 | tests `containers_partition_*`, `container_is_repositioned_*`, `empty_container_*` |
-| Remplacement atomique par `PATCH`, ETag avec retries bornés et relecture | NOOK-21, NOOK-41 | tests `managed_backend_*`, `retries_re_read_*`, `fourth_precondition_*`; vraie Admin API dans `nook_caddy_e2e` |
-| Ownership UUID, cleanup conditionnel et protection contre un ancien propriétaire | NOOK-23, NOOK-26, NOOK-38 | tests `owner_marker_*`, `stale_owner_cleanup_*`, concurrence CLI |
-| Matcher conjoint hostname + source loopback | NOOK-20, NOOK-41 | `proxy_route_combines_host_and_loopback_*`; test non-loopback `proxy_protocols` |
-| Upstream port ou URL HTTP(S), validation stricte et TLS jamais désactivé | NOOK-28, NOOK-41 | tests de validation Caddy; `alias_tls` valide/expiré/non approuvé/hostname incorrect |
-| Aliases persistants, formes courtes, suppression idempotente et `--force` limité à Nook | NOOK-26, NOOK-28, NOOK-29, NOOK-30, NOOK-38 | tests reconcile; `cli_alias::alias_shortcuts_*`, `force_refuses_a_foreign_*` |
-| Allocation de port, `{port}`, environnement et absence de relance après course | NOOK-22, NOOK-38 | tests process `reserve_port`, `substitution`, `child_environment`, `lost_port_race_*` |
-| Processus en groupe, readiness, warning, signaux et code de sortie conservé | NOOK-24, NOOK-25, NOOK-27, NOOK-32, NOOK-38 | tests process; intégrations SIGINT avant/après readiness, SIGTERM, stop/force et code de cleanup |
-| Aucun enfant/lease/route orphelin après spawn impossible ou mort du superviseur | NOOK-25, NOOK-27, NOOK-38 | `failed_spawn_*`, `caddy_failure_before_run_*`, `prune_recovers_after_*` |
-| Journaux transactionnels convergents à chaque frontière de mutation | NOOK-13, NOOK-16, NOOK-38 | `recovers_journals_left_at_every_external_mutation_boundary`; tests reconcile |
-| Toute commande opérationnelle réconcilie d’abord ; sélection et horodatage sont persistés | NOOK-13, NOOK-33, NOOK-38 | `ordinary_list_reconciles_reload_and_records_synchronization`; reload Caddy réel dans `nook_caddy_e2e` |
-| `list`, `status`, `stop`, `stop --force` et `prune` sûrs | NOOK-13, NOOK-25, NOOK-33, NOOK-36, NOOK-38 | tests CLI/process/reconcile, stop forcé réel et harness reload/restauration |
-| Diagnostic de dérive et confiance CA sans exécuter de commande privilégiée | NOOK-36 | tests `status_drift_*`, `local_ca_diagnostic_*`; intégration CA non approuvée |
-| Routes réellement produites par Nook : run/alias HTTPS et HTTP-only, reload, concurrence et protection étrangère | NOOK-38, NOOK-41 | `tests/nook_caddy_e2e.rs` sur vraie Admin API Caddy et ports `:80`/`:443` |
-| Bind hôte configurable, traduction des upstreams loopback et plages clientes Docker | NOOK-45 | tests `docker_network_settings_*`, `docker_route_translates_*`, processus et `tests/docker_e2e.sh` |
-| Export public et empreinte de la CA sans binaire Caddy | NOOK-46 | tests CLI `ca export`, validation E2E avec `curl --cacert` |
-| Compose officiel sécurisé et volumes persistants | NOOK-47 | `docker/compose.yaml`, `docker/Caddyfile`, `docker compose config`, E2E restart/empreinte |
-| Coexistence caddy-docker-proxy et restauration après reload | NOOK-48 | `docker/compose.caddy-docker-proxy.yaml`, scénario labels/réconciliation |
-| Porte CI Docker officielle/proxy | NOOK-49 | job `docker` dans `.github/workflows/ci.yml` |
-| Documentation Docker et matrice cross-platform | NOOK-51, NOOK-50 | `docs/DOCKER.md`, README, release et spécification YouTrack |
-| Host préservé, forwarded headers, WebSocket, SSE, streaming, HTTP/2, 502 et TLS upstream | NOOK-41 | `tests/proxy_protocols.rs`; `tests/alias_tls.rs` |
-| `nook update` remplace le binaire GitHub après vérification SHA-256 ; un contrôle mis en cache prévient si une version plus récente existe | post-MVP | tests `update::tests::*`, `cli_update` |
-| Documentation des prérequis, garde-fous, dépannage et hors-périmètre | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
-| Porte Linux compile/format/lint/tests/intégrations et produit un binaire vérifiable | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43 | `.github/workflows/ci.yml`; archive, SHA-256 et attestation via `.github/workflows/publish.yml` |
+| A Linux Rust binary crate with internal modules and consistent public errors | NOOK-10, NOOK-32 | `cargo check`; `src/main.rs` and modules |
+| `run` CLI, short form, opaque arguments, and stable help | NOOK-11, NOOK-32 | `cli::tests::*` tests; `cli_alias::help_is_successful_*` |
+| Versioned global/project configuration, management through `nook config`, and CLI → project → default precedence | NOOK-12 | `config::tests::*`, `cli::tests::parses_global_configuration_commands`, and `cli_config` tests |
+| Name normalized as a DNS label with project/Git/directory fallback | NOOK-17 | `config::tests::name_priority_*`, `normalizes_valid_names`, `rejects_invalid_dns_labels` |
+| Versioned XDG registry without argv, written atomically and locked | NOOK-15, NOOK-16, NOOK-38 | `state::tests::*`, including concurrency and temporary-file recovery |
+| Admin API client without starting Caddy and with actionable errors | NOOK-18, NOOK-32 | `caddy::tests::admin_client_*`; `cli_alias::status_has_a_stable_failure_*` |
+| Safe discovery of `:443`/`:80` servers, overrides, and ambiguities | NOOK-18 | `discovers_*`, `available_server_*`, `ambiguity_*`, `no_tls_*` tests |
+| Nook containers placed before catch-all without altering foreign routes | NOOK-19, NOOK-20 | `containers_partition_*`, `container_is_repositioned_*`, `empty_container_*` tests |
+| Atomic replacement through `PATCH`, ETag with bounded retries, and reread | NOOK-21, NOOK-41 | `managed_backend_*`, `retries_re_read_*`, `fourth_precondition_*` tests; real Admin API in `nook_caddy_e2e` |
+| UUID ownership, conditional cleanup, and protection from a previous owner | NOOK-23, NOOK-26, NOOK-38 | `owner_marker_*`, `stale_owner_cleanup_*`, CLI concurrency tests |
+| Combined hostname + loopback-source matcher | NOOK-20, NOOK-41 | `proxy_route_combines_host_and_loopback_*`; non-loopback `proxy_protocols` test |
+| Upstream port or HTTP(S) URL, strict validation, and TLS never disabled | NOOK-28, NOOK-41 | Caddy validation tests; valid/expired/untrusted/wrong-hostname `alias_tls` cases |
+| Persistent aliases, short forms, idempotent removal, and `--force` limited to Nook | NOOK-26, NOOK-28, NOOK-29, NOOK-30, NOOK-38 | reconciliation tests; `cli_alias::alias_shortcuts_*`, `force_refuses_a_foreign_*` |
+| Port allocation, `{port}`, environment, and no relaunch after a race | NOOK-22, NOOK-38 | process tests for `reserve_port`, `substitution`, `child_environment`, `lost_port_race_*` |
+| Grouped processes, readiness, warning, signals, and preserved exit code | NOOK-24, NOOK-25, NOOK-27, NOOK-32, NOOK-38 | process tests; SIGINT before/after readiness, SIGTERM, stop/force, and cleanup-code integrations |
+| No orphaned child/lease/route after an impossible spawn or supervisor death | NOOK-25, NOOK-27, NOOK-38 | `failed_spawn_*`, `caddy_failure_before_run_*`, `prune_recovers_after_*` |
+| Convergent transaction journals at every mutation boundary | NOOK-13, NOOK-16, NOOK-38 | `recovers_journals_left_at_every_external_mutation_boundary`; reconciliation tests |
+| Every operational command reconciles first; selection and timestamps persist | NOOK-13, NOOK-33, NOOK-38 | `ordinary_list_reconciles_reload_and_records_synchronization`; real Caddy reload in `nook_caddy_e2e` |
+| Safe `list`, `status`, `stop`, `stop --force`, and `prune` | NOOK-13, NOOK-25, NOOK-33, NOOK-36, NOOK-38 | CLI/process/reconciliation tests, real forced stop, and reload/restoration harness |
+| Drift diagnostics and CA trust without running privileged commands | NOOK-36 | `status_drift_*`, `local_ca_diagnostic_*`; untrusted-CA integration |
+| Routes actually produced by Nook: HTTPS and HTTP-only run/alias, reload, concurrency, and foreign-route protection | NOOK-38, NOOK-41 | `tests/nook_caddy_e2e.rs` against the real Caddy Admin API and ports `:80`/`:443` |
+| Configurable host bind, loopback-upstream translation, and Docker client ranges | NOOK-45 | `docker_network_settings_*`, `docker_route_translates_*`, process tests, and `tests/docker_e2e.sh` |
+| Public CA export and fingerprint without a Caddy binary | NOOK-46 | `ca export` CLI tests, E2E validation with `curl --cacert` |
+| Secure official Compose setup and persistent volumes | NOOK-47 | `docker/compose.yaml`, `docker/Caddyfile`, `docker compose config`, restart/fingerprint E2E |
+| caddy-docker-proxy coexistence and restoration after reload | NOOK-48 | `docker/compose.caddy-docker-proxy.yaml`, label/reconciliation scenario |
+| Official/proxy Docker CI gate | NOOK-49 | `docker` job in `.github/workflows/ci.yml` |
+| Docker documentation and cross-platform matrix | NOOK-51, NOOK-50 | `docs/DOCKER.md`, README, release notes, and YouTrack specification |
+| Preserved Host, forwarded headers, WebSocket, SSE, streaming, HTTP/2, 502, and upstream TLS | NOOK-41 | `tests/proxy_protocols.rs`; `tests/alias_tls.rs` |
+| `nook update` replaces a GitHub binary after SHA-256 verification; a cached check warns when a newer version exists | post-MVP | `update::tests::*`, `cli_update` tests |
+| Documentation for requirements, safeguards, troubleshooting, and out-of-scope items | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
+| Linux gate compiles, formats, lints, runs tests/integrations, and produces a verifiable binary | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43 | `.github/workflows/ci.yml`; archive, SHA-256, and attestation through `.github/workflows/publish.yml` |
 
-## Porte de sortie
+## Release gate
 
-La validation locale et CI exécute, dans cet ordre :
+Local and CI validation run, in this order:
 
 ```sh
 cargo fmt --check
@@ -48,4 +48,4 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --locked --release
 ```
 
-Les intégrations sont isolées dans des répertoires temporaires, utilisent Caddy `2.11.x`, n’installent aucune CA et nettoient leurs processus. La release MVP exige que tous les tickets MVP reliés soient résolus ; les travaux Tailscale restent explicitement post-MVP et en attente.
+Integration tests are isolated in temporary directories, use Caddy `2.11.x`, install no CA, and clean up their processes. The MVP release requires every linked MVP ticket to be resolved; Tailscale work remains explicitly post-MVP and pending.

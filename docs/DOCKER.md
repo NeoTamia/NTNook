@@ -1,10 +1,10 @@
-# Caddy dans Docker
+# Caddy in Docker
 
-Nook peut rester installé sur l’hôte Linux tandis que Caddy 2.11 tourne dans un conteneur. L’image officielle est la voie supportée. Nook ne pilote pas Docker et ne démarre ni n’arrête Caddy.
+Nook can remain installed on the Linux host while Caddy 2.11 runs in a container. The official image is the supported path. Nook does not control Docker and neither starts nor stops Caddy.
 
-## Démarrage recommandé
+## Recommended setup
 
-Docker Engine et Docker Compose v2 sont requis. Vérifiez d’abord que `172.30.0.0/24` n’entre pas en conflit avec un réseau existant, puis copiez la configuration Nook :
+Docker Engine and Docker Compose v2 are required. First verify that `172.30.0.0/24` does not conflict with an existing network, then copy the Nook configuration:
 
 ```sh
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/nook"
@@ -13,52 +13,52 @@ docker compose -f docker/compose.yaml up -d --wait
 nook status
 ```
 
-Le Compose publie HTTP, HTTPS, HTTP/3 et l’Admin API uniquement sur `127.0.0.1`. À l’intérieur du bridge, Caddy joint les applications hôte via `host.docker.internal`, associé explicitement à la passerelle `172.30.0.1` de ce réseau plutôt qu’à la passerelle du bridge Docker par défaut.
+The Compose setup publishes HTTP, HTTPS, HTTP/3, and the Admin API only on `127.0.0.1`. Inside the bridge, Caddy reaches host applications through `host.docker.internal`, explicitly mapped to this network's `172.30.0.1` gateway rather than to the default Docker bridge gateway.
 
-Les applications lancées par Nook écoutent sur cette passerelle, pas sur `0.0.0.0`. Les routes Caddy n’acceptent que les requêtes dont la source vue par Caddy est `172.30.0.1/32`.
+Applications launched by Nook listen on this gateway, not on `0.0.0.0`. Caddy routes accept only requests whose source, as seen by Caddy, is `172.30.0.1/32`.
 
-Si le sous-réseau doit changer, modifiez ensemble le subnet et la gateway du Compose, `run_bind_address` et `caddy_client_ip_ranges`.
+If the subnet must change, update the Compose `subnet` and `gateway`, `run_bind_address`, and `caddy_client_ip_ranges` together.
 
-## Faire confiance à HTTPS
+## Trust HTTPS
 
-Caddy conserve sa PKI dans le volume nommé `caddy_data`. Exportez une fois son certificat public :
+Caddy stores its PKI in the named `caddy_data` volume. Export its public certificate once:
 
 ```sh
 nook ca export caddy-local-ca.pem
 ```
 
-Nook affiche l’empreinte SHA-256 mais n’installe jamais le certificat. Sous Debian/Ubuntu, l’installation explicite ressemble à :
+Nook prints the SHA-256 fingerprint but never installs the certificate. On Debian/Ubuntu, an explicit installation looks like this:
 
 ```sh
 sudo cp caddy-local-ca.pem /usr/local/share/ca-certificates/nook-caddy.crt
 sudo update-ca-certificates
 ```
 
-Sous Windows, importez le PEM dans « Autorités de certification racines de confiance » pour l’utilisateur courant, après avoir vérifié l’empreinte affichée. Certains navigateurs utilisent leur propre magasin et nécessitent un import séparé.
+On Windows, after verifying the displayed fingerprint, import the PEM into “Trusted Root Certification Authorities” for the current user. Some browsers use their own certificate store and require a separate import.
 
-Il n’est pas nécessaire de réexporter la CA après un redémarrage ou une recréation conservant `caddy_data`. Réexportez-la si le volume est supprimé/remplacé, si la PKI est régénérée ou si l’instance Caddy change.
+You do not need to export the CA again after a restart or recreation that preserves `caddy_data`. Export it again if the volume is deleted or replaced, the PKI is regenerated, or the Caddy instance changes.
 
-## Sécurité
+## Security
 
-L’Admin API Caddy permet de modifier la configuration sans authentification applicative. Ne remplacez pas les publications `127.0.0.1:…` par `0.0.0.0:…` et n’exposez pas le port 2019 au LAN.
+Caddy's Admin API can modify the configuration without application-level authentication. Do not change the `127.0.0.1:…` port publications to `0.0.0.0:…`, and do not expose port 2019 to the LAN.
 
-Nook ne lit pas le socket Docker. L’image officielle n’en a pas besoin.
+Nook does not read the Docker socket. The official image does not need it.
 
 ## caddy-docker-proxy
 
-La variante suivante est testée comme compatibilité, pas comme voie principale :
+The following variant is compatibility-tested but is not the primary path:
 
 ```sh
 docker compose -f docker/compose.caddy-docker-proxy.yaml up -d --wait
 ```
 
-Elle monte `/var/run/docker.sock`. Le suffixe `:ro` empêche les écritures directes dans le fichier, mais l’API du daemon reste très privilégiée.
+It mounts `/var/run/docker.sock`. The `:ro` suffix prevents direct writes to the file, but the daemon API remains highly privileged.
 
-Le plugin reconstruit puis recharge un Caddyfile à chaque événement Docker pertinent. Une route ajoutée dynamiquement par Nook peut donc disparaître jusqu’à la prochaine commande opérationnelle (`status`, `prune`, etc.), qui la réconcilie. Cette interruption est couverte par le test de compatibilité.
+The plugin rebuilds and reloads a Caddyfile for every relevant Docker event. A route added dynamically by Nook can therefore disappear until the next operational command (`status`, `prune`, and so on) reconciles it. The compatibility test covers this interruption.
 
 ## Tests
 
-Les tests détruisent uniquement leur projet Compose et leurs volumes dédiés :
+The tests destroy only their own Compose project and dedicated volumes:
 
 ```sh
 NOOK_DOCKER_E2E=1 tests/docker_e2e.sh
@@ -67,15 +67,15 @@ NOOK_DOCKER_E2E=1 \
   tests/docker_e2e.sh
 ```
 
-## Plateformes
+## Platforms
 
-| Hôte | Nook | Caddy | Statut |
+| Host | Nook | Caddy | Status |
 |---|---|---|---|
-| Linux | natif | natif | supporté |
-| Linux | natif | image officielle Docker | supporté |
-| Linux | natif | caddy-docker-proxy | compatibilité testée avec réconciliation |
-| Windows | natif | Docker Desktop | Caddy faisable, Nook non porté |
-| Windows + WSL | Linux dans WSL | Docker Desktop | étude, non garanti |
-| macOS | natif | Docker Desktop | Caddy faisable, Nook non porté |
+| Linux | native | native | supported |
+| Linux | native | official Docker image | supported |
+| Linux | native | caddy-docker-proxy | compatibility-tested with reconciliation |
+| Windows | native | Docker Desktop | Caddy is feasible; Nook is not ported |
+| Windows + WSL | Linux in WSL | Docker Desktop | exploratory; not guaranteed |
+| macOS | native | Docker Desktop | Caddy is feasible; Nook is not ported |
 
-Le portage Windows de Nook reste distinct : `/proc`, les groupes de processus, les signaux POSIX, les sockets Unix, les chemins XDG et la détection du trust store doivent être remplacés ou conditionnés.
+Porting Nook to Windows remains a separate effort: `/proc`, process groups, POSIX signals, Unix sockets, XDG paths, and trust-store detection must be replaced or made conditional.

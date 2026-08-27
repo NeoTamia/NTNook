@@ -1,45 +1,45 @@
-# Nook 0.1.0 — notes de release MVP
+# Nook 0.1.0 — MVP release notes
 
-Cette version fournit un unique binaire Linux `nook`. La GitHub Release contient une archive statique
-`nook-x86_64-unknown-linux-musl.tar.xz`, sa somme SHA-256 et l'installateur `nook-installer.sh`.
-Les sources prêtes à compiler sont également publiées sur crates.io sous le nom `ntnook`.
+This release provides a single Linux `nook` binary. The GitHub Release contains the static
+`nook-x86_64-unknown-linux-musl.tar.xz` archive, its SHA-256 checksum, and the
+`nook-installer.sh` installer. Build-ready sources are also published on crates.io as `ntnook`.
 
-## Initialisation crates.io pour les mainteneurs
+## crates.io initialization for maintainers
 
-Le nom `nook` appartenant déjà à un autre projet, le paquet est publié sous le nom `ntnook` tout en
-installant la commande `nook`. Trusted Publishing nécessite une première publication manuelle :
+Because the name `nook` already belongs to another project, the package is published as `ntnook`
+while installing the `nook` command. Trusted Publishing requires an initial manual publication:
 
 ```sh
 cargo publish --locked
 ```
 
-Ajoutez ensuite un Trusted Publisher GitHub Actions à la crate `ntnook` avec le dépôt
-`NeoTamia/NTNook`, le workflow `publish.yml` et l'environnement `release`. L'environnement GitHub
-`release` doit autoriser les tags `v*`. Après une première exécution réussie, crates.io peut être
-configuré en mode « Trusted Publishing only ».
+Then add a GitHub Actions Trusted Publisher to the `ntnook` crate with repository
+`NeoTamia/NTNook`, workflow `publish.yml`, and environment `release`. The GitHub `release`
+environment must allow `v*` tags. After the first successful run, crates.io can be configured in
+“Trusted Publishing only” mode.
 
-## Fonctionnalités livrées
+## Delivered features
 
-- lancement supervisé d’une application locale sous un domaine `*.localhost` en HTTPS ou HTTP ;
-- aliases persistants vers un port ou une URL HTTP(S) ;
-- mutation atomique et propriétaire des routes d’une instance Caddy existante ;
-- commandes `list`, `status`, `stop`, `prune`, `update` et récupération après interruption ;
-- génération de complétions statiques Bash et Zsh avec `nook completions` ;
-- vérification TLS des upstreams HTTPS et diagnostic de la CA locale Caddy.
+- supervised launch of a local application under a `*.localhost` domain over HTTPS or HTTP;
+- persistent aliases to a port or HTTP(S) URL;
+- atomic, ownership-aware mutation of routes in an existing Caddy instance;
+- `list`, `status`, `stop`, `prune`, and `update` commands, with recovery after interruption;
+- static Bash and Zsh completion generation with `nook completions`;
+- TLS verification for HTTPS upstreams and diagnostics for Caddy's local CA.
 
-## Plateforme et dépendances
+## Platform and dependencies
 
-- Linux x86-64 ;
-- Caddy `2.11.x` natif ou via l’image Docker officielle, démarré séparément avec Admin API accessible ;
-- serveurs Caddy non ambigus sur `:443` et, pour `--no-tls`, sur `:80`.
+- Linux x86-64;
+- Caddy `2.11.x`, native or through the official Docker image, started separately with an accessible Admin API;
+- unambiguous Caddy servers on `:443` and, for `--no-tls`, on `:80`.
 
-La compilation reproductible utilise Rust `1.97.1` et `Cargo.lock`. OpenSSL, Python 3, curl avec HTTP/2, util-linux et iproute2 sont uniquement requis par les tests d’intégration, pas par le binaire.
+The reproducible build uses Rust `1.97.1` and `Cargo.lock`. OpenSSL, Python 3, curl with HTTP/2, util-linux, and iproute2 are required only by the integration tests, not by the binary.
 
-## Hors périmètre
+## Out of scope
 
-Le binaire ne fournit aucun daemon, IPC, socket local, serveur embarqué, shell implicite, modification de `/etc/hosts`, installation ou démarrage de Caddy, installation automatique de CA, orchestration Docker, LAN/mDNS, multi-service, support Windows/macOS natif, Tailscale Serve/Funnel ou exposition publique.
+The binary provides no daemon, IPC, local socket, embedded server, implicit shell, `/etc/hosts` modification, Caddy installation or startup, automatic CA installation, Docker orchestration, LAN/mDNS, multiple services, native Windows/macOS support, Tailscale Serve/Funnel, or public exposure.
 
-Le dépôt fournit un Compose Caddy officiel supporté sous Linux et une compatibilité testée avec caddy-docker-proxy. `nook ca export` permet de récupérer la CA publique sans exécutable Caddy sur l’hôte. Voir `docs/DOCKER.md`.
+The repository provides a supported official Caddy Compose setup on Linux and tested compatibility with caddy-docker-proxy. `nook ca export` retrieves the public CA without a Caddy executable on the host. See `docs/DOCKER.md`.
 
-Avant publication, l’artefact doit provenir d’une exécution CI verte. Après téléchargement, vérifiez-le
-avec `sha256sum --check nook-x86_64-unknown-linux-musl.tar.xz.sha256` depuis son répertoire.
+Before publication, the artifact must come from a green CI run. After downloading it, verify it
+from its directory with `sha256sum --check nook-x86_64-unknown-linux-musl.tar.xz.sha256`.
