@@ -19,7 +19,7 @@ case "$(uname -m)" in
         ;;
 esac
 
-for command in curl tar sha256sum install sed grep; do
+for command in curl tar sha256sum install sed awk cat; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "nook: required command not found: $command" >&2
         exit 1
@@ -55,20 +55,52 @@ quote_shell_path() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+replace_completion_block() {
+    nook_rc_file=$1
+    nook_block_file=$2
+    nook_filtered_file=$(mktemp "${temporary_directory}/nook-rc.XXXXXX")
+
+    if [ -f "$nook_rc_file" ]; then
+        awk '
+            /^# >>> nook completions >>>$/ { in_block = 1; next }
+            /^# <<< nook completions <<</ { in_block = 0; next }
+            in_block { next }
+            { lines[++line_count] = $0 }
+            END {
+                while (line_count > 0 && lines[line_count] == "") {
+                    line_count--
+                }
+                for (line = 1; line <= line_count; line++) {
+                    print lines[line]
+                }
+            }
+        ' "$nook_rc_file" > "$nook_filtered_file"
+    else
+        : > "$nook_filtered_file"
+    fi
+
+    {
+        cat "$nook_filtered_file"
+        if [ -s "$nook_filtered_file" ]; then
+            printf '\n'
+        fi
+        cat "$nook_block_file"
+    } > "$nook_rc_file"
+}
+
 append_bash_completion() {
     nook_rc_file=$1
     nook_completion_file=$2
     nook_quoted_file=$(quote_shell_path "$nook_completion_file")
-    if [ -f "$nook_rc_file" ] && grep -Fq '# >>> nook completions >>>' "$nook_rc_file"; then
-        return
-    fi
+    nook_block_file=$(mktemp "${temporary_directory}/nook-bash-block.XXXXXX")
     {
-        printf '\n# >>> nook completions >>>\n'
+        printf '# >>> nook completions >>>\n'
         printf 'if [ -r %s ]; then\n' "$nook_quoted_file"
         printf '    . %s\n' "$nook_quoted_file"
         printf 'fi\n'
         printf '# <<< nook completions <<<\n'
-    } >> "$nook_rc_file"
+    } > "$nook_block_file"
+    replace_completion_block "$nook_rc_file" "$nook_block_file"
 }
 
 append_zsh_completion() {
@@ -77,11 +109,9 @@ append_zsh_completion() {
     nook_completion_file=$3
     nook_quoted_directory=$(quote_shell_path "$nook_completion_directory")
     nook_quoted_file=$(quote_shell_path "$nook_completion_file")
-    if [ -f "$nook_rc_file" ] && grep -Fq '# >>> nook completions >>>' "$nook_rc_file"; then
-        return
-    fi
+    nook_block_file=$(mktemp "${temporary_directory}/nook-zsh-block.XXXXXX")
     {
-        printf '\n# >>> nook completions >>>\n'
+        printf '# >>> nook completions >>>\n'
         printf 'if [[ -r %s ]]; then\n' "$nook_quoted_file"
         printf '    fpath=(%s $fpath)\n' "$nook_quoted_directory"
         printf '    autoload -Uz compinit\n'
@@ -91,7 +121,8 @@ append_zsh_completion() {
         printf '    source %s\n' "$nook_quoted_file"
         printf 'fi\n'
         printf '# <<< nook completions <<<\n'
-    } >> "$nook_rc_file"
+    } > "$nook_block_file"
+    replace_completion_block "$nook_rc_file" "$nook_block_file"
 }
 
 if [ -n "${HOME:-}" ]; then

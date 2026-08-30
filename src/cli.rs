@@ -591,6 +591,53 @@ _nook_dynamic_word() {
     fi
 }
 
+_nook_dynamic_name_position() {
+    local kind="$1"
+    local name_index="$2"
+    local word
+    while (( name_index <= COMP_CWORD )); do
+        if (( name_index == COMP_CWORD )); then
+            word="${COMP_WORDS[name_index]}"
+            case "$word" in
+                --caddy-socket|--caddy-socket=*|--force|-h|--help|--|-*)
+                    return 1
+                    ;;
+                *)
+                    return 0
+                    ;;
+            esac
+        fi
+
+        word="${COMP_WORDS[name_index]}"
+        case "$word" in
+            --caddy-socket)
+                (( name_index + 1 == COMP_CWORD )) && return 1
+                (( name_index += 2 ))
+                ;;
+            --caddy-socket=*)
+                (( name_index += 1 ))
+                ;;
+            --force)
+                [[ "$kind" == "runs" ]] || return 1
+                (( name_index += 1 ))
+                ;;
+            -h|--help)
+                (( name_index += 1 ))
+                ;;
+            --)
+                (( name_index += 1 ))
+                ;;
+            -*)
+                return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
 _nook_dynamic() {
     _nook "$@"
 
@@ -600,6 +647,7 @@ _nook_dynamic() {
         word="${COMP_WORDS[command_index]}"
         case "$word" in
             --caddy-socket)
+                (( command_index + 1 >= COMP_CWORD )) && return 0
                 (( command_index += 2 ))
                 ;;
             --caddy-socket=*)
@@ -620,15 +668,35 @@ _nook_dynamic() {
     local current="${COMP_WORDS[COMP_CWORD]}"
     local nook_command="${COMP_WORDS[0]}"
 
-    if [[ "$subcommand" == "stop" ]] && (( COMP_CWORD == command_index + 1 )); then
+    if [[ "$subcommand" == "stop" ]] \
+        && _nook_dynamic_name_position runs "$((command_index + 1))"; then
         COMPREPLY=()
         _nook_dynamic_candidates runs "$nook_command" "$current"
         return 0
     fi
 
+    local alias_action_index=$((command_index + 1))
+    if [[ "$subcommand" == "alias" ]]; then
+        while (( alias_action_index < COMP_CWORD )); do
+            word="${COMP_WORDS[alias_action_index]}"
+            case "$word" in
+                --caddy-socket)
+                    (( alias_action_index + 1 >= COMP_CWORD )) && return 0
+                    (( alias_action_index += 2 ))
+                    ;;
+                --caddy-socket=*)
+                    (( alias_action_index += 1 ))
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+        done
+    fi
+
     if [[ "$subcommand" == "alias" \
-        && "${COMP_WORDS[command_index + 1]}" == "remove" ]] \
-        && (( COMP_CWORD == command_index + 2 )); then
+        && "${COMP_WORDS[alias_action_index]}" == "remove" ]] \
+        && _nook_dynamic_name_position aliases "$((alias_action_index + 1))"; then
         COMPREPLY=()
         _nook_dynamic_candidates aliases "$nook_command" "$current"
         return 0
@@ -643,7 +711,8 @@ _nook_dynamic() {
         return 0
     fi
 
-    if [[ "$subcommand" == "alias" ]] && (( COMP_CWORD == command_index + 1 )); then
+    if [[ "$subcommand" == "alias" ]] \
+        && _nook_dynamic_name_position aliases "$((command_index + 1))"; then
         case "$current" in
             set|remove|list|help|-*) ;;
             *) _nook_dynamic_candidates aliases "$nook_command" "$current" ;;
@@ -690,11 +759,59 @@ _nook_dynamic_word() {
     [[ "$word" == "$current"* ]] && compadd -Q -- "$word"
 }
 
+_nook_dynamic_name_position() {
+    local kind="$1"
+    local name_index="$2"
+    local word
+    while (( name_index <= CURRENT )); do
+        if (( name_index == CURRENT )); then
+            word="${words[name_index]}"
+            case "$word" in
+                --caddy-socket|--caddy-socket=*|--force|-h|--help|--|-*)
+                    return 1
+                    ;;
+                *)
+                    return 0
+                    ;;
+            esac
+        fi
+
+        word="${words[name_index]}"
+        case "$word" in
+            --caddy-socket)
+                (( name_index + 1 == CURRENT )) && return 1
+                (( name_index += 2 ))
+                ;;
+            --caddy-socket=*)
+                (( name_index += 1 ))
+                ;;
+            --force)
+                [[ "$kind" == "runs" ]] || return 1
+                (( name_index += 1 ))
+                ;;
+            -h|--help)
+                (( name_index += 1 ))
+                ;;
+            --)
+                (( name_index += 1 ))
+                ;;
+            -*)
+                return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
 _nook_dynamic() {
     local command_index=2
     while (( command_index < CURRENT )); do
         case "${words[command_index]}" in
             --caddy-socket)
+                (( command_index + 1 >= CURRENT )) && return 0
                 (( command_index += 2 ))
                 ;;
             --caddy-socket=*)
@@ -714,14 +831,33 @@ _nook_dynamic() {
     local subcommand="${words[command_index]}"
     local current="${words[CURRENT]}"
 
-    if [[ "$subcommand" == "stop" ]] && (( CURRENT == command_index + 1 )); then
+    if [[ "$subcommand" == "stop" ]] \
+        && _nook_dynamic_name_position runs "$((command_index + 1))"; then
         _nook_dynamic_candidates runs "$current"
         return 0
     fi
 
+    local alias_action_index=$((command_index + 1))
+    if [[ "$subcommand" == "alias" ]]; then
+        while (( alias_action_index < CURRENT )); do
+            case "${words[alias_action_index]}" in
+                --caddy-socket)
+                    (( alias_action_index + 1 >= CURRENT )) && return 0
+                    (( alias_action_index += 2 ))
+                    ;;
+                --caddy-socket=*)
+                    (( alias_action_index += 1 ))
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+        done
+    fi
+
     if [[ "$subcommand" == "alias" \
-        && "${words[command_index + 1]}" == "remove" ]] \
-        && (( CURRENT == command_index + 2 )); then
+        && "${words[alias_action_index]}" == "remove" ]] \
+        && _nook_dynamic_name_position aliases "$((alias_action_index + 1))"; then
         _nook_dynamic_candidates aliases "$current"
         return 0
     fi
@@ -737,7 +873,8 @@ _nook_dynamic() {
         return 0
     fi
 
-    if [[ "$subcommand" == "alias" ]] && (( CURRENT == command_index + 1 )); then
+    if [[ "$subcommand" == "alias" ]] \
+        && _nook_dynamic_name_position aliases "$((command_index + 1))"; then
         case "$current" in
             set|remove|list|help|-*) ;;
             *) _nook_dynamic_candidates aliases "$current" ;;

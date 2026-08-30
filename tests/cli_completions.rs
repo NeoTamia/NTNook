@@ -204,9 +204,36 @@ fn bash_completion_proposes_dynamic_names_for_stop_and_alias_remove() {
     let path = format!("{}:{}", bin_directory.display(), path.to_string_lossy());
     for (words, cword, expected) in [
         ("nook stop a", "2", "api\n"),
+        ("nook stop --force a", "3", "api\n"),
+        (
+            "nook stop --caddy-socket /tmp/caddy.sock --force a",
+            "5",
+            "api\n",
+        ),
+        (
+            "nook --caddy-socket /tmp/caddy.sock stop --force a",
+            "5",
+            "api\n",
+        ),
         ("nook alias remove d", "3", "docs\n"),
+        (
+            "nook alias remove --caddy-socket /tmp/caddy.sock d",
+            "5",
+            "docs\n",
+        ),
+        (
+            "nook alias --caddy-socket /tmp/caddy.sock remove d",
+            "5",
+            "docs\n",
+        ),
+        (
+            "nook --caddy-socket /tmp/caddy.sock alias remove d",
+            "5",
+            "docs\n",
+        ),
         ("nook a", "1", "alias\napi\n"),
         ("nook alias d", "2", "docs\n"),
+        ("nook alias --caddy-socket /tmp/caddy.sock d", "4", "docs\n"),
     ] {
         let output = Command::new("bash")
             .env("PATH", &path)
