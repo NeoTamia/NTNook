@@ -1,6 +1,6 @@
 {
   "name": "@neotamia/nook-run",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Run development commands through a system-installed Nook CLI",
   "type": "module",
   "bin": {
