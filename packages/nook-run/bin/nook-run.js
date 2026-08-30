@@ -6,8 +6,9 @@ import { constants } from "node:os";
 
 const INSTALL_URL =
   "https://github.com/NeoTamia/NTNook/releases/latest/download/nook-installer.sh";
-let launchError = false;
 let forwardedSignal;
+let child;
+const launchErrors = new WeakSet();
 
 function report(message) {
   writeSync(process.stderr.fd, `${message}\n`);
@@ -18,12 +19,28 @@ function signalExitCode(signal) {
   return signalNumber === undefined ? 1 : 128 + signalNumber;
 }
 
-const child = spawn("nook", ["run", ...process.argv.slice(2)], {
-  cwd: process.cwd(),
-  env: process.env,
-  shell: false,
-  stdio: "inherit",
-});
+const args = process.argv.slice(2);
+const separatorIndex = args.indexOf("--");
+const command = separatorIndex === -1 ? [] : args.slice(separatorIndex + 1);
+
+function spawnChild(executable, executableArgs) {
+  child = spawn(executable, executableArgs, {
+    cwd: process.cwd(),
+    env: process.env,
+    shell: false,
+    stdio: "inherit",
+  });
+
+  child.once("spawn", () => {
+    if (forwardedSignal !== undefined) {
+      child.kill(forwardedSignal);
+    }
+  });
+
+  const spawnedChild = child;
+  child.once("close", (code, signal) => handleClose(spawnedChild, code, signal));
+  return child;
+}
 
 function forwardSignal(signal) {
   forwardedSignal ??= signal;
@@ -49,27 +66,35 @@ function onSigterm() {
 process.once("SIGINT", onSigint);
 process.once("SIGTERM", onSigterm);
 
-child.once("spawn", () => {
-  if (forwardedSignal !== undefined) {
-    child.kill(forwardedSignal);
-  }
-});
-
-child.once("error", (error) => {
-  launchError = true;
-  removeSignalHandlers();
+function handleLaunchError(error) {
+  launchErrors.add(child);
 
   if (error.code === "ENOENT") {
-    report(`nook-run: Nook was not found in PATH.
+    report(`nook-run: warning: Nook was not found in PATH; running the command directly.
 
 Install Nook on Linux with:
   curl --proto '=https' --tlsv1.2 -LsSf ${INSTALL_URL} | sh
 
-Then restart your terminal and run the development command again.
-On Windows, run Nook from WSL.`);
-    process.exitCode = 127;
+Nook features such as local domains and HTTPS will be unavailable.`);
+
+    if (command.length === 0) {
+      removeSignalHandlers();
+      report("nook-run: no command was provided after --.");
+      process.exitCode = 127;
+      return;
+    }
+
+    const fallback = spawnChild(command[0], command.slice(1));
+    fallback.once("error", (fallbackError) => {
+      launchErrors.add(fallback);
+      removeSignalHandlers();
+      report(`nook-run: failed to start ${command[0]}: ${fallbackError.message}`);
+      process.exitCode = fallbackError.code === "ENOENT" ? 127 : 1;
+    });
     return;
   }
+
+  removeSignalHandlers();
 
   if (error.code === "EACCES") {
     report("nook-run: the Nook executable in PATH is not executable.");
@@ -79,14 +104,14 @@ On Windows, run Nook from WSL.`);
 
   report(`nook-run: failed to start Nook: ${error.message}`);
   process.exitCode = 1;
-});
+}
 
-child.once("close", (code, signal) => {
-  removeSignalHandlers();
-
-  if (launchError) {
+function handleClose(closedChild, code, signal) {
+  if (launchErrors.has(closedChild)) {
     return;
   }
+
+  removeSignalHandlers();
 
   if (signal !== null) {
     process.exitCode = signalExitCode(signal);
@@ -99,4 +124,6 @@ child.once("close", (code, signal) => {
   }
 
   process.exitCode = code ?? 1;
-});
+}
+
+spawnChild("nook", ["run", ...args]).once("error", handleLaunchError);
