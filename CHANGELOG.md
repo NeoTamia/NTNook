@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.5.0](https://github.com/NeoTamia/NTNook/compare/v0.4.1...v0.5.0) (2026-08-30)
+
+
+### ✨ Features
+
+* Add project configuration init command ([7342cb5](https://github.com/NeoTamia/NTNook/commit/7342cb5501640fc94e28a542d8efcc80d962505c))
+* Introduce `@neotamia/nook-run` package for JavaScript CLI integration ([a659f0f](https://github.com/NeoTamia/NTNook/commit/a659f0f254964ca3a5461821a411f1999a3de488))
+
+
+### 🐛 Bug Fixes
+
+* **ci:** Install pnpm on PATH ([3af92bc](https://github.com/NeoTamia/NTNook/commit/3af92bcb129a239dfb076651034300fc5c4467a9))
+* Preserve init child arguments ([7bee144](https://github.com/NeoTamia/NTNook/commit/7bee144ba63808485a927c57bf609a62e730bf15))
+
+
+### 🔧 Build System
+
+* **deps:** Update actions/setup-node action to v6.5.0 ([#27](https://github.com/NeoTamia/NTNook/issues/27)) ([3dfe52a](https://github.com/NeoTamia/NTNook/commit/3dfe52a1ede77441c1099bced0781c853c7a4a06))
+
+
+### 👷 Continuous Integration
+
+* Split crate and package workflows ([480fabb](https://github.com/NeoTamia/NTNook/commit/480fabbaccdac102cfdda737c57ac3c58b3e4cea))
+
 ## [0.4.1](https://github.com/NeoTamia/NTNook/compare/v0.4.0...v0.4.1) (2026-08-27)
 
 
