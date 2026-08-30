@@ -79,11 +79,37 @@ fn local_init_creates_only_local_overrides() {
     let directory = temporary_directory();
     let output = nook(&directory, &["init", "--local", "--app-port", "5180"]);
     assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add nook.local.toml to .gitignore"));
     assert!(!directory.join("nook.toml").exists());
     let contents = fs::read_to_string(directory.join("nook.local.toml")).unwrap();
     assert!(contents.contains("# name ="));
     assert!(contents.contains("app_port = 5180"));
     assert!(!contents.contains("\nname ="));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn init_preserves_caddy_socket_arguments_after_the_separator() {
+    let directory = temporary_directory();
+    let output = nook(
+        &directory,
+        &[
+            "init",
+            "--name",
+            "demo",
+            "--",
+            "server",
+            "--caddy-socket",
+            "/tmp/server.sock",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contents = fs::read_to_string(directory.join("nook.toml")).unwrap();
+    assert!(contents.contains("command = [\"server\", \"--caddy-socket\", \"/tmp/server.sock\"]"));
     fs::remove_dir_all(directory).unwrap();
 }
 

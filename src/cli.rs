@@ -345,7 +345,7 @@ fn init_command(
     if arguments.local && !local_config_is_ignored(&current_directory) {
         writeln!(
             errors,
-            "warning: nook.local.toml may contain workstation-specific settings; add /nook.local.toml to .gitignore"
+            "warning: nook.local.toml may contain workstation-specific settings; add nook.local.toml to .gitignore"
         )?;
     }
     Ok(())
@@ -1064,12 +1064,16 @@ fn parse_from(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, clap
 
 fn normalize_shortcuts(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     let mut arguments: Vec<_> = arguments.into_iter().collect();
+    let option_boundary = arguments
+        .iter()
+        .position(|value| value == "--")
+        .unwrap_or(arguments.len());
 
     if !arguments.get(1).is_some_and(|value| value == "config")
-        && let Some(index) = arguments
+        && let Some(index) = arguments[..option_boundary]
             .iter()
             .position(|value| value == "--caddy-socket")
-            .filter(|index| *index > 1 && *index + 1 < arguments.len())
+            .filter(|index| *index > 1 && *index + 1 < option_boundary)
     {
         let option = arguments.remove(index);
         let value = arguments.remove(index);
@@ -1100,6 +1104,7 @@ fn normalize_shortcuts(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsS
 
 fn is_command(value: &OsStr) -> bool {
     [
+        "init",
         "run",
         "alias",
         "list",
