@@ -75,10 +75,12 @@ autoload -Uz compinit
 compinit
 ```
 
-Regenerate the file after every Nook update. This initial version completes canonical forms such
-as `nook run --name api` and `nook alias set api 3000`. The `nook api run` and
-`nook alias api 3000` shortcuts, as well as existing run or alias names, are not yet completed
-dynamically.
+Regenerate the file after every Nook update. The generated scripts complete canonical forms such
+as `nook run --name api` and `nook alias set api 3000`, as well as existing run names after
+`nook stop` and alias names after `nook alias remove`. They also offer the known names for the
+`nook <name> run` and `nook alias <name>` shortcuts. Dynamic completion reads the local registry
+without reconciling Caddy or changing state; an unavailable, invalid, or busy registry simply
+produces no dynamic candidates.
 
 ## Prepare Caddy for Nook
 
