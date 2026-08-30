@@ -30,6 +30,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Create a project configuration in the current directory.
+    Init(InitArgs),
     /// Run a command behind a temporary Nook route.
     Run(RunArgs),
     /// Manage persistent aliases.
@@ -50,6 +52,37 @@ pub(crate) enum Command {
     Completions(CompletionsArgs),
     /// Update the nook binary from GitHub Releases.
     Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct InitArgs {
+    /// Create nook.local.toml instead of nook.toml.
+    #[arg(long)]
+    pub(crate) local: bool,
+    /// Print the configuration without creating a file.
+    #[arg(long, conflicts_with = "force")]
+    pub(crate) print: bool,
+    /// Replace an existing regular configuration file.
+    #[arg(long)]
+    pub(crate) force: bool,
+    /// Route name; .localhost is appended automatically.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    /// Expose the route over HTTP instead of HTTPS.
+    #[arg(long)]
+    pub(crate) no_tls: bool,
+    /// Preferred application port.
+    #[arg(long, value_name = "PORT")]
+    pub(crate) app_port: Option<u16>,
+    /// Fail rather than falling back when the preferred port is occupied.
+    #[arg(long, requires = "app_port")]
+    pub(crate) strict_port: bool,
+    /// Seconds before warning that the application is not ready.
+    #[arg(long, value_name = "SECONDS")]
+    pub(crate) readiness_warn_after: Option<u64>,
+    /// Child argv to store in the project configuration.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub(crate) command: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -235,6 +268,9 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         crate::update::warn_if_available(errors);
     }
     let command = match command {
+        Command::Init(arguments) => {
+            return init_command(arguments, output, errors).map(|()| 0);
+        }
         Command::Update(arguments) => {
             return update_command(arguments, output, errors);
         }
@@ -280,10 +316,166 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
             command: CaCommand::Export(arguments),
         }) => ca_export_command(arguments, &global, output).map(|()| 0),
         Command::Config(_) => unreachable!("configuration commands return before loading Caddy"),
-        Command::Completions(_) | Command::Update(_) => {
-            unreachable!("completion and update commands return before loading Caddy")
+        Command::Init(_) | Command::Completions(_) | Command::Update(_) => {
+            unreachable!("commands handled before global configuration return above")
         }
     }
+}
+
+fn init_command(
+    arguments: InitArgs,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> crate::Result<()> {
+    let current_directory = std::env::current_dir()?;
+    let contents = project_config_template(&arguments, &current_directory)?;
+    if arguments.print {
+        write!(output, "{contents}")?;
+        return Ok(());
+    }
+
+    let filename = if arguments.local {
+        "nook.local.toml"
+    } else {
+        "nook.toml"
+    };
+    let path = current_directory.join(filename);
+    write_project_config(&path, contents.as_bytes(), arguments.force)?;
+    writeln!(output, "created {}", path.display())?;
+    if arguments.local && !local_config_is_ignored(&current_directory) {
+        writeln!(
+            errors,
+            "warning: nook.local.toml may contain workstation-specific settings; add /nook.local.toml to .gitignore"
+        )?;
+    }
+    Ok(())
+}
+
+fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Result<String> {
+    let mut contents = String::from("format_version = 1\n\n");
+    let name = match arguments.name.as_deref() {
+        Some(name) => crate::config::project_name(name)?,
+        None => crate::config::infer_project_name(directory)?,
+    };
+    if arguments.local && arguments.name.is_none() {
+        contents.push_str("# Override the shared route name on this workstation.\n");
+        contents.push_str(&format!("# name = {}\n\n", toml_string(&name)));
+    } else {
+        contents.push_str("# Domain exposed as <name>.localhost.\n");
+        contents.push_str(&format!("name = {}\n\n", toml_string(&name)));
+    }
+
+    if arguments.command.is_empty() {
+        contents.push_str(
+            "# Command started by `nook run`.\n# command = [\"pnpm\", \"run\", \"dev\"]\n\n",
+        );
+    } else {
+        let command = arguments
+            .command
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(|value| toml::Value::String(value.to_owned()))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "project commands must contain valid UTF-8",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        contents.push_str("# Command started by `nook run`.\n");
+        contents.push_str(&format!("command = {}\n\n", toml::Value::Array(command)));
+    }
+    if arguments.no_tls {
+        contents.push_str("# Expose the application over HTTPS.\ntls = false\n\n");
+    } else {
+        contents.push_str("# Expose the application over HTTPS.\n# tls = true\n\n");
+    }
+    match arguments.app_port {
+        Some(port) => contents.push_str(&format!(
+            "# Preferred application port.\napp_port = {port}\n\n"
+        )),
+        None => contents.push_str("# Preferred application port.\n# app_port = 5173\n\n"),
+    }
+    if arguments.strict_port {
+        contents.push_str("# Fail when the preferred port is unavailable.\nstrict_port = true\n\n");
+    } else {
+        contents
+            .push_str("# Fail when the preferred port is unavailable.\n# strict_port = false\n\n");
+    }
+    match arguments.readiness_warn_after {
+        Some(seconds) => contents.push_str(&format!(
+            "# Delay before the readiness warning.\nreadiness_warn_after_seconds = {seconds}\n"
+        )),
+        None => contents.push_str(
+            "# Delay before the readiness warning.\n# readiness_warn_after_seconds = 30\n",
+        ),
+    }
+    Ok(contents)
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
+}
+
+fn write_project_config(path: &Path, contents: &[u8], force: bool) -> io::Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !force {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists; use --force to replace it",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+    }
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .unwrap_or_else(|| OsStr::new("nook.toml"))
+            .to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        if force {
+            fs::rename(&temporary, path)?;
+        } else {
+            fs::hard_link(&temporary, path)?;
+            fs::remove_file(&temporary)?;
+        }
+        Ok(())
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn local_config_is_ignored(directory: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["check-ignore", "--quiet", "nook.local.toml"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn update_command(

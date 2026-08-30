@@ -463,6 +463,27 @@ fn resolve_hostname(
     )
 }
 
+pub(crate) fn infer_project_name(current_directory: &Path) -> Result<String, Error> {
+    let hostname = resolve_hostname(
+        None,
+        None,
+        find_git_root(current_directory).as_deref(),
+        current_directory,
+    )?;
+    Ok(hostname
+        .strip_suffix(".localhost")
+        .unwrap_or(&hostname)
+        .to_owned())
+}
+
+pub(crate) fn project_name(name: &str) -> Result<String, Error> {
+    let hostname = normalize_hostname(name)?;
+    Ok(hostname
+        .strip_suffix(".localhost")
+        .unwrap_or(&hostname)
+        .to_owned())
+}
+
 pub(crate) fn normalize_hostname(name: &str) -> Result<String, Error> {
     if !name.is_ascii() {
         return invalid_name(name, "only ASCII DNS labels are supported");

@@ -256,6 +256,20 @@ Nook never changes a foreign Caddy route, even with `--force`. Nook routes carry
 
 ## Project configuration
 
+Create a documented project configuration in the current directory:
+
+```sh
+nook init
+nook init --name api --app-port 5173 -- pnpm run dev
+nook init --local
+nook init --print
+```
+
+By default, `init` writes `nook.toml`; `--local` selects `nook.local.toml`, and `--print`
+writes the generated TOML to standard output without changing the filesystem. Existing files are
+protected unless `--force` is passed. The generated template documents every available project
+setting, while command-line values are written as active settings.
+
 The `nook.toml` file describes a single application:
 
 ```toml
