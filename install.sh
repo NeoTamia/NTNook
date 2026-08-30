@@ -19,7 +19,7 @@ case "$(uname -m)" in
         ;;
 esac
 
-for command in curl tar sha256sum install; do
+for command in curl tar sha256sum install sed grep; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "nook: required command not found: $command" >&2
         exit 1
@@ -50,6 +50,69 @@ curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
 install_directory=${NOOK_INSTALL_DIR:-${XDG_BIN_HOME:-"$HOME/.local/bin"}}
 mkdir -p "$install_directory"
 install -m 0755 "${temporary_directory}/nook" "${install_directory}/nook"
+
+quote_shell_path() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+append_bash_completion() {
+    nook_rc_file=$1
+    nook_completion_file=$2
+    nook_quoted_file=$(quote_shell_path "$nook_completion_file")
+    if [ -f "$nook_rc_file" ] && grep -Fq '# >>> nook completions >>>' "$nook_rc_file"; then
+        return
+    fi
+    {
+        printf '\n# >>> nook completions >>>\n'
+        printf 'if [ -r %s ]; then\n' "$nook_quoted_file"
+        printf '    . %s\n' "$nook_quoted_file"
+        printf 'fi\n'
+        printf '# <<< nook completions <<<\n'
+    } >> "$nook_rc_file"
+}
+
+append_zsh_completion() {
+    nook_rc_file=$1
+    nook_completion_directory=$2
+    nook_completion_file=$3
+    nook_quoted_directory=$(quote_shell_path "$nook_completion_directory")
+    nook_quoted_file=$(quote_shell_path "$nook_completion_file")
+    if [ -f "$nook_rc_file" ] && grep -Fq '# >>> nook completions >>>' "$nook_rc_file"; then
+        return
+    fi
+    {
+        printf '\n# >>> nook completions >>>\n'
+        printf 'if [[ -r %s ]]; then\n' "$nook_quoted_file"
+        printf '    fpath=(%s $fpath)\n' "$nook_quoted_directory"
+        printf '    autoload -Uz compinit\n'
+        printf '    if (( ! $+functions[compdef] )); then\n'
+        printf '        compinit\n'
+        printf '    fi\n'
+        printf '    source %s\n' "$nook_quoted_file"
+        printf 'fi\n'
+        printf '# <<< nook completions <<<\n'
+    } >> "$nook_rc_file"
+}
+
+if [ -n "${HOME:-}" ]; then
+    completion_data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
+    bash_completion_directory="$completion_data_home/bash-completion/completions"
+    zsh_completion_directory="$completion_data_home/zsh/site-functions"
+    bash_completion_file="$bash_completion_directory/nook"
+    zsh_completion_file="$zsh_completion_directory/_nook"
+
+    mkdir -p "$bash_completion_directory" "$zsh_completion_directory"
+    "${install_directory}/nook" completions bash > "${temporary_directory}/nook.bash"
+    "${install_directory}/nook" completions zsh > "${temporary_directory}/nook.zsh"
+    install -m 0644 "${temporary_directory}/nook.bash" "$bash_completion_file"
+    install -m 0644 "${temporary_directory}/nook.zsh" "$zsh_completion_file"
+
+    append_bash_completion "$HOME/.bashrc" "$bash_completion_file"
+    append_zsh_completion "$HOME/.zshrc" "$zsh_completion_directory" "$zsh_completion_file"
+    echo "nook: installed Bash and Zsh completions"
+else
+    echo "nook: HOME is unset; shell completions were not installed" >&2
+fi
 
 echo "nook: installed ${install_directory}/nook"
 case ":${PATH}:" in

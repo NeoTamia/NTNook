@@ -18,7 +18,9 @@ nook --help
 
 The script installs Nook into `$XDG_BIN_HOME`, or `~/.local/bin` by default, without using `sudo`.
 Use `NOOK_INSTALL_DIR` to select another directory and `NOOK_VERSION` to install a specific
-version. Rust users can also build the published version from crates.io:
+version. It also installs Bash and Zsh completion files under `${XDG_DATA_HOME:-~/.local/share}`
+and adds idempotent source blocks to `~/.bashrc` and `~/.zshrc`. Rust users can also build the
+published version from crates.io:
 
 ```sh
 cargo install ntnook --locked
@@ -39,7 +41,9 @@ To run Caddy in Docker without installing its binary on the host, use the [Docke
 ## Bash and Zsh completion
 
 Nook generates completion scripts synchronized with the commands and options of the installed
-version. To load them only in the current session:
+version. The release installer installs both scripts and adds idempotent source blocks to
+`~/.bashrc` and `~/.zshrc`; the manual setup below is useful for Cargo/source installations.
+To load them only in the current session:
 
 ```sh
 # Bash
