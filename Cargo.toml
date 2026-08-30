@@ -10,6 +10,7 @@ readme = "README.md"
 keywords = ["localhost", "caddy", "proxy", "development", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
+exclude = ["packages/**"]
 
 [[bin]]
 name = "nook"

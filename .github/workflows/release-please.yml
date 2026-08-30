@@ -29,3 +29,15 @@ jobs:
     with:
       tag-name: ${{ needs.release-please.outputs.tag_name }}
       version: ${{ needs.release-please.outputs.version }}
+
+  gitflow-nook-run:
+    name: Gitflow nook-run release
+    needs: release-please
+    if: ${{ fromJSON(needs.release-please.outputs.outputs)['packages/nook-run--release_created'] == 'true' }}
+    uses: NeoTamia/actions/.github/workflows/gitflow-release.yml@19c096d7414b3b1756eea45e5aa5c7a3eaed3455 # main
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      tag-name: ${{ fromJSON(needs.release-please.outputs.outputs)['packages/nook-run--tag_name'] }}
+      version: ${{ fromJSON(needs.release-please.outputs.outputs)['packages/nook-run--version'] }}

@@ -1,8 +1,32 @@
-name: CI
+name: Crate CI
 
 on:
   push:
+    paths:
+      - ".github/workflows/ci-crate.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/**"
+      - "docker/**"
+      - "README.md"
+      - "RELEASE.md"
+      - "LICENSE"
+      - "install.sh"
   pull_request:
+    paths:
+      - ".github/workflows/ci-crate.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "src/**"
+      - "tests/**"
+      - "docker/**"
+      - "README.md"
+      - "RELEASE.md"
+      - "LICENSE"
+      - "install.sh"
   workflow_dispatch:
 
 permissions:

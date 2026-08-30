@@ -2,7 +2,7 @@ name: Publish
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "nook-run-v*"]
 
 concurrency:
   group: publish-${{ github.ref }}
@@ -18,6 +18,7 @@ env:
 jobs:
   release-assets:
     name: GitHub Release assets
+    if: ${{ startsWith(github.ref_name, 'v') }}
     runs-on: ubuntu-24.04
     permissions:
       artifact-metadata: write
@@ -125,3 +126,70 @@ jobs:
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  npm:
+    name: npm
+    if: ${{ startsWith(github.ref_name, 'nook-run-v') }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/nook-run
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+          registry-url: https://registry.npmjs.org
+
+      - name: Install trusted-publishing-compatible npm
+        run: npm install --global npm@12.0.2
+
+      - name: Install pnpm
+        uses: pnpm/setup@c9883cc79df532ad1a7b81bf9ab944ceb090d65c # v2.0.0
+        with:
+          version: 11.24.0
+          install: false
+
+      - name: Install package
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify tag and package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#nook-run-v}"
+          package_version="$(node --print 'require("./package.json").version')"
+          test "$version" = "$package_version"
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$(git rev-parse HEAD)"
+
+      - name: Test package
+        run: |
+          pnpm test
+          pnpm run pack:check
+
+      - name: Check npm version
+        id: npm-version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#nook-run-v}"
+          if pnpm view "@neotamia/nook-run@${version}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.npm-version.outputs.published != 'true'
+        # npm Trusted Publishing currently supports only npm publish/stage publish.
+        run: npm publish --access public

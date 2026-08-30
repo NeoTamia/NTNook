@@ -9,3 +9,7 @@
 
 # Per-developer Nook overrides
 /nook.local.toml
+
+# Local npm package artifacts
+/packages/nook-run/node_modules/
+/packages/nook-run/*.tgz

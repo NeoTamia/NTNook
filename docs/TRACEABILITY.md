@@ -33,6 +33,7 @@ This matrix links product requirements to implementation tickets and checks trac
 | Docker documentation and cross-platform matrix | NOOK-51, NOOK-50 | `docs/DOCKER.md`, README, release notes, and YouTrack specification |
 | Preserved Host, forwarded headers, WebSocket, SSE, streaming, HTTP/2, 502, and upstream TLS | NOOK-41 | `tests/proxy_protocols.rs`; `tests/alias_tls.rs` |
 | `nook update` replaces a GitHub binary after SHA-256 verification; a cached check warns when a newer version exists | post-MVP | `update::tests::*`, `cli_update` tests |
+| Package-manager-neutral JavaScript wrapper reports a missing Nook and preserves arguments, exit codes, and signals | post-MVP | `packages/nook-run/test`; Node 22/24 and npm/pnpm/Yarn/Bun CI jobs |
 | Documentation for requirements, safeguards, troubleshooting, and out-of-scope items | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
 | Linux gate compiles, formats, lints, runs tests/integrations, and produces a verifiable binary | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43 | `.github/workflows/ci.yml`; archive, SHA-256, and attestation through `.github/workflows/publish.yml` |
 
