@@ -188,6 +188,31 @@ nook: domain=api.localhost url=https://api.localhost port=5173
 
 This information is written to stderr to keep supervision messages separate from the application's standard output.
 
+### JavaScript package scripts
+
+JavaScript projects can use `@neotamia/nook-run` to provide a package-manager-independent `dev`
+script with an actionable error when the system `nook` executable is missing:
+
+```sh
+pnpm add --save-dev @neotamia/nook-run
+# npm install --save-dev @neotamia/nook-run
+# yarn add --dev @neotamia/nook-run
+# bun add --dev @neotamia/nook-run
+```
+
+```json
+{
+  "scripts": {
+    "dev": "nook-run --name web -- vite"
+  }
+}
+```
+
+The wrapper passes its arguments directly to `nook run`, inherits the terminal and environment,
+forwards interruption signals, and preserves Nook's exit code. It has no dependencies or install
+hooks and never downloads Nook or Caddy. Nook must still be installed separately and available in
+`PATH`. The wrapper requires Node.js 22 or newer; Windows users must run it with Nook inside WSL.
+
 ## Persistent aliases
 
 ```sh

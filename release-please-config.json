@@ -27,10 +27,22 @@
   "packages": {
     ".": {
       "draft": false,
+      "exclude-paths": [
+        "packages/nook-run"
+      ],
       "include-component-in-tag": false,
       "prerelease": false,
       "pull-request-title-pattern": "chore(release): 🚀 Release ${version}",
       "release-type": "rust"
+    },
+    "packages/nook-run": {
+      "component": "nook-run",
+      "draft": false,
+      "include-component-in-tag": true,
+      "package-name": "@neotamia/nook-run",
+      "prerelease": false,
+      "pull-request-title-pattern": "chore(release): 🚀 Release ${component} ${version}",
+      "release-type": "node"
     }
   },
   "plugins": [

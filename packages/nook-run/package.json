@@ -1,0 +1,43 @@
+{
+  "name": "@neotamia/nook-run",
+  "version": "0.0.0",
+  "description": "Run development commands through a system-installed Nook CLI",
+  "type": "module",
+  "bin": {
+    "nook-run": "bin/nook-run.js"
+  },
+  "files": [
+    "bin",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "pack:check": "pnpm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "nook",
+    "localhost",
+    "caddy",
+    "development",
+    "cli"
+  ],
+  "license": "LGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NeoTamia/NTNook.git",
+    "directory": "packages/nook-run"
+  },
+  "bugs": {
+    "url": "https://github.com/NeoTamia/NTNook/issues"
+  },
+  "homepage": "https://github.com/NeoTamia/NTNook#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@11.24.0"
+}
