@@ -45,17 +45,26 @@ async function createFakeNook(directory, source) {
   return executable;
 }
 
-test("prints installation guidance when Nook is missing", async (t) => {
+test("warns and runs the command directly when Nook is missing", async (t) => {
   const directory = await temporaryDirectory(t);
-  const result = await runLauncher(["--", "fake-app"], {
+  const command = path.join(directory, "fake-app");
+  await writeFile(
+    command,
+    `#!${process.execPath}\nconsole.log(JSON.stringify(process.argv.slice(2)));\n`,
+    "utf8",
+  );
+  await chmod(command, 0o755);
+
+  const result = await runLauncher(["--name", "web", "--", command, "an argument"], {
     env: { ...process.env, PATH: directory },
   });
 
-  assert.equal(result.code, 127);
+  assert.equal(result.code, 0);
+  assert.match(result.stderr, /warning: Nook was not found in PATH/);
   assert.match(result.stderr, /Nook was not found in PATH/);
   assert.match(result.stderr, /nook-installer\.sh/);
-  assert.match(result.stderr, /On Windows, run Nook from WSL/);
-  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /local domains and HTTPS will be unavailable/);
+  assert.equal(result.stdout, '["an argument"]\n');
 });
 
 test("distinguishes a non-executable Nook binary", async (t) => {
