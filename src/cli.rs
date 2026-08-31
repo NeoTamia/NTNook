@@ -437,6 +437,9 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
             "# Delay before the readiness warning.\n# readiness_warn_after_seconds = 30\n",
         ),
     }
+    contents.push_str(
+        "\n# Interface used to bind the application and injected as HOST.\n# run_bind_address = \"127.0.0.1\"\n",
+    );
     Ok(contents)
 }
 
@@ -1039,7 +1042,11 @@ fn run_command(
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
-    let mut config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
+    let config = crate::config::resolve_run(
+        &arguments,
+        &std::env::current_dir()?,
+        global.run_bind_address,
+    )?;
     if let Some(path) = &config.ignored_local_config {
         writeln!(
             errors,
@@ -1047,7 +1054,6 @@ fn run_command(
             path.display()
         )?;
     }
-    config.bind_address = global.run_bind_address;
     let store = state_store()?;
     with_caddy_routes(global, config.tls, !config.tls, |routes| {
         let mut running = crate::process::start_run(&config, &store, routes)?;

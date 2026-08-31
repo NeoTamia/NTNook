@@ -38,6 +38,7 @@ fn init_creates_a_documented_project_configuration() {
     assert!(contents.contains("app_port = 5173"));
     assert!(contents.contains("strict_port = true"));
     assert!(contents.contains("readiness_warn_after_seconds = 12"));
+    assert!(contents.contains("# run_bind_address = \"127.0.0.1\""));
 
     toml::from_str::<toml::Value>(&contents).expect("generated TOML should parse");
     fs::remove_dir_all(directory).unwrap();

@@ -286,6 +286,7 @@ tls = true
 app_port = 5173
 strict_port = false
 readiness_warn_after_seconds = 30
+run_bind_address = "127.0.0.1"
 ```
 
 Without a command after `--`, `command` is required. Name precedence is: `--name`, project file, Git root basename, then current-directory basename. CLI values override file values.
@@ -298,10 +299,12 @@ format_version = 1
 name = "api-alwyn"
 app_port = 5180
 strict_port = true
+run_bind_address = "0.0.0.0"
 ```
 
-The complete precedence order is: defaults and inference, `nook.toml`, `nook.local.toml`, then
-CLI options. The local file can also be used on its own, without `nook.toml`. Each file is
+The complete precedence order is: defaults and global configuration, `nook.toml`,
+`nook.local.toml`, then CLI options. The local file can also be used on its own, without
+`nook.toml`. Each file is
 validated separately, must declare `format_version = 1`, and rejects unknown fields.
 
 Because this file is workstation-specific, add it to the project's `.gitignore`:
@@ -404,7 +407,11 @@ overrides `caddy_admin`. To save the socket in the configuration, use
 `nook config init --caddy-socket PATH` or
 `nook config set caddy-admin unix:///path/admin.socket`.
 
-`run_bind_address` selects the interface used to reserve the port, probe readiness, and inject `HOST`. `caddy_loopback_host` changes only the connection address for local upstreams as seen by Caddy. `caddy_client_ip_ranges` controls the `remote_ip` matcher added to every Nook route. The defaults preserve native loopback behavior.
+`run_bind_address` selects the interface used to reserve the port, probe readiness, and inject
+`HOST`. It can be overridden per project in `nook.toml` or `nook.local.toml`.
+`caddy_loopback_host` changes only the connection address for local upstreams as seen by Caddy.
+`caddy_client_ip_ranges` controls the `remote_ip` matcher added to every Nook route. The defaults
+preserve native loopback behavior.
 
 ## Export the local CA
 

@@ -127,6 +127,7 @@ struct ProjectConfig {
     app_port: Option<u16>,
     strict_port: Option<bool>,
     readiness_warn_after_seconds: Option<u64>,
+    run_bind_address: Option<IpAddr>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -325,10 +326,17 @@ fn validate_global(config: &GlobalConfig) -> Result<(), Error> {
 pub(crate) fn resolve_run(
     arguments: &RunArgs,
     current_directory: &Path,
+    default_bind_address: IpAddr,
 ) -> Result<ResolvedRunConfig, Error> {
     let (project, ignored_local_config) = load_project(arguments, current_directory)?;
     let git_root = find_git_root(current_directory);
-    let mut resolved = merge_run(arguments, project, git_root.as_deref(), current_directory)?;
+    let mut resolved = merge_run(
+        arguments,
+        project,
+        git_root.as_deref(),
+        current_directory,
+        default_bind_address,
+    )?;
     resolved.ignored_local_config = ignored_local_config;
     Ok(resolved)
 }
@@ -393,6 +401,7 @@ fn merge_project(
         readiness_warn_after_seconds: local
             .readiness_warn_after_seconds
             .or(base.readiness_warn_after_seconds),
+        run_bind_address: local.run_bind_address.or(base.run_bind_address),
     })
 }
 
@@ -401,6 +410,7 @@ fn merge_run(
     project: Option<ProjectConfig>,
     git_root: Option<&Path>,
     current_directory: &Path,
+    default_bind_address: IpAddr,
 ) -> Result<ResolvedRunConfig, Error> {
     let project = project.unwrap_or(ProjectConfig {
         format_version: FORMAT_VERSION,
@@ -410,6 +420,7 @@ fn merge_run(
         app_port: None,
         strict_port: None,
         readiness_warn_after_seconds: None,
+        run_bind_address: None,
     });
     let hostname = resolve_hostname(
         arguments.name.as_deref(),
@@ -440,7 +451,7 @@ fn merge_run(
             .readiness_warn_after
             .or(project.readiness_warn_after_seconds)
             .unwrap_or(DEFAULT_READINESS_WARN_AFTER_SECONDS),
-        bind_address: default_run_bind_address(),
+        bind_address: project.run_bind_address.unwrap_or(default_bind_address),
         ignored_local_config: None,
     })
 }
@@ -607,8 +618,9 @@ fn validate_version(path: &Path, version: u32) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, GlobalConfig, ProjectConfig, format_global, global_config_path_with, merge_run,
-        normalize_hostname, resolve_hostname, validate_global, write_global_at,
+        Error, GlobalConfig, ProjectConfig, default_run_bind_address, format_global,
+        global_config_path_with, merge_run, normalize_hostname, resolve_hostname, validate_global,
+        write_global_at,
     };
     use crate::cli::{Cli, Command};
     use clap::Parser;
@@ -702,6 +714,7 @@ mod tests {
             Some(project()),
             Some(Path::new("/git")),
             Path::new("/cwd"),
+            default_run_bind_address(),
         )
         .unwrap();
         assert_eq!(resolved.hostname, "cli.localhost");
@@ -720,6 +733,7 @@ mod tests {
             Some(project()),
             Some(Path::new("/git")),
             Path::new("/cwd"),
+            default_run_bind_address(),
         )
         .unwrap();
         assert_eq!(resolved.hostname, "project.localhost");
@@ -738,7 +752,8 @@ mod tests {
                 &run_args(&["run"]),
                 None,
                 Some(Path::new("/git")),
-                Path::new("/cwd")
+                Path::new("/cwd"),
+                default_run_bind_address(),
             ),
             Err(Error::MissingCommand)
         ));
@@ -750,14 +765,14 @@ mod tests {
         let missing = directory.join("missing.toml");
         let run = run_args(&["run", "--config", missing.to_str().unwrap(), "--", "server"]);
         assert!(matches!(
-            super::resolve_run(&run, &directory),
+            resolve_run(&run, &directory),
             Err(Error::Read { .. })
         ));
         let invalid = directory.join("invalid.toml");
         fs::write(&invalid, "format_version = 2\ncommand = [\"server\"]\n").unwrap();
         let run = run_args(&["run", "--config", invalid.to_str().unwrap()]);
         assert!(matches!(
-            super::resolve_run(&run, &directory),
+            resolve_run(&run, &directory),
             Err(Error::UnsupportedVersion { version: 2, .. })
         ));
         fs::remove_dir_all(directory).unwrap();
@@ -776,6 +791,7 @@ mod tests {
                 "app_port = 8000\n",
                 "strict_port = true\n",
                 "readiness_warn_after_seconds = 20\n",
+                "run_bind_address = \"127.0.0.2\"\n",
             ),
         )
         .unwrap();
@@ -788,17 +804,19 @@ mod tests {
                 "tls = false\n",
                 "strict_port = false\n",
                 "readiness_warn_after_seconds = 5\n",
+                "run_bind_address = \"0.0.0.0\"\n",
             ),
         )
         .unwrap();
 
-        let resolved = super::resolve_run(&run_args(&["run"]), &directory).unwrap();
+        let resolved = resolve_run(&run_args(&["run"]), &directory).unwrap();
         assert_eq!(resolved.hostname, "local.localhost");
         assert_eq!(resolved.command, ["local-command"]);
         assert!(!resolved.tls);
         assert_eq!(resolved.app_port, Some(8000));
         assert!(!resolved.strict_port);
         assert_eq!(resolved.readiness_warn_after_seconds, 5);
+        assert_eq!(resolved.bind_address.to_string(), "0.0.0.0");
         assert!(resolved.ignored_local_config.is_none());
 
         fs::remove_dir_all(directory).unwrap();
@@ -813,7 +831,7 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = super::resolve_run(&run_args(&["run"]), &directory).unwrap();
+        let resolved = resolve_run(&run_args(&["run"]), &directory).unwrap();
         assert_eq!(resolved.hostname, "local-only.localhost");
         assert_eq!(resolved.command, ["server"]);
 
@@ -833,15 +851,14 @@ mod tests {
         fs::write(&local, "format_version = 1\nname = \"local\"\n").unwrap();
 
         let base_path = base.to_str().unwrap();
-        let ignored =
-            super::resolve_run(&run_args(&["run", "--config", base_path]), &directory).unwrap();
+        let ignored = resolve_run(&run_args(&["run", "--config", base_path]), &directory).unwrap();
         assert_eq!(ignored.hostname, "base.localhost");
         assert_eq!(
             ignored.ignored_local_config.as_deref(),
             Some(local.as_path())
         );
 
-        let applied = super::resolve_run(
+        let applied = resolve_run(
             &run_args(&["run", "--config", base_path, "--local"]),
             &directory,
         )
@@ -851,7 +868,7 @@ mod tests {
 
         fs::remove_file(&local).unwrap();
         assert!(matches!(
-            super::resolve_run(
+            resolve_run(
                 &run_args(&["run", "--config", base_path, "--local"]),
                 &directory
             ),
@@ -870,7 +887,7 @@ mod tests {
             "format_version = 1\nname = \"local\"\ncommand = [\"server\"]\n",
         )
         .unwrap();
-        let resolved = super::resolve_run(
+        let resolved = resolve_run(
             &run_args(&["run", "--config", local.to_str().unwrap(), "--local"]),
             &directory,
         )
@@ -886,12 +903,12 @@ mod tests {
         let local = directory.join("nook.local.toml");
         fs::write(&local, "format_version = 2\ncommand = [\"server\"]\n").unwrap();
         assert!(matches!(
-            super::resolve_run(&run_args(&["run"]), &directory),
+            resolve_run(&run_args(&["run"]), &directory),
             Err(Error::UnsupportedVersion { path, version: 2 }) if path == local
         ));
         fs::write(&local, "format_version = 1\nunknown = true\n").unwrap();
         assert!(matches!(
-            super::resolve_run(&run_args(&["run", "--", "server"]), &directory),
+            resolve_run(&run_args(&["run", "--", "server"]), &directory),
             Err(Error::Parse { path, .. }) if path == local
         ));
         fs::remove_dir_all(directory).unwrap();
@@ -986,7 +1003,15 @@ mod tests {
             app_port: Some(8000),
             strict_port: Some(false),
             readiness_warn_after_seconds: Some(20),
+            run_bind_address: None,
         }
+    }
+
+    fn resolve_run(
+        arguments: &crate::cli::RunArgs,
+        current_directory: &Path,
+    ) -> Result<super::ResolvedRunConfig, Error> {
+        super::resolve_run(arguments, current_directory, default_run_bind_address())
     }
 
     fn run_args(arguments: &[&str]) -> crate::cli::RunArgs {
