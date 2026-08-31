@@ -200,6 +200,24 @@ impl Store {
         Self { path }
     }
 
+    /// Reads the registry for shell completion without creating or changing
+    /// any state files. A concurrent mutation makes the completion stale at
+    /// worst, so a busy lock is treated as an empty result instead of
+    /// blocking the interactive shell.
+    pub(crate) fn load_for_completion(&self) -> Option<Registry> {
+        let lock_path = self.path.with_extension("lock");
+        match File::open(&lock_path) {
+            Ok(lock) => {
+                lock.try_lock_shared().ok()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+
+        let contents = fs::read(&self.path).ok()?;
+        decode(&contents).ok()
+    }
+
     pub(crate) fn lock_operations(&self) -> Result<OperationGuard, Error> {
         let parent = self.path.parent().ok_or_else(|| {
             io_error(
@@ -404,6 +422,23 @@ mod tests {
                 .last_synchronized_at_unix_ms,
             Some(42)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completion_load_is_read_only_and_tolerates_invalid_state() {
+        let directory = temporary_directory("completion");
+        let path = directory.join("nested/state.json");
+        let store = Store::new(path.clone());
+
+        assert!(store.load_for_completion().is_none());
+        assert!(!path.parent().unwrap().exists());
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not json").unwrap();
+        assert!(store.load_for_completion().is_none());
+        assert!(!path.with_extension("lock").exists());
+
         fs::remove_dir_all(directory).unwrap();
     }
 
