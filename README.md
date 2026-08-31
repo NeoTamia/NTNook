@@ -18,7 +18,9 @@ nook --help
 
 The script installs Nook into `$XDG_BIN_HOME`, or `~/.local/bin` by default, without using `sudo`.
 Use `NOOK_INSTALL_DIR` to select another directory and `NOOK_VERSION` to install a specific
-version. Rust users can also build the published version from crates.io:
+version. It also installs Bash and Zsh completion files under `${XDG_DATA_HOME:-~/.local/share}`
+and adds idempotent source blocks to `~/.bashrc` and `~/.zshrc`. Rust users can also build the
+published version from crates.io:
 
 ```sh
 cargo install ntnook --locked
@@ -39,7 +41,9 @@ To run Caddy in Docker without installing its binary on the host, use the [Docke
 ## Bash and Zsh completion
 
 Nook generates completion scripts synchronized with the commands and options of the installed
-version. To load them only in the current session:
+version. The release installer installs both scripts and adds idempotent source blocks to
+`~/.bashrc` and `~/.zshrc`; the manual setup below is useful for Cargo/source installations.
+To load them only in the current session:
 
 ```sh
 # Bash
@@ -75,10 +79,12 @@ autoload -Uz compinit
 compinit
 ```
 
-Regenerate the file after every Nook update. This initial version completes canonical forms such
-as `nook run --name api` and `nook alias set api 3000`. The `nook api run` and
-`nook alias api 3000` shortcuts, as well as existing run or alias names, are not yet completed
-dynamically.
+Regenerate the file after every Nook update. The generated scripts complete canonical forms such
+as `nook run --name api` and `nook alias set api 3000`, as well as existing run names after
+`nook stop` and alias names after `nook alias remove`. They also offer the known names for the
+`nook <name> run` and `nook alias <name>` shortcuts. Dynamic completion reads the local registry
+without reconciling Caddy or changing state; an unavailable, invalid, or busy registry simply
+produces no dynamic candidates.
 
 ## Prepare Caddy for Nook
 
@@ -280,6 +286,7 @@ tls = true
 app_port = 5173
 strict_port = false
 readiness_warn_after_seconds = 30
+run_bind_address = "127.0.0.1"
 ```
 
 Without a command after `--`, `command` is required. Name precedence is: `--name`, project file, Git root basename, then current-directory basename. CLI values override file values.
@@ -292,10 +299,12 @@ format_version = 1
 name = "api-alwyn"
 app_port = 5180
 strict_port = true
+run_bind_address = "0.0.0.0"
 ```
 
-The complete precedence order is: defaults and inference, `nook.toml`, `nook.local.toml`, then
-CLI options. The local file can also be used on its own, without `nook.toml`. Each file is
+The complete precedence order is: defaults and global configuration, `nook.toml`,
+`nook.local.toml`, then CLI options. The local file can also be used on its own, without
+`nook.toml`. Each file is
 validated separately, must declare `format_version = 1`, and rejects unknown fields.
 
 Because this file is workstation-specific, add it to the project's `.gitignore`:
@@ -398,7 +407,11 @@ overrides `caddy_admin`. To save the socket in the configuration, use
 `nook config init --caddy-socket PATH` or
 `nook config set caddy-admin unix:///path/admin.socket`.
 
-`run_bind_address` selects the interface used to reserve the port, probe readiness, and inject `HOST`. `caddy_loopback_host` changes only the connection address for local upstreams as seen by Caddy. `caddy_client_ip_ranges` controls the `remote_ip` matcher added to every Nook route. The defaults preserve native loopback behavior.
+`run_bind_address` selects the interface used to reserve the port, probe readiness, and inject
+`HOST`. It can be overridden per project in `nook.toml` or `nook.local.toml`.
+`caddy_loopback_host` changes only the connection address for local upstreams as seen by Caddy.
+`caddy_client_ip_ranges` controls the `remote_ip` matcher added to every Nook route. The defaults
+preserve native loopback behavior.
 
 ## Export the local CA
 

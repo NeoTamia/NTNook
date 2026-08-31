@@ -1,6 +1,6 @@
 //! Command-line parsing, terminal output, and exit-code policy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -52,6 +52,12 @@ pub(crate) enum Command {
     Completions(CompletionsArgs),
     /// Update the nook binary from GitHub Releases.
     Update(UpdateArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum CompletionKind {
+    Runs,
+    Aliases,
 }
 
 #[derive(Debug, Args)]
@@ -253,10 +259,28 @@ pub(crate) struct StopArgs {
 }
 
 pub(crate) fn run() -> crate::Result<i32> {
-    let cli = parse_from(std::env::args_os())?;
+    let arguments: Vec<_> = std::env::args_os().collect();
+    if arguments
+        .get(1)
+        .is_some_and(|argument| argument == "__complete")
+    {
+        return completion_query(&arguments);
+    }
+    let cli = parse_from(arguments)?;
     let stdout = io::stdout();
     let stderr = io::stderr();
     execute(cli, &mut stdout.lock(), &mut stderr.lock())
+}
+
+fn completion_query(arguments: &[OsString]) -> crate::Result<i32> {
+    let kind = match arguments.get(2).and_then(|argument| argument.to_str()) {
+        Some("runs") => CompletionKind::Runs,
+        Some("aliases") => CompletionKind::Aliases,
+        _ => return Ok(0),
+    };
+    let stdout = io::stdout();
+    completion_query_command(kind, &mut stdout.lock())?;
+    Ok(0)
 }
 
 fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate::Result<i32> {
@@ -413,6 +437,9 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
             "# Delay before the readiness warning.\n# readiness_warn_after_seconds = 30\n",
         ),
     }
+    contents.push_str(
+        "\n# Interface used to bind the application and injected as HOST.\n# run_bind_address = \"127.0.0.1\"\n",
+    );
     Ok(contents)
 }
 
@@ -499,8 +526,375 @@ fn completions_command(arguments: CompletionsArgs, output: &mut impl Write) -> i
     let mut command = Cli::command();
     command.set_bin_name("nook");
     command.build();
-    shell.try_generate(&command, output)
+    shell.try_generate(&command, output)?;
+    match shell {
+        Shell::Bash => output.write_all(BASH_DYNAMIC_COMPLETION.as_bytes()),
+        Shell::Zsh => output.write_all(ZSH_DYNAMIC_COMPLETION.as_bytes()),
+        _ => Ok(()),
+    }
 }
+
+fn completion_query_command(kind: CompletionKind, output: &mut impl Write) -> io::Result<()> {
+    let Ok(path) = crate::state::state_path() else {
+        return Ok(());
+    };
+    let Some(registry) = crate::state::Store::new(path).load_for_completion() else {
+        return Ok(());
+    };
+
+    let names = match kind {
+        CompletionKind::Runs => registry
+            .leases
+            .values()
+            .filter_map(|lease| completion_name(&lease.hostname))
+            .collect::<BTreeSet<_>>(),
+        CompletionKind::Aliases => registry
+            .aliases
+            .values()
+            .filter_map(|alias| completion_name(&alias.hostname))
+            .collect::<BTreeSet<_>>(),
+    };
+    for name in names {
+        writeln!(output, "{name}")?;
+    }
+    Ok(())
+}
+
+fn completion_name(hostname: &str) -> Option<String> {
+    let hostname = crate::config::normalize_hostname(hostname).ok()?;
+    Some(
+        hostname
+            .strip_suffix(".localhost")
+            .unwrap_or(&hostname)
+            .to_owned(),
+    )
+}
+
+const BASH_DYNAMIC_COMPLETION: &str = r#"
+
+# Complete names from Nook's local registry without invoking reconciliation
+# or Caddy. Errors deliberately produce no dynamic candidates.
+_nook_dynamic_candidates() {
+    local kind="$1"
+    local nook_command="$2"
+    local cur="$3"
+    local candidate
+    while IFS= read -r candidate; do
+        if [[ "$candidate" == "$cur"* ]]; then
+            COMPREPLY+=("$candidate")
+        fi
+    done < <(command "$nook_command" __complete "$kind" 2>/dev/null)
+}
+
+_nook_dynamic_word() {
+    local word="$1"
+    local cur="$2"
+    if [[ "$word" == "$cur"* ]]; then
+        COMPREPLY+=("$word")
+    fi
+}
+
+_nook_dynamic_name_position() {
+    local kind="$1"
+    local name_index="$2"
+    local word
+    while (( name_index <= COMP_CWORD )); do
+        if (( name_index == COMP_CWORD )); then
+            word="${COMP_WORDS[name_index]}"
+            case "$word" in
+                --caddy-socket|--caddy-socket=*|--force|-h|--help|--|-*)
+                    return 1
+                    ;;
+                *)
+                    return 0
+                    ;;
+            esac
+        fi
+
+        word="${COMP_WORDS[name_index]}"
+        case "$word" in
+            --caddy-socket)
+                (( name_index + 1 == COMP_CWORD )) && return 1
+                (( name_index += 2 ))
+                ;;
+            --caddy-socket=*)
+                (( name_index += 1 ))
+                ;;
+            --force)
+                [[ "$kind" == "runs" ]] || return 1
+                (( name_index += 1 ))
+                ;;
+            -h|--help)
+                (( name_index += 1 ))
+                ;;
+            --)
+                (( name_index += 1 ))
+                ;;
+            -*)
+                return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
+_nook_dynamic() {
+    _nook "$@"
+
+    local command_index=1
+    local word
+    while (( command_index < COMP_CWORD )); do
+        word="${COMP_WORDS[command_index]}"
+        case "$word" in
+            --caddy-socket)
+                (( command_index + 1 >= COMP_CWORD )) && return 0
+                (( command_index += 2 ))
+                ;;
+            --caddy-socket=*)
+                (( command_index += 1 ))
+                ;;
+            --)
+                return 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    (( command_index >= ${#COMP_WORDS[@]} )) && return 0
+
+    local subcommand="${COMP_WORDS[command_index]}"
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local nook_command="${COMP_WORDS[0]}"
+
+    if [[ "$subcommand" == "stop" ]] \
+        && _nook_dynamic_name_position runs "$((command_index + 1))"; then
+        COMPREPLY=()
+        _nook_dynamic_candidates runs "$nook_command" "$current"
+        return 0
+    fi
+
+    local alias_action_index=$((command_index + 1))
+    if [[ "$subcommand" == "alias" ]]; then
+        while (( alias_action_index < COMP_CWORD )); do
+            word="${COMP_WORDS[alias_action_index]}"
+            case "$word" in
+                --caddy-socket)
+                    (( alias_action_index + 1 >= COMP_CWORD )) && return 0
+                    (( alias_action_index += 2 ))
+                    ;;
+                --caddy-socket=*)
+                    (( alias_action_index += 1 ))
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+        done
+    fi
+
+    if [[ "$subcommand" == "alias" \
+        && "${COMP_WORDS[alias_action_index]}" == "remove" ]] \
+        && _nook_dynamic_name_position aliases "$((alias_action_index + 1))"; then
+        COMPREPLY=()
+        _nook_dynamic_candidates aliases "$nook_command" "$current"
+        return 0
+    fi
+
+    # `nook <name> run` and `nook alias <name>` are supported shortcuts.
+    if (( COMP_CWORD == command_index )); then
+        case "$current" in
+            -*) ;;
+            *) _nook_dynamic_candidates runs "$nook_command" "$current" ;;
+        esac
+        return 0
+    fi
+
+    if [[ "$subcommand" == "alias" ]] \
+        && _nook_dynamic_name_position aliases "$((command_index + 1))"; then
+        case "$current" in
+            set|remove|list|help|-*) ;;
+            *) _nook_dynamic_candidates aliases "$nook_command" "$current" ;;
+        esac
+        return 0
+    fi
+
+    case "$subcommand" in
+        init|run|alias|list|status|stop|prune|ca|config|completions|update|help|-*) ;;
+        *)
+            if (( COMP_CWORD == command_index + 1 )); then
+                _nook_dynamic_word run "$current"
+            fi
+            ;;
+    esac
+}
+
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -F _nook_dynamic -o nosort -o bashdefault -o default nook
+else
+    complete -F _nook_dynamic -o bashdefault -o default nook
+fi
+"#;
+
+const ZSH_DYNAMIC_COMPLETION: &str = r#"
+
+# Complete names from Nook's local registry without invoking reconciliation
+# or Caddy. Errors deliberately produce no dynamic candidates.
+_nook_dynamic_candidates() {
+    local kind="$1"
+    local nook_command="${words[1]}"
+    local current="$2"
+    local -a candidates
+    candidates=("${(@f)$(command "$nook_command" __complete "$kind" 2>/dev/null)}")
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        [[ -n "$candidate" && "$candidate" == "$current"* ]] && compadd -Q -- "$candidate"
+    done
+}
+
+_nook_dynamic_word() {
+    local word="$1"
+    local current="$2"
+    [[ "$word" == "$current"* ]] && compadd -Q -- "$word"
+}
+
+_nook_dynamic_name_position() {
+    local kind="$1"
+    local name_index="$2"
+    local word
+    while (( name_index <= CURRENT )); do
+        if (( name_index == CURRENT )); then
+            word="${words[name_index]}"
+            case "$word" in
+                --caddy-socket|--caddy-socket=*|--force|-h|--help|--|-*)
+                    return 1
+                    ;;
+                *)
+                    return 0
+                    ;;
+            esac
+        fi
+
+        word="${words[name_index]}"
+        case "$word" in
+            --caddy-socket)
+                (( name_index + 1 == CURRENT )) && return 1
+                (( name_index += 2 ))
+                ;;
+            --caddy-socket=*)
+                (( name_index += 1 ))
+                ;;
+            --force)
+                [[ "$kind" == "runs" ]] || return 1
+                (( name_index += 1 ))
+                ;;
+            -h|--help)
+                (( name_index += 1 ))
+                ;;
+            --)
+                (( name_index += 1 ))
+                ;;
+            -*)
+                return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
+_nook_dynamic() {
+    local command_index=2
+    while (( command_index < CURRENT )); do
+        case "${words[command_index]}" in
+            --caddy-socket)
+                (( command_index + 1 >= CURRENT )) && return 0
+                (( command_index += 2 ))
+                ;;
+            --caddy-socket=*)
+                (( command_index += 1 ))
+                ;;
+            --)
+                return 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    (( command_index >= CURRENT + 1 )) && return 0
+
+    local subcommand="${words[command_index]}"
+    local current="${words[CURRENT]}"
+
+    if [[ "$subcommand" == "stop" ]] \
+        && _nook_dynamic_name_position runs "$((command_index + 1))"; then
+        _nook_dynamic_candidates runs "$current"
+        return 0
+    fi
+
+    local alias_action_index=$((command_index + 1))
+    if [[ "$subcommand" == "alias" ]]; then
+        while (( alias_action_index < CURRENT )); do
+            case "${words[alias_action_index]}" in
+                --caddy-socket)
+                    (( alias_action_index + 1 >= CURRENT )) && return 0
+                    (( alias_action_index += 2 ))
+                    ;;
+                --caddy-socket=*)
+                    (( alias_action_index += 1 ))
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+        done
+    fi
+
+    if [[ "$subcommand" == "alias" \
+        && "${words[alias_action_index]}" == "remove" ]] \
+        && _nook_dynamic_name_position aliases "$((alias_action_index + 1))"; then
+        _nook_dynamic_candidates aliases "$current"
+        return 0
+    fi
+
+    _nook "$@"
+
+    # `nook <name> run` and `nook alias <name>` are supported shortcuts.
+    if (( CURRENT == command_index )); then
+        case "$current" in
+            -*) ;;
+            *) _nook_dynamic_candidates runs "$current" ;;
+        esac
+        return 0
+    fi
+
+    if [[ "$subcommand" == "alias" ]] \
+        && _nook_dynamic_name_position aliases "$((command_index + 1))"; then
+        case "$current" in
+            set|remove|list|help|-*) ;;
+            *) _nook_dynamic_candidates aliases "$current" ;;
+        esac
+        return 0
+    fi
+
+    case "$subcommand" in
+        init|run|alias|list|status|stop|prune|ca|config|completions|update|help|-*) ;;
+        *)
+            (( CURRENT == command_index + 1 )) && _nook_dynamic_word run "$current"
+            ;;
+    esac
+}
+
+compdef _nook_dynamic nook
+"#;
 
 fn config_command(arguments: ConfigArgs, output: &mut impl Write) -> crate::Result<()> {
     match arguments.command {
@@ -648,7 +1042,11 @@ fn run_command(
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
-    let mut config = crate::config::resolve_run(&arguments, &std::env::current_dir()?)?;
+    let config = crate::config::resolve_run(
+        &arguments,
+        &std::env::current_dir()?,
+        global.run_bind_address,
+    )?;
     if let Some(path) = &config.ignored_local_config {
         writeln!(
             errors,
@@ -656,7 +1054,6 @@ fn run_command(
             path.display()
         )?;
     }
-    config.bind_address = global.run_bind_address;
     let store = state_store()?;
     with_caddy_routes(global, config.tls, !config.tls, |routes| {
         let mut running = crate::process::start_run(&config, &store, routes)?;

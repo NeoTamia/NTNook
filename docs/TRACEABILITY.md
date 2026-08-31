@@ -32,6 +32,7 @@ This matrix links product requirements to implementation tickets and checks trac
 | Official/proxy Docker CI gate | NOOK-49 | `docker` job in `.github/workflows/ci.yml` |
 | Docker documentation and cross-platform matrix | NOOK-51, NOOK-50 | `docs/DOCKER.md`, README, release notes, and YouTrack specification |
 | Preserved Host, forwarded headers, WebSocket, SSE, streaming, HTTP/2, 502, and upstream TLS | NOOK-41 | `tests/proxy_protocols.rs`; `tests/alias_tls.rs` |
+| Static and registry-backed Bash/Zsh completion for runs, aliases, and shortcuts | NOOK-52 | `tests/cli_completions.rs`; generated scripts perform read-only completion queries |
 | `nook update` replaces a GitHub binary after SHA-256 verification; a cached check warns when a newer version exists | post-MVP | `update::tests::*`, `cli_update` tests |
 | Package-manager-neutral JavaScript wrapper reports a missing Nook and preserves arguments, exit codes, and signals | post-MVP | `packages/nook-run/test`; Node 22/24 and npm/pnpm/Yarn/Bun CI jobs |
 | Documentation for requirements, safeguards, troubleshooting, and out-of-scope items | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |

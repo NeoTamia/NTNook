@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/NeoTamia/NTNook/compare/v0.5.0...v0.6.0) (2026-08-31)
+
+
+### ✨ Features
+
+* **cli:** Add dynamic shell completions ([dc68490](https://github.com/NeoTamia/NTNook/commit/dc6849096b054dff7f2a218269a864ff02cbebae))
+* **config:** Add support for configurable `run_bind_address` setting ([ebe371a](https://github.com/NeoTamia/NTNook/commit/ebe371a7870deec697777e529f49b523dc9f8abb))
+* **install:** Configure shell completions ([dd0f255](https://github.com/NeoTamia/NTNook/commit/dd0f2550ecdd91aeae2ab874d452ea7db67f0496))
+
+
+### 🐛 Bug Fixes
+
+* **completions:** Address review feedback ([09515f4](https://github.com/NeoTamia/NTNook/commit/09515f49d90859f7b7752135647d7eabec25916f))
+
 ## [0.5.0](https://github.com/NeoTamia/NTNook/compare/v0.4.1...v0.5.0) (2026-08-30)
 
 
