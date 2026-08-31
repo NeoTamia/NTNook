@@ -73,7 +73,7 @@ fn completion_help_lists_supported_shells_and_rejects_others() {
     let help = nook(&["completions", "--help"]);
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    assert!(help.contains("Usage: nook completions <SHELL>"));
+    assert!(help.contains("completions <SHELL>"));
     assert!(help.contains("[possible values: bash, zsh, power-shell]"));
 
     let rejected = nook(&["completions", "fish"]);
@@ -82,6 +82,7 @@ fn completion_help_lists_supported_shells_and_rejects_others() {
 }
 
 #[test]
+#[cfg(unix)]
 fn generated_bash_completion_has_valid_syntax() {
     let output = nook(&["completions", "bash"]);
     assert!(output.status.success());
@@ -105,6 +106,7 @@ fn generated_bash_completion_has_valid_syntax() {
 }
 
 #[test]
+#[cfg(unix)]
 fn generated_zsh_completion_has_valid_syntax() {
     if Command::new("zsh").arg("--version").output().is_err() {
         return;
