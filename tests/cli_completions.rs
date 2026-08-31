@@ -181,6 +181,7 @@ fn dynamic_completion_returns_empty_for_missing_invalid_or_locked_state() {
 }
 
 #[test]
+#[cfg(unix)]
 fn bash_completion_proposes_dynamic_names_for_stop_and_alias_remove() {
     let directory = temporary_directory("dynamic-bash");
     let state_home = directory.join("state");

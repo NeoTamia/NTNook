@@ -5,9 +5,13 @@ use base64::Engine as _;
 use serde_json::Value;
 use serde_json::json;
 use std::fmt;
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
@@ -140,7 +144,11 @@ pub(crate) struct Upstream {
 #[derive(Debug)]
 enum AdminEndpoint {
     Http(Url),
-    Unix { address: String, socket: PathBuf },
+    #[cfg(unix)]
+    Unix {
+        address: String,
+        socket: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -150,23 +158,30 @@ pub(crate) struct Client {
 
 impl Client {
     pub(crate) fn new(admin: &str) -> Result<Self, Error> {
-        if let Some(socket) = admin
+        if let Some(socket_path) = admin
             .strip_prefix("unix://")
             .or_else(|| admin.strip_prefix("unix/"))
         {
-            let socket = PathBuf::from(socket);
-            if !socket.is_absolute() {
-                return Err(Error::AdminUrl(
+            #[cfg(windows)]
+            return Err(Error::AdminUrl(format!(
+                "Unix sockets are not supported on Windows (`{socket_path}`); use an HTTP(S) Admin API URL such as http://127.0.0.1:2019"
+            )));
+            #[cfg(unix)]
+            {
+                let socket = PathBuf::from(socket_path);
+                if !socket.is_absolute() {
+                    return Err(Error::AdminUrl(
                     "Unix socket path must be absolute (for example unix//run/caddy/admin.socket)"
                         .into(),
                 ));
+                }
+                return Ok(Self {
+                    admin: AdminEndpoint::Unix {
+                        address: admin.to_owned(),
+                        socket,
+                    },
+                });
             }
-            return Ok(Self {
-                admin: AdminEndpoint::Unix {
-                    address: admin.to_owned(),
-                    socket,
-                },
-            });
         }
         let admin = Url::parse(admin).map_err(|error| Error::AdminUrl(error.to_string()))?;
         if !matches!(admin.scheme(), "http" | "https") || admin.host().is_none() {
@@ -191,6 +206,7 @@ impl Client {
                     .read_json()
                     .map_err(|error| Error::AdminRequest(error.to_string()))
             }
+            #[cfg(unix)]
             AdminEndpoint::Unix { socket, .. } => {
                 let response = unix_request(socket, "GET", "/config/", &[], None)?;
                 response.ensure_success()?;
@@ -212,6 +228,7 @@ impl Client {
                     .read_to_string()
                     .map_err(|error| Error::AdminRequest(error.to_string()))
             }
+            #[cfg(unix)]
             AdminEndpoint::Unix { socket, .. } => {
                 let response = unix_request(socket, "GET", "/pki/ca/local", &[], None)?;
                 response.ensure_success()?;
@@ -233,6 +250,7 @@ impl Client {
                     format!("{host}:{port}")
                 }
             }
+            #[cfg(unix)]
             AdminEndpoint::Unix { address, .. } => address.clone(),
         };
         format!("caddy trust --address {address}")
@@ -274,6 +292,7 @@ impl Client {
                     std::thread::sleep,
                 )
             }
+            #[cfg(unix)]
             AdminEndpoint::Unix { socket, .. } => {
                 let endpoint = server_routes_path(server);
                 mutate_with_retry(
@@ -312,8 +331,15 @@ impl Client {
     }
 
     fn server_routes_http_endpoint(&self, server: &str) -> Result<Url, Error> {
-        let AdminEndpoint::Http(admin) = &self.admin else {
-            return Err(Error::AdminUrl("expected an HTTP(S) endpoint".into()));
+        #[cfg(windows)]
+        let AdminEndpoint::Http(admin) = &self.admin;
+        #[cfg(unix)]
+        let admin = match &self.admin {
+            AdminEndpoint::Http(admin) => admin,
+            #[cfg(unix)]
+            AdminEndpoint::Unix { .. } => {
+                return Err(Error::AdminUrl("expected an HTTP(S) endpoint".into()));
+            }
         };
         let mut endpoint = admin.clone();
         endpoint.set_path("");
@@ -347,12 +373,14 @@ fn server_routes_path(server: &str) -> String {
     endpoint.path().to_owned()
 }
 
+#[cfg(unix)]
 struct UnixResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl UnixResponse {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -375,6 +403,7 @@ impl UnixResponse {
     }
 }
 
+#[cfg(unix)]
 fn unix_request(
     socket: &Path,
     method: &str,
@@ -420,6 +449,7 @@ fn unix_request(
     parse_http_response(&bytes)
 }
 
+#[cfg(unix)]
 fn unix_connect_error(socket: &Path, error: std::io::Error) -> Error {
     let remediation = if error.kind() == std::io::ErrorKind::PermissionDenied {
         format!(
@@ -435,6 +465,7 @@ fn unix_connect_error(socket: &Path, error: std::io::Error) -> Error {
     ))
 }
 
+#[cfg(unix)]
 fn parse_http_response(bytes: &[u8]) -> Result<UnixResponse, Error> {
     let header_end = bytes
         .windows(4)
@@ -479,6 +510,7 @@ fn parse_http_response(bytes: &[u8]) -> Result<UnixResponse, Error> {
     })
 }
 
+#[cfg(unix)]
 fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let mut decoded = Vec::new();
     loop {
@@ -506,6 +538,7 @@ fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, Error> {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
     let (canonical, _) = canonical_local_ca(pem)?;
     let certificate = pem_certificates(&canonical).remove(0);
@@ -522,6 +555,47 @@ pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
         }
     }
     Ok(false)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
+    use windows_sys::Win32::Security::Cryptography::{
+        CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateContext,
+        CertOpenSystemStoreW,
+    };
+
+    let (_, expected) = canonical_local_ca(pem)?;
+    let store_name: Vec<u16> = "ROOT".encode_utf16().chain(Some(0)).collect();
+    let store = unsafe { CertOpenSystemStoreW(0, store_name.as_ptr()) };
+    if store.is_null() {
+        return Err(Error::AdminRequest(format!(
+            "cannot open the Windows ROOT certificate store: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut previous = std::ptr::null();
+    let mut trusted = false;
+    loop {
+        let context = unsafe { CertEnumCertificatesInStore(store, previous) };
+        if context.is_null() {
+            break;
+        }
+        let certificate = unsafe {
+            std::slice::from_raw_parts(
+                (*context).pbCertEncoded,
+                usize::try_from((*context).cbCertEncoded).unwrap_or(0),
+            )
+        };
+        if certificate == expected {
+            trusted = true;
+            unsafe { CertFreeCertificateContext(context) };
+            break;
+        }
+        previous = context;
+    }
+    unsafe { CertCloseStore(store, 0) };
+    Ok(trusted)
 }
 
 pub(crate) fn canonical_local_ca(pem: &str) -> Result<(String, Vec<u8>), Error> {
@@ -1175,9 +1249,11 @@ mod tests {
         Client, Error, ServerOverrides, ServerSelection, discover_servers, normalize_upstream,
     };
     use serde_json::json;
+    #[cfg(unix)]
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
 
     #[test]
@@ -1202,25 +1278,34 @@ mod tests {
                 .trust_command(),
             "caddy trust --address 127.0.0.1:2020"
         );
-        assert_eq!(
-            Client::new("unix//run/caddy/admin.socket")
-                .unwrap()
-                .trust_command(),
-            "caddy trust --address unix//run/caddy/admin.socket"
-        );
-        assert_eq!(
-            Client::new("unix:///run/caddy/admin.socket")
-                .unwrap()
-                .trust_command(),
-            "caddy trust --address unix:///run/caddy/admin.socket"
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                Client::new("unix//run/caddy/admin.socket")
+                    .unwrap()
+                    .trust_command(),
+                "caddy trust --address unix//run/caddy/admin.socket"
+            );
+            assert_eq!(
+                Client::new("unix:///run/caddy/admin.socket")
+                    .unwrap()
+                    .trust_command(),
+                "caddy trust --address unix:///run/caddy/admin.socket"
+            );
+            assert!(matches!(
+                Client::new("unix/relative.socket"),
+                Err(Error::AdminUrl(_))
+            ));
+        }
+        #[cfg(windows)]
         assert!(matches!(
-            Client::new("unix/relative.socket"),
-            Err(Error::AdminUrl(_))
+            Client::new("unix/C:\\caddy\\admin.sock"),
+            Err(Error::AdminUrl(reason)) if reason.contains("not supported on Windows")
         ));
     }
 
     #[test]
+    #[cfg(unix)]
     fn admin_client_reads_chunked_config_over_unix_socket() {
         let root = std::env::temp_dir().join(format!(
             "nook-unix-test-{}-{}",
@@ -1256,6 +1341,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unix_permission_error_explains_persistent_caddy_listener_mode() {
         let error = super::unix_connect_error(
             std::path::Path::new("/run/caddy/admin.socket"),

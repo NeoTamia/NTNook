@@ -1,0 +1,122 @@
+#![cfg(windows)]
+
+use std::fs;
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use uuid::Uuid;
+
+struct CaddyChild(Child);
+
+impl Drop for CaddyChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn native_caddy_supports_status_and_owned_aliases() {
+    let root = std::env::temp_dir().join(format!("nook-windows-caddy-{}", Uuid::new_v4()));
+    let app_data = root.join("roaming");
+    let local_app_data = root.join("local");
+    let caddy_data = root.join("caddy-data");
+    fs::create_dir_all(app_data.join("Nook")).unwrap();
+    fs::create_dir_all(&local_app_data).unwrap();
+    fs::create_dir_all(&caddy_data).unwrap();
+
+    let admin_port = reserve_port();
+    let caddyfile = root.join("Caddyfile");
+    fs::write(
+        &caddyfile,
+        format!(
+            "{{\n\tadmin 127.0.0.1:{admin_port}\n}}\n\nhttps://localhost:443 {{\n\ttls internal\n\trespond 404\n}}\n\nhttp://localhost:80 {{\n\trespond 404\n}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        app_data.join("Nook/config.toml"),
+        format!("format_version = 1\ncaddy_admin = \"http://127.0.0.1:{admin_port}\"\n"),
+    )
+    .unwrap();
+
+    let child = Command::new("caddy.exe")
+        .args(["run", "--config"])
+        .arg(&caddyfile)
+        .env("XDG_DATA_HOME", &caddy_data)
+        .env("XDG_CONFIG_HOME", root.join("caddy-config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("caddy.exe must be available in PATH");
+    let mut caddy = CaddyChild(child);
+    wait_for_admin(admin_port, &mut caddy.0);
+
+    let status = nook(&app_data, &local_app_data, &["status"]);
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("caddy\tok"));
+
+    let set = nook(
+        &app_data,
+        &local_app_data,
+        &["alias", "set", "windows-e2e", "3000", "--no-tls"],
+    );
+    assert!(
+        set.status.success(),
+        "alias set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let remove = nook(
+        &app_data,
+        &local_app_data,
+        &["alias", "remove", "windows-e2e"],
+    );
+    assert!(
+        remove.status.success(),
+        "alias remove failed: {}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    drop(caddy);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn nook(app_data: &Path, local_app_data: &Path, arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_nook"))
+        .args(arguments)
+        .env("APPDATA", app_data)
+        .env("LOCALAPPDATA", local_app_data)
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+        .output()
+        .unwrap()
+}
+
+fn reserve_port() -> u16 {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn wait_for_admin(port: u16, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("Caddy exited before its Admin API was ready: {status}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("Caddy Admin API did not become ready on port {port}");
+}

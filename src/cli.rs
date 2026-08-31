@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -111,6 +110,7 @@ pub(crate) struct CompletionsArgs {
 pub(crate) enum CompletionShell {
     Bash,
     Zsh,
+    PowerShell,
 }
 
 #[derive(Debug, Args)]
@@ -473,15 +473,18 @@ fn write_project_config(path: &Path, contents: &[u8], force: bool) -> io::Result
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
         if force {
-            fs::rename(&temporary, path)?;
+            crate::platform::replace_file(&temporary, path)?;
         } else {
             fs::hard_link(&temporary, path)?;
             fs::remove_file(&temporary)?;
@@ -522,6 +525,7 @@ fn completions_command(arguments: CompletionsArgs, output: &mut impl Write) -> i
     let shell = match arguments.shell {
         CompletionShell::Bash => Shell::Bash,
         CompletionShell::Zsh => Shell::Zsh,
+        CompletionShell::PowerShell => Shell::PowerShell,
     };
     let mut command = Cli::command();
     command.set_bin_name("nook");
@@ -1016,15 +1020,18 @@ fn write_certificate(path: &Path, contents: &[u8], force: bool) -> io::Result<()
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
         if force {
-            fs::rename(&temporary, path)?;
+            crate::platform::replace_file(&temporary, path)?;
         } else {
             fs::hard_link(&temporary, path)?;
             fs::remove_file(&temporary)?;
@@ -1080,7 +1087,7 @@ fn run_command(
 fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<()> {
     let hostname = crate::config::normalize_hostname(&arguments.name)?;
     let store = state_store()?;
-    let mut system = crate::process::LinuxStopSystem;
+    let mut system = crate::process::NativeStopSystem;
     crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
     writeln!(output, "sent SIGTERM to {hostname}")?;
     Ok(())
@@ -1531,6 +1538,7 @@ fn looks_like_option(value: &OsStr) -> bool {
 mod tests {
     use std::ffi::OsString;
     use std::io::{self, Write};
+    #[cfg(unix)]
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use clap::error::ErrorKind;
@@ -1605,6 +1613,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preserves_non_utf8_child_arguments() {
         let argument = OsString::from_vec(vec![b'a', 0x80, b'b']);
         let cli = parse_from([
@@ -1683,6 +1692,7 @@ mod tests {
         for (shell, expected) in [
             ("bash", CompletionShell::Bash),
             ("zsh", CompletionShell::Zsh),
+            ("power-shell", CompletionShell::PowerShell),
         ] {
             let cli = parse(&["completions", shell]);
             let Command::Completions(arguments) = cli.command else {

@@ -306,10 +306,9 @@ impl Store {
             .and_then(|()| temporary.flush())
             .and_then(|()| temporary.sync_all())
             .map_err(|source| io_error(&temporary_path, source))?;
-        fs::rename(&temporary_path, &self.path).map_err(|source| io_error(&self.path, source))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| io_error(parent, source))?;
+        crate::platform::replace_file(&temporary_path, &self.path)
+            .map_err(|source| io_error(&self.path, source))?;
+        crate::platform::sync_directory(parent).map_err(|source| io_error(parent, source))?;
         Ok(result)
     }
 }
@@ -325,6 +324,7 @@ fn io_error(path: impl Into<PathBuf>, source: io::Error) -> Error {
     }
 }
 
+#[cfg(unix)]
 fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Error> {
     if let Some(directory) = get("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(directory).join("nook/state.json"));
@@ -333,6 +333,15 @@ fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Er
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".local/state/nook/state.json"))
+        .ok_or(Error::MissingHome)
+}
+
+#[cfg(windows)]
+fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Error> {
+    get("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|directory| directory.join("Nook/state.json"))
         .ok_or(Error::MissingHome)
 }
 
@@ -348,6 +357,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    #[cfg(unix)]
     fn state_path_prefers_xdg_and_falls_back_to_home() {
         let xdg =
             state_path_with(|key| (key == "XDG_STATE_HOME").then(|| OsString::from("/state")))
@@ -356,6 +366,19 @@ mod tests {
         let home =
             state_path_with(|key| (key == "HOME").then(|| OsString::from("/home/user"))).unwrap();
         assert_eq!(home, Path::new("/home/user/.local/state/nook/state.json"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn state_path_uses_local_app_data_on_windows() {
+        let path = state_path_with(|key| {
+            (key == "LOCALAPPDATA").then(|| OsString::from(r"C:\Users\dev\AppData\Local"))
+        })
+        .unwrap();
+        assert_eq!(
+            path,
+            Path::new(r"C:\Users\dev\AppData\Local\Nook\state.json")
+        );
     }
 
     #[test]

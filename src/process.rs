@@ -1,18 +1,27 @@
-//! Linux process identity, port allocation, signals, and readiness.
+//! Cross-platform process identity, port allocation, signals, and readiness.
 #![allow(dead_code)]
 
 use std::ffi::OsString;
 use std::fmt;
+#[cfg(unix)]
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 
 use crate::config::ResolvedRunConfig;
@@ -33,6 +42,61 @@ struct ProcIdentity {
     state: u8,
     pgid: i32,
     start_time_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSignal {
+    Interrupt,
+    Terminate,
+    Kill,
+}
+
+struct ForwardedSignals {
+    #[cfg(unix)]
+    inner: Signals,
+    #[cfg(windows)]
+    interrupted: Arc<AtomicBool>,
+}
+
+impl ForwardedSignals {
+    fn new() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Signals::new([SIGINT, SIGTERM]).map(|inner| Self { inner })
+        }
+        #[cfg(windows)]
+        {
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let signal = Arc::clone(&interrupted);
+            ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
+                .map_err(io::Error::other)?;
+            Ok(Self { interrupted })
+        }
+    }
+
+    fn pending(&mut self) -> Vec<ProcessSignal> {
+        #[cfg(unix)]
+        {
+            self.inner
+                .pending()
+                .map(|signal| {
+                    if signal == SIGINT {
+                        ProcessSignal::Interrupt
+                    } else {
+                        ProcessSignal::Terminate
+                    }
+                })
+                .collect()
+        }
+        #[cfg(windows)]
+        {
+            if self.interrupted.swap(false, Ordering::SeqCst) {
+                vec![ProcessSignal::Interrupt]
+            } else {
+                Vec::new()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -77,27 +141,32 @@ pub(crate) struct ManagedChild {
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) start_time_ticks: u64,
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
 }
 
 impl ManagedChild {
-    pub(crate) fn signal_group(&self, signal: i32) -> Result<(), Error> {
-        send_group_signal(self.pgid, signal).map_err(Error::Spawn)
+    pub(crate) fn signal(&self, signal: ProcessSignal) -> Result<(), Error> {
+        signal_managed_child(self, signal).map_err(Error::Spawn)
     }
 
     pub(crate) fn wait(&mut self) -> Result<i32, Error> {
-        let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(Error::Spawn)?;
+        let mut signals = ForwardedSignals::new().map_err(Error::Spawn)?;
         self.wait_with_signals(&mut signals)
     }
 
-    fn wait_with_signals(&mut self, signals: &mut Signals) -> Result<i32, Error> {
+    fn wait_with_signals(&mut self, signals: &mut ForwardedSignals) -> Result<i32, Error> {
         loop {
             for signal in signals.pending() {
-                let _ = send_group_signal(self.pgid, signal);
+                let _ = self.signal(signal);
             }
             if let Some(status) = self.child.try_wait().map_err(Error::Spawn)? {
+                #[cfg(unix)]
                 return Ok(status
                     .code()
                     .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
+                #[cfg(windows)]
+                return Ok(status.code().unwrap_or(1));
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -169,7 +238,7 @@ pub(crate) struct RunningChild {
     tls: bool,
     bind_address: IpAddr,
     readiness_warn_after: Duration,
-    signals: Signals,
+    signals: ForwardedSignals,
 }
 
 pub(crate) fn start_run(
@@ -186,7 +255,7 @@ fn start_run_with_hook(
     routes: &mut impl RouteBackend,
     after_release: impl FnOnce(u16),
 ) -> Result<RunningChild, RunError> {
-    let signals = Signals::new([SIGINT, SIGTERM]).map_err(Error::Spawn)?;
+    let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
     let _operations = store.lock_operations()?;
     let conflicts = store.mutate(|registry| {
         let aliases = registry
@@ -295,7 +364,7 @@ fn start_run_with_hook(
     let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     reservation.release();
     after_release(port);
-    let child = match spawn_child(&argv, &environment) {
+    let child = match spawn_managed_child(&argv, &environment, owner_id) {
         Ok(child) => child,
         Err(error) => {
             let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
@@ -371,7 +440,7 @@ impl RunningChild {
         let mut warned = false;
         loop {
             for signal in self.signals.pending() {
-                self.child.signal_group(signal)?;
+                self.child.signal(signal)?;
             }
             if TcpStream::connect_timeout(
                 &SocketAddr::new(self.bind_address, self.port),
@@ -471,18 +540,18 @@ impl std::error::Error for StopError {}
 
 pub(crate) trait StopSystem {
     fn liveness(&mut self, lease: &Lease) -> Liveness;
-    fn signal(&mut self, pgid: i32, signal: i32) -> io::Result<()>;
+    fn signal(&mut self, lease: &Lease, signal: ProcessSignal) -> io::Result<()>;
     fn sleep(&mut self, duration: Duration);
 }
 
-pub(crate) struct LinuxStopSystem;
+pub(crate) struct NativeStopSystem;
 
-impl StopSystem for LinuxStopSystem {
+impl StopSystem for NativeStopSystem {
     fn liveness(&mut self, lease: &Lease) -> Liveness {
         lease_liveness(lease)
     }
-    fn signal(&mut self, pgid: i32, signal: i32) -> io::Result<()> {
-        send_group_signal(pgid, signal)
+    fn signal(&mut self, lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
+        signal_lease(lease, signal)
     }
     fn sleep(&mut self, duration: Duration) {
         thread::sleep(duration);
@@ -514,7 +583,7 @@ pub(crate) fn stop_managed(
         return Err(StopError::Stale(hostname.to_owned()));
     }
     system
-        .signal(lease.pgid, libc::SIGTERM)
+        .signal(lease, ProcessSignal::Terminate)
         .map_err(|error| StopError::Signal(error.to_string()))?;
     if !force {
         return Ok(());
@@ -527,7 +596,7 @@ pub(crate) fn stop_managed(
     }
     if system.liveness(lease) == Liveness::Alive {
         system
-            .signal(lease.pgid, libc::SIGKILL)
+            .signal(lease, ProcessSignal::Kill)
             .map_err(|error| StopError::Signal(error.to_string()))?;
     }
     Ok(())
@@ -547,6 +616,16 @@ pub(crate) fn spawn_child(
     argv: &[OsString],
     environment: &[(OsString, OsString)],
 ) -> Result<ManagedChild, Error> {
+    spawn_managed_child(argv, environment, Uuid::new_v4())
+}
+
+fn spawn_managed_child(
+    argv: &[OsString],
+    environment: &[(OsString, OsString)],
+    lease_id: Uuid,
+) -> Result<ManagedChild, Error> {
+    #[cfg(unix)]
+    let _ = lease_id;
     let (program, arguments) = argv.split_first().ok_or(Error::EmptyCommand)?;
     let mut command = Command::new(program);
     command.args(arguments).envs(environment.iter().cloned());
@@ -554,24 +633,36 @@ pub(crate) fn spawn_child(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    configure_linux_child(&mut command);
+    configure_child(&mut command);
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
-    let Some(identity) = read_proc_identity(pid) else {
-        let _ = send_group_signal(pid as i32, libc::SIGKILL);
+    let Some(identity) = read_process_identity(pid) else {
+        let _ = child.kill();
         let _ = child.wait();
         return Err(Error::ProcessIdentity(pid));
+    };
+    #[cfg(windows)]
+    let job = match create_and_assign_job(&child, lease_id) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Spawn(error));
+        }
     };
     Ok(ManagedChild {
         child,
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
+        #[cfg(windows)]
+        job,
     })
 }
 
+#[cfg(unix)]
 #[allow(unsafe_code)]
-fn configure_linux_child(command: &mut Command) {
+fn configure_child(command: &mut Command) {
     // SAFETY: this closure runs after fork and before exec. It only invokes
     // async-signal-safe libc syscalls and constructs errors from errno.
     unsafe {
@@ -590,6 +681,15 @@ fn configure_linux_child(command: &mut Command) {
     }
 }
 
+#[cfg(windows)]
+fn configure_child(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn send_group_signal(pgid: i32, signal: i32) -> io::Result<()> {
     // SAFETY: pgid is read from /proc for the spawned child and negating it
@@ -601,10 +701,166 @@ fn send_group_signal(pgid: i32, signal: i32) -> io::Result<()> {
     }
 }
 
-fn read_proc_identity(pid: u32) -> Option<ProcIdentity> {
+#[cfg(unix)]
+fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Result<()> {
+    let signal = match signal {
+        ProcessSignal::Interrupt => libc::SIGINT,
+        ProcessSignal::Terminate => libc::SIGTERM,
+        ProcessSignal::Kill => libc::SIGKILL,
+    };
+    send_group_signal(child.pgid, signal)
+}
+
+#[cfg(unix)]
+fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
+    let signal = match signal {
+        ProcessSignal::Interrupt => libc::SIGINT,
+        ProcessSignal::Terminate => libc::SIGTERM,
+        ProcessSignal::Kill => libc::SIGKILL,
+    };
+    send_group_signal(lease.pgid, signal)
+}
+
+#[cfg(unix)]
+fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
     fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| parse_stat(&stat))
+}
+
+#[cfg(windows)]
+fn job_name(lease_id: Uuid) -> Vec<u16> {
+    format!("Local\\Nook-{lease_id}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect()
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn create_and_assign_job(
+    child: &Child,
+    lease_id: Uuid,
+) -> io::Result<windows_sys::Win32::Foundation::HANDLE> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let name = job_name(lease_id);
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), name.as_ptr()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const information).cast(),
+            u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .expect("job information size fits u32"),
+        )
+    };
+    let assigned = configured != 0
+        && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } != 0;
+    if !assigned {
+        let error = io::Error::last_os_error();
+        unsafe { CloseHandle(job) };
+        return Err(error);
+    }
+    Ok(job)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+    let succeeded = match signal {
+        ProcessSignal::Interrupt | ProcessSignal::Terminate => unsafe {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.pid)
+        },
+        ProcessSignal::Kill => unsafe { TerminateJobObject(child.job, 1) },
+    };
+    if succeeded == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::JobObjects::{OpenJobObjectW, TerminateJobObject};
+    use windows_sys::Win32::System::SystemServices::JOB_OBJECT_TERMINATE;
+
+    match signal {
+        ProcessSignal::Interrupt | ProcessSignal::Terminate => {
+            if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, lease.pid) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        ProcessSignal::Kill => {
+            let name = job_name(lease.id);
+            let job = unsafe { OpenJobObjectW(JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
+            if job.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let result = unsafe { TerminateJobObject(job, 1) };
+            let error = (result == 0).then(io::Error::last_os_error);
+            unsafe { CloseHandle(job) };
+            error.map_or(Ok(()), Err)
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
+    use std::mem::zeroed;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut creation: FILETIME = unsafe { zeroed() };
+    let mut exit: FILETIME = unsafe { zeroed() };
+    let mut kernel: FILETIME = unsafe { zeroed() };
+    let mut user: FILETIME = unsafe { zeroed() };
+    let result =
+        unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    unsafe { CloseHandle(process) };
+    let pgid = i32::try_from(pid).ok()?;
+    (result != 0).then(|| ProcIdentity {
+        state: b'R',
+        pgid,
+        start_time_ticks: u64::from(creation.dwLowDateTime)
+            | (u64::from(creation.dwHighDateTime) << 32),
+    })
+}
+
+#[cfg(windows)]
+impl Drop for ManagedChild {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
+    }
 }
 
 pub(crate) struct PortReservation {
@@ -674,6 +930,11 @@ fn bind(address: IpAddr, port: u16) -> io::Result<TcpListener> {
 
 pub(crate) fn substitute_port(arguments: &[OsString], port: u16) -> Vec<OsString> {
     let replacement = port.to_string();
+    substitute_port_platform(arguments, &replacement)
+}
+
+#[cfg(unix)]
+fn substitute_port_platform(arguments: &[OsString], replacement: &str) -> Vec<OsString> {
     arguments
         .iter()
         .map(|argument| {
@@ -686,6 +947,38 @@ pub(crate) fn substitute_port(arguments: &[OsString], port: u16) -> Vec<OsString
         .collect()
 }
 
+#[cfg(windows)]
+fn substitute_port_platform(arguments: &[OsString], replacement: &str) -> Vec<OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let needle: Vec<u16> = "{port}".encode_utf16().collect();
+    let replacement: Vec<u16> = replacement.encode_utf16().collect();
+    arguments
+        .iter()
+        .map(|argument| {
+            let input: Vec<u16> = argument.encode_wide().collect();
+            OsString::from_wide(&replace_wide(&input, &needle, &replacement))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn replace_wide(input: &[u16], needle: &[u16], replacement: &[u16]) -> Vec<u16> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(position) = rest
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        output.extend_from_slice(&rest[..position]);
+        output.extend_from_slice(replacement);
+        rest = &rest[position + needle.len()..];
+    }
+    output.extend_from_slice(rest);
+    output
+}
+
+#[cfg(unix)]
 fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut rest = input;
@@ -723,6 +1016,7 @@ pub(crate) fn child_environment(
     ]
 }
 
+#[cfg(unix)]
 pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     match fs::read_to_string(format!("/proc/{}/stat", lease.pid)) {
         Ok(stat) => match parse_stat(&stat) {
@@ -736,6 +1030,43 @@ pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     }
 }
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
+
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            lease.pid,
+        )
+    };
+    if process.is_null() {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(87) | Some(1168) => Liveness::Dead,
+            _ => Liveness::Indeterminate,
+        };
+    }
+    let wait = unsafe { WaitForSingleObject(process, 0) };
+    unsafe { CloseHandle(process) };
+    if wait != WAIT_TIMEOUT {
+        return Liveness::Dead;
+    }
+    match read_process_identity(lease.pid) {
+        Some(identity) if identity.start_time_ticks == lease.process_start_time_ticks => {
+            Liveness::Alive
+        }
+        Some(_) => Liveness::Dead,
+        None => Liveness::Indeterminate,
+    }
+}
+
+#[cfg(unix)]
 fn identity_liveness(identity: ProcIdentity, pgid: i32, start_time_ticks: u64) -> Liveness {
     if matches!(identity.state, b'Z' | b'X')
         || identity.pgid != pgid
@@ -747,6 +1078,7 @@ fn identity_liveness(identity: ProcIdentity, pgid: i32, start_time_ticks: u64) -
     }
 }
 
+#[cfg(unix)]
 fn parse_stat(stat: &str) -> Option<ProcIdentity> {
     let command_end = stat.rfind(')')?;
     let fields: Vec<_> = stat.get(command_end + 1..)?.split_whitespace().collect();
@@ -757,7 +1089,7 @@ fn parse_stat(stat: &str) -> Option<ProcIdentity> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -765,9 +1097,9 @@ mod tests {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::{
-        Error, Liveness, ProcIdentity, StopError, StopSystem, child_environment, identity_liveness,
-        parse_stat, reserve_port, spawn_child, start_run, start_run_with_hook, stop_managed,
-        substitute_port,
+        Error, Liveness, ProcIdentity, ProcessSignal, StopError, StopSystem, child_environment,
+        identity_liveness, parse_stat, reserve_port, spawn_child, start_run, start_run_with_hook,
+        stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -943,7 +1275,7 @@ mod tests {
     fn group_signal_returns_conventional_signal_exit_code() {
         let mut child =
             spawn_child(&[OsString::from("/bin/sleep"), OsString::from("10")], &[]).unwrap();
-        child.signal_group(libc::SIGTERM).unwrap();
+        child.signal(ProcessSignal::Terminate).unwrap();
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGTERM);
     }
 
@@ -960,7 +1292,7 @@ mod tests {
         );
         assert_eq!(routes.owners.get("api.localhost"), Some(&running.lease_id));
         assert!(registry.pending_operations.is_empty());
-        running.child.signal_group(libc::SIGTERM).unwrap();
+        running.child.signal(ProcessSignal::Terminate).unwrap();
         assert_eq!(running.finish(&store, &mut routes).unwrap().exit_code, 143);
         assert!(
             decode(&std::fs::read(&path).unwrap())
@@ -986,7 +1318,7 @@ mod tests {
         );
         let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(registry.leases[&running.lease_id].state, LeaseState::Ready);
-        running.child.signal_group(libc::SIGTERM).unwrap();
+        running.child.signal(ProcessSignal::Terminate).unwrap();
         running.child.wait().unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1014,7 +1346,7 @@ mod tests {
             start_run(&config, &store, &mut routes),
             Err(super::RunError::Conflict(hostname)) if hostname == "api.localhost"
         ));
-        first.child.signal_group(libc::SIGTERM).unwrap();
+        first.child.signal(ProcessSignal::Terminate).unwrap();
         first.finish(&store, &mut routes).unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1044,7 +1376,7 @@ mod tests {
         assert!(!registry.leases.contains_key(&first.lease_id));
         assert!(registry.leases.contains_key(&replacement.lease_id));
 
-        first.child.signal_group(libc::SIGTERM).unwrap();
+        first.child.signal(ProcessSignal::Terminate).unwrap();
         first.finish(&store, &mut routes).unwrap();
         assert_eq!(routes.owners["api.localhost"], replacement.lease_id);
         assert!(
@@ -1053,7 +1385,7 @@ mod tests {
                 .leases
                 .contains_key(&replacement.lease_id)
         );
-        replacement.child.signal_group(libc::SIGTERM).unwrap();
+        replacement.child.signal(ProcessSignal::Terminate).unwrap();
         replacement.finish(&store, &mut routes).unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1150,7 +1482,7 @@ mod tests {
     #[derive(Default)]
     struct ControlledStop {
         alive_checks: usize,
-        signals: Vec<i32>,
+        signals: Vec<ProcessSignal>,
         sleeps: usize,
         stale: bool,
     }
@@ -1164,7 +1496,11 @@ mod tests {
                 Liveness::Alive
             }
         }
-        fn signal(&mut self, _pgid: i32, signal: i32) -> std::io::Result<()> {
+        fn signal(
+            &mut self,
+            _lease: &crate::state::Lease,
+            signal: ProcessSignal,
+        ) -> std::io::Result<()> {
             self.signals.push(signal);
             Ok(())
         }
@@ -1181,9 +1517,12 @@ mod tests {
         let mut running = start_run(&config, &store, &mut routes).unwrap();
         let mut system = ControlledStop::default();
         stop_managed(&store, "api.localhost", true, &mut system).unwrap();
-        assert_eq!(system.signals, [libc::SIGTERM, libc::SIGKILL]);
+        assert_eq!(
+            system.signals,
+            [ProcessSignal::Terminate, ProcessSignal::Kill]
+        );
         assert_eq!(system.sleeps, 40);
-        running.child.signal_group(libc::SIGTERM).unwrap();
+        running.child.signal(ProcessSignal::Terminate).unwrap();
         running.child.wait().unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1200,7 +1539,7 @@ mod tests {
         };
         assert!(stop_managed(&store, "api.localhost", true, &mut system).is_err());
         assert!(system.signals.is_empty());
-        running.child.signal_group(libc::SIGTERM).unwrap();
+        running.child.signal(ProcessSignal::Terminate).unwrap();
         running.child.wait().unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1235,5 +1574,97 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("nook-run-{}", Uuid::new_v4()));
         let path = directory.join("state.json");
         (Store::new(path.clone()), path)
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    use super::{
+        Liveness, ProcessSignal, lease_liveness, read_process_identity, spawn_child,
+        substitute_port,
+    };
+    use crate::state::{Lease, LeaseState, Scheme};
+    use uuid::Uuid;
+
+    #[test]
+    fn substitution_preserves_unpaired_utf16() {
+        let argument = OsString::from_wide(&[
+            0xd800,
+            b'-' as u16,
+            b'{' as u16,
+            b'p' as u16,
+            b'o' as u16,
+            b'r' as u16,
+            b't' as u16,
+            b'}' as u16,
+        ]);
+        let replaced = substitute_port(&[argument], 4321);
+        assert_eq!(
+            replaced[0].encode_wide().collect::<Vec<_>>(),
+            [
+                0xd800,
+                b'-' as u16,
+                b'4' as u16,
+                b'3' as u16,
+                b'2' as u16,
+                b'1' as u16
+            ]
+        );
+    }
+
+    #[test]
+    fn child_runs_in_a_named_job_and_preserves_exit_code() {
+        let mut child = spawn_child(
+            &[
+                OsString::from("cmd.exe"),
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from("exit 7"),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(child.pgid, child.pid as i32);
+        assert!(child.start_time_ticks > 0);
+        assert_eq!(child.wait().unwrap(), 7);
+    }
+
+    #[test]
+    fn force_terminates_the_managed_job() {
+        let mut child = spawn_child(
+            &[
+                OsString::from("cmd.exe"),
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from("ping -n 30 127.0.0.1 >NUL"),
+            ],
+            &[],
+        )
+        .unwrap();
+        child.signal(ProcessSignal::Kill).unwrap();
+        assert_ne!(child.wait().unwrap(), 0);
+    }
+
+    #[test]
+    fn process_creation_time_prevents_pid_reuse() {
+        let pid = std::process::id();
+        let identity = read_process_identity(pid).unwrap();
+        let mut lease = Lease {
+            id: Uuid::new_v4(),
+            hostname: "test.localhost".into(),
+            target: "http://127.0.0.1:3000".into(),
+            scheme: Scheme::Http,
+            tls: false,
+            pid,
+            pgid: identity.pgid,
+            process_start_time_ticks: identity.start_time_ticks,
+            state: LeaseState::Ready,
+        };
+        assert_eq!(lease_liveness(&lease), Liveness::Alive);
+        lease.process_start_time_ticks = lease.process_start_time_ticks.saturating_add(1);
+        assert_eq!(lease_liveness(&lease), Liveness::Dead);
     }
 }
