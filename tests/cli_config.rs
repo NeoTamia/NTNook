@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 use uuid::Uuid;
 
 #[test]
+#[cfg(unix)]
 fn config_commands_create_show_update_and_protect_the_global_file() {
     let directory = std::env::temp_dir().join(format!("nook-cli-config-{}", Uuid::new_v4()));
     let config_home = directory.join("config");
@@ -61,6 +62,26 @@ fn config_commands_create_show_update_and_protect_the_global_file() {
     assert!(shown.contains("run_bind_address = \"127.0.0.2\""));
     assert!(shown.contains("caddy_admin = \"unix//run/caddy/admin.socket\""));
 
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_rejects_unix_admin_sockets() {
+    let directory = std::env::temp_dir().join(format!("nook-cli-config-{}", Uuid::new_v4()));
+    let config_home = directory.join("config");
+    let state_home = directory.join("state");
+
+    let result = nook(
+        &config_home,
+        &state_home,
+        &["config", "init", "--caddy-socket", r"C:\caddy\admin.sock"],
+    );
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("Unix sockets are not supported on Windows")
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 
