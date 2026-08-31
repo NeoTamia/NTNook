@@ -338,6 +338,9 @@ fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Er
 
 #[cfg(windows)]
 fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Error> {
+    if let Some(directory) = get("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(directory).join("nook/state.json"));
+    }
     get("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

@@ -31,6 +31,17 @@ fn completion_scripts_are_generated_without_configuration_or_caddy() {
                 "update",
             ][..],
         ),
+        (
+            "power-shell",
+            &[
+                "Register-ArgumentCompleter",
+                "--readiness-warn-after",
+                "--local",
+                "--print",
+                "init",
+                "update",
+            ][..],
+        ),
     ] {
         let output = nook(&[
             "--caddy-socket",
@@ -63,7 +74,7 @@ fn completion_help_lists_supported_shells_and_rejects_others() {
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("Usage: nook completions <SHELL>"));
-    assert!(help.contains("[possible values: bash, zsh]"));
+    assert!(help.contains("[possible values: bash, zsh, power-shell]"));
 
     let rejected = nook(&["completions", "fish"]);
     assert!(!rejected.status.success());

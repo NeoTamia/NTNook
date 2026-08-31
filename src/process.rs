@@ -13,7 +13,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 #[cfg(windows)]
-use std::sync::Arc;
+use std::sync::OnceLock;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -54,9 +54,12 @@ pub(crate) enum ProcessSignal {
 struct ForwardedSignals {
     #[cfg(unix)]
     inner: Signals,
-    #[cfg(windows)]
-    interrupted: Arc<AtomicBool>,
 }
+
+#[cfg(windows)]
+static WINDOWS_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+static WINDOWS_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 impl ForwardedSignals {
     fn new() -> io::Result<Self> {
@@ -66,11 +69,14 @@ impl ForwardedSignals {
         }
         #[cfg(windows)]
         {
-            let interrupted = Arc::new(AtomicBool::new(false));
-            let signal = Arc::clone(&interrupted);
-            ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
-                .map_err(io::Error::other)?;
-            Ok(Self { interrupted })
+            WINDOWS_SIGNAL_HANDLER
+                .get_or_init(|| {
+                    ctrlc::set_handler(|| WINDOWS_INTERRUPTED.store(true, Ordering::SeqCst))
+                        .map_err(|error| error.to_string())
+                })
+                .as_ref()
+                .map_err(|error| io::Error::other(error.clone()))?;
+            Ok(Self {})
         }
     }
 
@@ -90,7 +96,7 @@ impl ForwardedSignals {
         }
         #[cfg(windows)]
         {
-            if self.interrupted.swap(false, Ordering::SeqCst) {
+            if WINDOWS_INTERRUPTED.swap(false, Ordering::SeqCst) {
                 vec![ProcessSignal::Interrupt]
             } else {
                 Vec::new()

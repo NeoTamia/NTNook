@@ -1,8 +1,11 @@
 # Nook 0.1.0 — MVP release notes
 
-This release provides a single Linux `nook` binary. The GitHub Release contains the static
-`nook-x86_64-unknown-linux-musl.tar.xz` archive, its SHA-256 checksum, and the
-`nook-installer.sh` installer. Build-ready sources are also published on crates.io as `ntnook`.
+GitHub Releases provide a static Linux archive and a native Windows archive:
+
+- `nook-x86_64-unknown-linux-musl.tar.xz`, its SHA-256 checksum, and `nook-installer.sh`;
+- `nook-x86_64-pc-windows-msvc.zip`, its SHA-256 checksum, and `nook-installer.ps1`.
+
+Build-ready sources are also published on crates.io as `ntnook`.
 
 ## crates.io initialization for maintainers
 
@@ -52,22 +55,29 @@ the npm CLI's `publish` and `stage publish` commands.
 - persistent aliases to a port or HTTP(S) URL;
 - atomic, ownership-aware mutation of routes in an existing Caddy instance;
 - `list`, `status`, `stop`, `prune`, and `update` commands, with recovery after interruption;
-- static Bash and Zsh completion generation with `nook completions`;
+- static Bash, Zsh, and PowerShell completion generation with `nook completions`;
 - TLS verification for HTTPS upstreams and diagnostics for Caddy's local CA.
 
 ## Platform and dependencies
 
-- Linux x86-64;
+- Linux x86-64 and Windows x86-64;
 - Caddy `2.11.x`, native or through the official Docker image, started separately with an accessible Admin API;
 - unambiguous Caddy servers on `:443` and, for `--no-tls`, on `:80`.
 
-The reproducible build uses Rust `1.97.1` and `Cargo.lock`. OpenSSL, Python 3, curl with HTTP/2, util-linux, and iproute2 are required only by the integration tests, not by the binary.
+Native `caddy.exe` over its loopback TCP Admin API is the primary Windows path. Docker Desktop
+with the official image is a supported secondary path.
+
+The reproducible build uses Rust `1.98.0` and `Cargo.lock`. OpenSSL, Python 3, curl with HTTP/2,
+util-linux, and iproute2 are required only by the Linux integration tests, not by the binary.
 
 ## Out of scope
 
-The binary provides no daemon, IPC, local socket, embedded server, implicit shell, `/etc/hosts` modification, Caddy installation or startup, automatic CA installation, Docker orchestration, LAN/mDNS, multiple services, native Windows/macOS support, Tailscale Serve/Funnel, or public exposure.
+The binary provides no daemon, IPC or embedded server, implicit shell, hosts-file modification,
+Caddy installation or startup, automatic CA installation, Docker orchestration, LAN/mDNS,
+multiple services, native macOS support, Tailscale Serve/Funnel, or public exposure.
 
 The repository provides a supported official Caddy Compose setup on Linux and tested compatibility with caddy-docker-proxy. `nook ca export` retrieves the public CA without a Caddy executable on the host. See `docs/DOCKER.md`.
 
-Before publication, the artifact must come from a green CI run. After downloading it, verify it
-from its directory with `sha256sum --check nook-x86_64-unknown-linux-musl.tar.xz.sha256`.
+Before publication, artifacts must come from green Linux and Windows CI runs. Verify the Linux
+archive with `sha256sum --check nook-x86_64-unknown-linux-musl.tar.xz.sha256`; the PowerShell
+installer verifies the Windows archive automatically with `Get-FileHash`.

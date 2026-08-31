@@ -628,6 +628,9 @@ fn cache_path() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn cache_path() -> Option<PathBuf> {
+    if let Some(directory) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(directory).join("nook/update-check.json"));
+    }
     env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .map(|directory| PathBuf::from(directory).join("Nook/cache/update-check.json"))

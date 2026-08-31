@@ -289,6 +289,13 @@ fn write_global_at(path: &Path, config: &GlobalConfig, force: bool) -> Result<()
 }
 
 fn validate_global(config: &GlobalConfig) -> Result<(), Error> {
+    #[cfg(windows)]
+    if config.caddy_admin.starts_with("unix/") {
+        return Err(Error::InvalidGlobal {
+            field: "caddy_admin",
+            reason: "Unix sockets are not supported on Windows; use an HTTP(S) Admin API URL such as http://127.0.0.1:2019".into(),
+        });
+    }
     let valid_ip = config.caddy_loopback_host.parse::<IpAddr>().is_ok();
     if !valid_ip
         && (config.caddy_loopback_host.is_empty()
@@ -580,6 +587,9 @@ fn global_config_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<Pat
 
 #[cfg(windows)]
 fn global_config_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Error> {
+    if let Some(directory) = get("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(directory).join("nook/config.toml"));
+    }
     get("APPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
