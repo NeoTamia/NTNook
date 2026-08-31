@@ -699,12 +699,12 @@ mod tests {
         assert!(write_global_at(&path, &config, false).is_err());
 
         let mut replacement = GlobalConfig::default();
-        replacement.set_caddy_admin("unix//run/caddy/admin.socket".into());
+        replacement.set_caddy_admin("http://127.0.0.1:2020".into());
         write_global_at(&path, &replacement, true).unwrap();
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("unix//run/caddy/admin.socket")
+                .contains("http://127.0.0.1:2020")
         );
         fs::remove_dir_all(directory).unwrap();
     }
