@@ -9,6 +9,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::cli::RunArgs;
@@ -472,8 +475,8 @@ fn resolve_hostname(
 ) -> Result<String, Error> {
     let inferred = git_root
         .and_then(Path::file_name)
-        .or_else(|| current_directory.file_name())
-        .and_then(|name| name.to_str());
+        .and_then(|name| name.to_str())
+        .or_else(|| current_directory.file_name().and_then(|name| name.to_str()));
     normalize_hostname(
         cli_name
             .or(project_name)
@@ -569,7 +572,22 @@ fn find_git_root(current_directory: &Path) -> Option<PathBuf> {
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    git_root_from_output(output.stdout)
+}
+
+#[cfg(unix)]
+fn git_root_from_output(mut output: Vec<u8>) -> Option<PathBuf> {
+    while output.last().is_some_and(u8::is_ascii_whitespace) {
+        output.pop();
+    }
+    (!output.is_empty()).then(|| PathBuf::from(OsString::from_vec(output)))
+}
+
+#[cfg(windows)]
+fn git_root_from_output(output: Vec<u8>) -> Option<PathBuf> {
+    let path = String::from_utf8_lossy(&output)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
@@ -987,6 +1005,19 @@ mod tests {
         );
         assert_eq!(
             resolve_hostname(None, None, None, Path::new("/work/current")).unwrap(),
+            "current.localhost"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_git_root_falls_back_to_the_current_directory_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let git_root = super::git_root_from_output(b"/roots/git-\xff\n".to_vec()).unwrap();
+        assert_eq!(git_root.as_os_str().as_bytes(), b"/roots/git-\xff");
+        assert_eq!(
+            resolve_hostname(None, None, Some(&git_root), Path::new("/work/current")).unwrap(),
             "current.localhost"
         );
     }
