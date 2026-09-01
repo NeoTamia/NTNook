@@ -748,14 +748,23 @@ fn windows_batch_command_line(program: &std::ffi::OsStr, arguments: &[OsString])
         if index != 0 {
             command_line.push(b' ' as u16);
         }
-        command_line.push(b'"' as u16);
+        let quoted = index == 0
+            || argument.encode_wide().next().is_none()
+            || argument
+                .encode_wide()
+                .any(|unit| unit <= u16::from(u8::MAX) && b" \t\"&|<>^()".contains(&(unit as u8)));
+        if quoted {
+            command_line.push(b'"' as u16);
+        }
         for unit in argument.encode_wide() {
             command_line.push(unit);
             if unit == b'"' as u16 {
                 command_line.push(unit);
             }
         }
-        command_line.push(b'"' as u16);
+        if quoted {
+            command_line.push(b'"' as u16);
+        }
     }
     command_line.push(b'"' as u16);
     OsString::from_wide(&command_line)
@@ -1810,7 +1819,11 @@ mod windows_tests {
     fn path_resolves_cmd_package_shims() {
         let directory = std::env::temp_dir().join(format!("nook command shim {}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("nook-test-shim.cmd"), "@exit /b %1\r\n").unwrap();
+        std::fs::write(
+            directory.join("nook-test-shim.cmd"),
+            "@if \"%~1\"==\"7\" (exit /b 7) else (exit /b 9)\r\n",
+        )
+        .unwrap();
         let mut child = spawn_child(
             &[OsString::from("nook-test-shim"), OsString::from("7")],
             &[
