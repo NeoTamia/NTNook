@@ -8,7 +8,7 @@ use std::fmt;
 #[cfg(unix)]
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
@@ -451,7 +451,7 @@ impl RunningChild {
                 self.child.signal(signal)?;
             }
             if TcpStream::connect_timeout(
-                &SocketAddr::new(self.bind_address, self.port),
+                &SocketAddr::new(readiness_probe_address(self.bind_address), self.port),
                 Duration::from_millis(100),
             )
             .is_ok()
@@ -509,6 +509,14 @@ impl RunningChild {
             exit_code,
             warnings,
         })
+    }
+}
+
+fn readiness_probe_address(bind_address: IpAddr) -> IpAddr {
+    match bind_address {
+        IpAddr::V4(address) if address.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(address) if address.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        address => address,
     }
 }
 
@@ -1276,13 +1284,13 @@ fn parse_stat(stat: &str) -> Option<ProcIdentity> {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, TcpListener};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use super::{
         Error, Liveness, ProcIdentity, ProcessSignal, StopError, StopSystem, child_environment,
-        identity_liveness, parse_stat, reserve_port, spawn_child, start_run, start_run_with_hook,
-        stop_managed, substitute_port,
+        identity_liveness, parse_stat, readiness_probe_address, reserve_port, spawn_child,
+        start_run, start_run_with_hook, stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -1319,6 +1327,20 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn readiness_uses_loopback_for_wildcard_bind_addresses() {
+        assert_eq!(
+            readiness_probe_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            readiness_probe_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        let explicit = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        assert_eq!(readiness_probe_address(explicit), explicit);
     }
 
     #[test]
