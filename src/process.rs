@@ -638,9 +638,15 @@ fn spawn_managed_child(
     let program = program.clone();
     let arguments = arguments.to_vec();
     #[cfg(windows)]
-    let (program, arguments) = prepare_windows_command(program, arguments, environment);
+    let (program, arguments, raw_argument) =
+        prepare_windows_command(program, arguments, environment);
     let mut command = Command::new(program);
     command.args(arguments).envs(environment.iter().cloned());
+    #[cfg(windows)]
+    if let Some(raw_argument) = raw_argument {
+        use std::os::windows::process::CommandExt;
+        command.raw_arg(raw_argument);
+    }
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -704,9 +710,9 @@ fn prepare_windows_command(
     program: OsString,
     arguments: Vec<OsString>,
     environment: &[(OsString, OsString)],
-) -> (OsString, Vec<OsString>) {
+) -> (OsString, Vec<OsString>, Option<OsString>) {
     let Some(resolved) = resolve_windows_program(&program, environment) else {
-        return (program, arguments);
+        return (program, arguments, None);
     };
     let is_batch = resolved
         .extension()
@@ -715,19 +721,44 @@ fn prepare_windows_command(
             extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
         });
     if !is_batch {
-        return (resolved.into_os_string(), arguments);
+        return (resolved.into_os_string(), arguments, None);
     }
 
     let interpreter =
         effective_windows_env(environment, "COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
-    let mut shell_arguments = vec![
+    let shell_arguments = vec![
         OsString::from("/D"),
+        OsString::from("/V:OFF"),
         OsString::from("/S"),
         OsString::from("/C"),
-        resolved.into_os_string(),
     ];
-    shell_arguments.extend(arguments);
-    (interpreter, shell_arguments)
+    let command_line = windows_batch_command_line(resolved.as_os_str(), &arguments);
+    (interpreter, shell_arguments, Some(command_line))
+}
+
+#[cfg(windows)]
+fn windows_batch_command_line(program: &std::ffi::OsStr, arguments: &[OsString]) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let mut command_line = vec![b'"' as u16];
+    for (index, argument) in std::iter::once(program)
+        .chain(arguments.iter().map(OsString::as_os_str))
+        .enumerate()
+    {
+        if index != 0 {
+            command_line.push(b' ' as u16);
+        }
+        command_line.push(b'"' as u16);
+        for unit in argument.encode_wide() {
+            command_line.push(unit);
+            if unit == b'"' as u16 {
+                command_line.push(unit);
+            }
+        }
+        command_line.push(b'"' as u16);
+    }
+    command_line.push(b'"' as u16);
+    OsString::from_wide(&command_line)
 }
 
 #[cfg(windows)]
