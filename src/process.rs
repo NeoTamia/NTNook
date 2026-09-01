@@ -579,7 +579,7 @@ pub(crate) fn stop_managed(
     hostname: &str,
     force: bool,
     system: &mut impl StopSystem,
-) -> Result<(), StopError> {
+) -> Result<ProcessSignal, StopError> {
     let _operations = store
         .lock_operations()
         .map_err(|error| StopError::State(error.to_string()))?;
@@ -603,16 +603,16 @@ pub(crate) fn stop_managed(
             system
                 .signal(lease, ProcessSignal::Kill)
                 .map_err(|kill_error| StopError::Signal(kill_error.to_string()))?;
-            return Ok(());
+            return Ok(ProcessSignal::Kill);
         }
         return Err(StopError::Signal(error.to_string()));
     }
     if !force {
-        return Ok(());
+        return Ok(ProcessSignal::Terminate);
     }
     for _ in 0..40 {
         if system.liveness(lease) != Liveness::Alive {
-            return Ok(());
+            return Ok(ProcessSignal::Terminate);
         }
         system.sleep(Duration::from_millis(50));
     }
@@ -620,8 +620,9 @@ pub(crate) fn stop_managed(
         system
             .signal(lease, ProcessSignal::Kill)
             .map_err(|error| StopError::Signal(error.to_string()))?;
+        return Ok(ProcessSignal::Kill);
     }
-    Ok(())
+    Ok(ProcessSignal::Terminate)
 }
 
 fn replace_operation(registry: &mut crate::state::Registry, id: Uuid, kind: PendingOperationKind) {
@@ -1800,7 +1801,8 @@ mod tests {
         let mut routes = Routes::default();
         let mut running = start_run(&config, &store, &mut routes).unwrap();
         let mut system = ControlledStop::default();
-        stop_managed(&store, "api.localhost", true, &mut system).unwrap();
+        let signal = stop_managed(&store, "api.localhost", true, &mut system).unwrap();
+        assert_eq!(signal, ProcessSignal::Kill);
         assert_eq!(
             system.signals,
             [ProcessSignal::Terminate, ProcessSignal::Kill]
@@ -1821,7 +1823,8 @@ mod tests {
             terminate_fails: true,
             ..ControlledStop::default()
         };
-        stop_managed(&store, "api.localhost", true, &mut system).unwrap();
+        let signal = stop_managed(&store, "api.localhost", true, &mut system).unwrap();
+        assert_eq!(signal, ProcessSignal::Kill);
         assert_eq!(
             system.signals,
             [ProcessSignal::Terminate, ProcessSignal::Kill]

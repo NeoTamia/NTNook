@@ -119,27 +119,40 @@ function Get-NookPathIdentity([string]$path) {
 }
 $destination = [IO.Path]::GetFullPath($env:NOOK_INSTALL_DESTINATION)
 $identity = Get-NookPathIdentity $destination
-$blockers = @(
-    Get-Process -ErrorAction SilentlyContinue | Where-Object {
-        if ($_.Id -eq $PID) { return $false }
-        try {
-            $null -ne $_.Path -and
-                [string]::Equals(
-                    (Get-NookPathIdentity $_.Path),
-                    $identity,
-                    [StringComparison]::OrdinalIgnoreCase
-                )
-        } catch {
-            $false
+function Get-NookInstallBlockers {
+    @(
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            if ($_.Id -eq $PID) { return $false }
+            try {
+                $null -ne $_.Path -and
+                    [string]::Equals(
+                        (Get-NookPathIdentity $_.Path),
+                        $identity,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )
+            } catch {
+                $false
+            }
         }
+    )
+}
+$unexplainedFailures = 0
+while ($true) {
+    $blockers = @(Get-NookInstallBlockers)
+    if ($blockers.Count -gt 0) { $blockers | Wait-Process }
+    try {
+        Move-Item -Force -LiteralPath $env:NOOK_INSTALL_SOURCE -Destination $destination
+        break
+    } catch {
+        $moveError = $_
+        if ((Get-NookInstallBlockers).Count -gt 0) { continue }
+        $unexplainedFailures += 1
+        if ($unexplainedFailures -ge 3) {
+            Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $env:NOOK_INSTALL_SOURCE
+            throw $moveError
+        }
+        Start-Sleep -Milliseconds 50
     }
-)
-if ($blockers.Count -gt 0) { $blockers | Wait-Process }
-try {
-    Move-Item -Force -LiteralPath $env:NOOK_INSTALL_SOURCE -Destination $destination
-} catch {
-    Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $env:NOOK_INSTALL_SOURCE
-    throw
 }
 '@
         $encodedReplacement = [Convert]::ToBase64String(

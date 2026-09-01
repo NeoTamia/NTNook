@@ -1088,11 +1088,19 @@ fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<(
     let hostname = crate::config::normalize_hostname(&arguments.name)?;
     let store = state_store()?;
     let mut system = crate::process::NativeStopSystem;
-    crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
-    #[cfg(unix)]
-    writeln!(output, "sent SIGTERM to {hostname}")?;
-    #[cfg(windows)]
-    writeln!(output, "sent CTRL_BREAK to {hostname}")?;
+    let signal = crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
+    let signal_name = match signal {
+        #[cfg(unix)]
+        crate::process::ProcessSignal::Terminate => "SIGTERM",
+        #[cfg(unix)]
+        crate::process::ProcessSignal::Kill => "SIGKILL",
+        #[cfg(windows)]
+        crate::process::ProcessSignal::Terminate => "CTRL_BREAK",
+        #[cfg(windows)]
+        crate::process::ProcessSignal::Kill => "forced termination",
+        crate::process::ProcessSignal::Interrupt => "interrupt",
+    };
+    writeln!(output, "sent {signal_name} to {hostname}")?;
     Ok(())
 }
 

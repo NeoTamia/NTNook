@@ -474,31 +474,46 @@ function Get-NookPathIdentity([string]$path) {
 }
 $destination = [IO.Path]::GetFullPath($env:NOOK_UPDATE_DESTINATION)
 $destinationIdentity = Get-NookPathIdentity $destination
-$blockers = @(
-    Get-Process -ErrorAction SilentlyContinue | Where-Object {
-        if ($_.Id -eq $PID) {
-            return $false
+function Get-NookUpdateBlockers {
+    @(
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            if ($_.Id -eq $PID) {
+                return $false
+            }
+            try {
+                $null -ne $_.Path -and
+                    [string]::Equals(
+                        (Get-NookPathIdentity $_.Path),
+                        $destinationIdentity,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )
+            } catch {
+                $false
+            }
         }
-        try {
-            $null -ne $_.Path -and
-                [string]::Equals(
-                    (Get-NookPathIdentity $_.Path),
-                    $destinationIdentity,
-                    [StringComparison]::OrdinalIgnoreCase
-                )
-        } catch {
-            $false
-        }
-    }
-)
-if ($blockers.Count -gt 0) {
-    $blockers | Wait-Process
+    )
 }
-try {
-    Move-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Destination $destination -Force
-} catch {
-    Remove-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Force -ErrorAction SilentlyContinue
-    throw
+$unexplainedFailures = 0
+while ($true) {
+    $blockers = @(Get-NookUpdateBlockers)
+    if ($blockers.Count -gt 0) {
+        $blockers | Wait-Process
+    }
+    try {
+        Move-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Destination $destination -Force
+        break
+    } catch {
+        $moveError = $_
+        if ((Get-NookUpdateBlockers).Count -gt 0) {
+            continue
+        }
+        $unexplainedFailures += 1
+        if ($unexplainedFailures -ge 3) {
+            Remove-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Force -ErrorAction SilentlyContinue
+            throw $moveError
+        }
+        Start-Sleep -Milliseconds 50
+    }
 }
 "#;
 
