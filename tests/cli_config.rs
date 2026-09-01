@@ -82,7 +82,9 @@ fn windows_rejects_unix_admin_sockets() {
         String::from_utf8_lossy(&result.stderr)
             .contains("Unix sockets are not supported on Windows")
     );
-    fs::remove_dir_all(directory).unwrap();
+    if directory.exists() {
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[test]
