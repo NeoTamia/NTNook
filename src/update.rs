@@ -462,7 +462,28 @@ $parent = Get-Process -Id ([int]$env:NOOK_UPDATE_PARENT_PID) -ErrorAction Silent
 if ($null -ne $parent) {
     $parent | Wait-Process
 }
-Move-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Destination $env:NOOK_UPDATE_DESTINATION -Force
+$destination = [IO.Path]::GetFullPath($env:NOOK_UPDATE_DESTINATION)
+$blockers = @(
+    Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        if ($_.Id -eq $PID) {
+            return $false
+        }
+        try {
+            $null -ne $_.Path -and [IO.Path]::GetFullPath($_.Path) -ieq $destination
+        } catch {
+            $false
+        }
+    }
+)
+if ($blockers.Count -gt 0) {
+    $blockers | Wait-Process
+}
+try {
+    Move-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Destination $destination -Force
+} catch {
+    Remove-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Force -ErrorAction SilentlyContinue
+    throw
+}
 "#;
 
 #[cfg(windows)]
@@ -778,6 +799,63 @@ mod tests {
             .env("NOOK_UPDATE_DESTINATION", &destination)
             .output()
             .unwrap();
+        assert!(
+            output.status.success(),
+            "PowerShell updater failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_windows_update_waits_for_an_active_destination() {
+        use std::process::{Command, Stdio};
+
+        let directory = std::env::temp_dir().join(format!("nook-update-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let destination = directory.join("nook.exe");
+        std::fs::write(&source, b"replacement").unwrap();
+        std::fs::copy(
+            std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()),
+            &destination,
+        )
+        .unwrap();
+
+        let mut blocker = Command::new(&destination)
+            .args(["/D", "/C", "ping -n 30 127.0.0.1 >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut updater = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                super::WINDOWS_UPDATE_SCRIPT,
+            ])
+            .env("NOOK_UPDATE_PARENT_PID", "2147483647")
+            .env("NOOK_UPDATE_SOURCE", &source)
+            .env("NOOK_UPDATE_DESTINATION", &destination)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(updater.try_wait().unwrap().is_none());
+        assert!(source.exists());
+
+        blocker.kill().unwrap();
+        blocker.wait().unwrap();
+        let output = updater.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "PowerShell updater failed: {}",
