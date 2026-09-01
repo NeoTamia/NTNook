@@ -99,6 +99,22 @@ fn native_caddy_supports_status_and_owned_aliases() {
         String::from_utf8_lossy(&remove.stderr)
     );
 
+    let native_exit = nook(
+        &app_data,
+        &local_app_data,
+        &[
+            "run",
+            "--name",
+            "windows-exit-code",
+            "--",
+            "cmd.exe",
+            "/D",
+            "/C",
+            "exit 300",
+        ],
+    );
+    assert_eq!(native_exit.status.code(), Some(300));
+
     let mut running = nook_command(&app_data, &local_app_data)
         .args([
             "run",
