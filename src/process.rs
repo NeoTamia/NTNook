@@ -1,6 +1,8 @@
 //! Cross-platform process identity, port allocation, signals, and readiness.
 #![allow(dead_code)]
 
+#[cfg(windows)]
+use std::env;
 use std::ffi::OsString;
 use std::fmt;
 #[cfg(unix)]
@@ -633,6 +635,10 @@ fn spawn_managed_child(
     #[cfg(unix)]
     let _ = lease_id;
     let (program, arguments) = argv.split_first().ok_or(Error::EmptyCommand)?;
+    let program = program.clone();
+    let arguments = arguments.to_vec();
+    #[cfg(windows)]
+    let (program, arguments) = prepare_windows_command(program, arguments, environment);
     let mut command = Command::new(program);
     command.args(arguments).envs(environment.iter().cloned());
     command
@@ -691,6 +697,98 @@ fn configure_child(command: &mut Command) {
             Ok(())
         });
     }
+}
+
+#[cfg(windows)]
+fn prepare_windows_command(
+    program: OsString,
+    arguments: Vec<OsString>,
+    environment: &[(OsString, OsString)],
+) -> (OsString, Vec<OsString>) {
+    let Some(resolved) = resolve_windows_program(&program, environment) else {
+        return (program, arguments);
+    };
+    let is_batch = resolved
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        });
+    if !is_batch {
+        return (resolved.into_os_string(), arguments);
+    }
+
+    let interpreter =
+        effective_windows_env(environment, "COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
+    let mut shell_arguments = vec![
+        OsString::from("/D"),
+        OsString::from("/S"),
+        OsString::from("/C"),
+        resolved.into_os_string(),
+    ];
+    shell_arguments.extend(arguments);
+    (interpreter, shell_arguments)
+}
+
+#[cfg(windows)]
+fn resolve_windows_program(
+    program: &std::ffi::OsStr,
+    environment: &[(OsString, OsString)],
+) -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+
+    let program = Path::new(program);
+    let has_directory = program.is_absolute()
+        || program
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty());
+    let directories = if has_directory {
+        vec![PathBuf::new()]
+    } else {
+        let mut directories = vec![env::current_dir().ok()?];
+        if let Some(path) = effective_windows_env(environment, "PATH") {
+            directories.extend(env::split_paths(&path));
+        }
+        directories
+    };
+    let extensions = if program.extension().is_some() {
+        vec![OsString::new()]
+    } else {
+        effective_windows_env(environment, "PATHEXT")
+            .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"))
+            .to_string_lossy()
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(OsString::from)
+            .collect()
+    };
+
+    for directory in directories {
+        let base = directory.join(program);
+        if base.is_file() {
+            return Some(base);
+        }
+        for extension in &extensions {
+            let mut candidate = base.as_os_str().to_os_string();
+            candidate.push(extension);
+            let candidate = PathBuf::from(candidate);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn effective_windows_env(environment: &[(OsString, OsString)], name: &str) -> Option<OsString> {
+    environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .or_else(|| env::var_os(name))
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(windows)]
@@ -1675,6 +1773,23 @@ mod windows_tests {
         assert_eq!(child.pgid, child.pid as i32);
         assert!(child.start_time_ticks > 0);
         assert_eq!(child.wait().unwrap(), 7);
+    }
+
+    #[test]
+    fn path_resolves_cmd_package_shims() {
+        let directory = std::env::temp_dir().join(format!("nook command shim {}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("nook-test-shim.cmd"), "@exit /b %1\r\n").unwrap();
+        let mut child = spawn_child(
+            &[OsString::from("nook-test-shim"), OsString::from("7")],
+            &[
+                (OsString::from("PATH"), directory.as_os_str().to_owned()),
+                (OsString::from("PATHEXT"), OsString::from(".CMD")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(child.wait().unwrap(), 7);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
