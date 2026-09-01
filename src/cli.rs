@@ -1089,7 +1089,10 @@ fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<(
     let store = state_store()?;
     let mut system = crate::process::NativeStopSystem;
     crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
+    #[cfg(unix)]
     writeln!(output, "sent SIGTERM to {hostname}")?;
+    #[cfg(windows)]
+    writeln!(output, "sent CTRL_BREAK to {hostname}")?;
     Ok(())
 }
 

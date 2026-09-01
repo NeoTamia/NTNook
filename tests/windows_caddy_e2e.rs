@@ -152,6 +152,10 @@ fn native_caddy_supports_status_and_owned_aliases() {
         "stop from a separate process failed: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
+    assert_eq!(
+        String::from_utf8(stop.stdout).unwrap(),
+        "sent CTRL_BREAK to windows-stop.localhost\n"
+    );
     wait_for_exit(&mut running, Duration::from_secs(10));
     assert_eq!(fs::read(&graceful_marker).unwrap(), b"stopped gracefully");
 
