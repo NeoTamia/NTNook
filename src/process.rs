@@ -598,9 +598,15 @@ pub(crate) fn stop_managed(
     if system.liveness(lease) != Liveness::Alive {
         return Err(StopError::Stale(hostname.to_owned()));
     }
-    system
-        .signal(lease, ProcessSignal::Terminate)
-        .map_err(|error| StopError::Signal(error.to_string()))?;
+    if let Err(error) = system.signal(lease, ProcessSignal::Terminate) {
+        if force {
+            system
+                .signal(lease, ProcessSignal::Kill)
+                .map_err(|kill_error| StopError::Signal(kill_error.to_string()))?;
+            return Ok(());
+        }
+        return Err(StopError::Signal(error.to_string()));
+    }
     if !force {
         return Ok(());
     }
@@ -1759,6 +1765,7 @@ mod tests {
         signals: Vec<ProcessSignal>,
         sleeps: usize,
         stale: bool,
+        terminate_fails: bool,
     }
 
     impl StopSystem for ControlledStop {
@@ -1776,6 +1783,9 @@ mod tests {
             signal: ProcessSignal,
         ) -> std::io::Result<()> {
             self.signals.push(signal);
+            if signal == ProcessSignal::Terminate && self.terminate_fails {
+                return Err(std::io::Error::other("graceful signal unavailable"));
+            }
             Ok(())
         }
         fn sleep(&mut self, _duration: std::time::Duration) {
@@ -1796,6 +1806,27 @@ mod tests {
             [ProcessSignal::Terminate, ProcessSignal::Kill]
         );
         assert_eq!(system.sleeps, 40);
+        running.child.signal(ProcessSignal::Terminate).unwrap();
+        running.child.wait().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn force_stop_kills_immediately_when_graceful_signal_is_unavailable() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sleep", "10"], 30);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let mut system = ControlledStop {
+            terminate_fails: true,
+            ..ControlledStop::default()
+        };
+        stop_managed(&store, "api.localhost", true, &mut system).unwrap();
+        assert_eq!(
+            system.signals,
+            [ProcessSignal::Terminate, ProcessSignal::Kill]
+        );
+        assert_eq!(system.sleeps, 0);
         running.child.signal(ProcessSignal::Terminate).unwrap();
         running.child.wait().unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
