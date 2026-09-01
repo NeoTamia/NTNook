@@ -3,7 +3,7 @@
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,13 @@ struct CaddyChild(Child);
 impl Drop for CaddyChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.0.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -50,7 +56,7 @@ fn native_caddy_supports_status_and_owned_aliases() {
         .env("XDG_CONFIG_HOME", root.join("caddy-config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("caddy.exe must be available in PATH");
     let mut caddy = CaddyChild(child);
@@ -89,14 +95,30 @@ fn native_caddy_supports_status_and_owned_aliases() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn nook(app_data: &Path, local_app_data: &Path, arguments: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_nook"))
+fn nook(app_data: &Path, local_app_data: &Path, arguments: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nook"))
         .args(arguments)
         .env("APPDATA", app_data)
         .env("LOCALAPPDATA", local_app_data)
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
-        .output()
-        .unwrap()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    panic!(
+        "nook {arguments:?} timed out after 30 seconds; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn reserve_port() -> u16 {

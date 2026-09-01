@@ -124,7 +124,7 @@ jobs:
         run: cargo check --locked
 
       - name: Test with native Caddy
-        run: cargo test --locked -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1 --nocapture
 
       - name: Lint
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
