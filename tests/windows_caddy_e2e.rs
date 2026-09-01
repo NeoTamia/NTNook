@@ -45,7 +45,7 @@ fn native_caddy_supports_status_and_owned_aliases() {
     fs::write(
         &caddyfile,
         format!(
-            "{{\n\tadmin 127.0.0.1:{admin_port}\n}}\n\nhttps://localhost:{https_port} {{\n\ttls internal\n\trespond 404\n}}\n\nhttp://localhost:{http_port} {{\n\trespond 404\n}}\n"
+            "{{\n\tadmin 127.0.0.1:{admin_port}\n\tauto_https disable_redirects\n}}\n\nhttps://localhost:{https_port} {{\n\ttls internal\n\trespond 404\n}}\n\nhttp://localhost:{http_port} {{\n\trespond 404\n}}\n"
         ),
     )
     .unwrap();
