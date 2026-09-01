@@ -760,13 +760,13 @@ fn windows_batch_command_line(program: &std::ffi::OsStr, arguments: &[OsString])
             || argument.encode_wide().next().is_none()
             || argument
                 .encode_wide()
-                .any(|unit| unit <= u16::from(u8::MAX) && b" \t\"&|<>^()".contains(&(unit as u8)));
+                .any(|unit| unit <= u16::from(u8::MAX) && b" \t\"&|<>^()%".contains(&(unit as u8)));
         if quoted {
             command_line.push(b'"' as u16);
         }
         for unit in argument.encode_wide() {
             command_line.push(unit);
-            if unit == b'"' as u16 {
+            if unit == b'"' as u16 || unit == b'%' as u16 {
                 command_line.push(unit);
             }
         }
@@ -1843,14 +1843,25 @@ mod windows_tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("nook-test-shim.cmd"),
-            "@if \"%~1\"==\"7\" (exit /b 7) else (exit /b 9)\r\n",
+            concat!(
+                "@if \"%~1\"==\"7\" if \"%~2\"==\"%%NOOK_TEST_SHIM_VALUE%%\" ",
+                "(exit /b 7) else (exit /b 9)\r\n",
+            ),
         )
         .unwrap();
         let mut child = spawn_child(
-            &[OsString::from("nook-test-shim"), OsString::from("7")],
+            &[
+                OsString::from("nook-test-shim"),
+                OsString::from("7"),
+                OsString::from("%NOOK_TEST_SHIM_VALUE%"),
+            ],
             &[
                 (OsString::from("PATH"), directory.as_os_str().to_owned()),
                 (OsString::from("PATHEXT"), OsString::from(".CMD")),
+                (
+                    OsString::from("NOOK_TEST_SHIM_VALUE"),
+                    OsString::from("expanded"),
+                ),
             ],
         )
         .unwrap();
