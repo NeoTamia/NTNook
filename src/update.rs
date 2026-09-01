@@ -456,6 +456,16 @@ fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
 }
 
 #[cfg(windows)]
+const WINDOWS_UPDATE_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$parent = Get-Process -Id ([int]$env:NOOK_UPDATE_PARENT_PID) -ErrorAction SilentlyContinue
+if ($null -ne $parent) {
+    $parent | Wait-Process
+}
+Move-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Destination $env:NOOK_UPDATE_DESTINATION -Force
+"#;
+
+#[cfg(windows)]
 fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
     use std::process::{Command, Stdio};
 
@@ -473,18 +483,13 @@ fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
         file.sync_all()?;
         drop(file);
 
-        let script = r#"
-$ErrorActionPreference = 'Stop'
-Wait-Process -Id ([int]$env:NOOK_UPDATE_PARENT_PID)
-Move-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Destination $env:NOOK_UPDATE_DESTINATION -Force
-"#;
         Command::new("powershell.exe")
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                script,
+                WINDOWS_UPDATE_SCRIPT,
             ])
             .env("NOOK_UPDATE_PARENT_PID", std::process::id().to_string())
             .env("NOOK_UPDATE_SOURCE", &temporary)
@@ -748,6 +753,40 @@ mod tests {
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_windows_update_tolerates_an_absent_parent() {
+        use std::process::Command;
+
+        let directory = std::env::temp_dir().join(format!("nook-update-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let destination = directory.join("destination.exe");
+        std::fs::write(&source, b"replacement").unwrap();
+
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                super::WINDOWS_UPDATE_SCRIPT,
+            ])
+            .env("NOOK_UPDATE_PARENT_PID", "2147483647")
+            .env("NOOK_UPDATE_SOURCE", &source)
+            .env("NOOK_UPDATE_DESTINATION", &destination)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "PowerShell updater failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn parses_release_tags_and_compares_semver() {
