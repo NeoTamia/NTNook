@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 use std::fs;
+use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
@@ -56,7 +57,7 @@ fn native_caddy_supports_status_and_owned_aliases() {
         .env("XDG_CONFIG_HOME", root.join("caddy-config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("caddy.exe must be available in PATH");
     let mut caddy = CaddyChild(child);
@@ -136,7 +137,11 @@ fn wait_for_admin(port: u16, child: &mut Child) {
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
-            panic!("Caddy exited before its Admin API was ready: {status}");
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("Caddy exited before its Admin API was ready: {status}; stderr: {stderr}");
         }
         thread::sleep(Duration::from_millis(100));
     }
