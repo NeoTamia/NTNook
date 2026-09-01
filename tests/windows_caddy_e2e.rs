@@ -35,20 +35,29 @@ fn native_caddy_supports_status_and_owned_aliases() {
     fs::create_dir_all(&local_app_data).unwrap();
     fs::create_dir_all(&caddy_data).unwrap();
 
-    let admin_port = reserve_port();
+    let admin_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let https_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let http_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let admin_port = admin_guard.local_addr().unwrap().port();
+    let https_port = https_guard.local_addr().unwrap().port();
+    let http_port = http_guard.local_addr().unwrap().port();
     let caddyfile = root.join("Caddyfile");
     fs::write(
         &caddyfile,
         format!(
-            "{{\n\tadmin 127.0.0.1:{admin_port}\n}}\n\nhttps://localhost:443 {{\n\ttls internal\n\trespond 404\n}}\n\nhttp://localhost:80 {{\n\trespond 404\n}}\n"
+            "{{\n\tadmin 127.0.0.1:{admin_port}\n}}\n\nhttps://localhost:{https_port} {{\n\ttls internal\n\trespond 404\n}}\n\nhttp://localhost:{http_port} {{\n\trespond 404\n}}\n"
         ),
     )
     .unwrap();
     fs::write(
         app_data.join("Nook/config.toml"),
-        format!("format_version = 1\ncaddy_admin = \"http://127.0.0.1:{admin_port}\"\n"),
+        format!(
+            "format_version = 1\ncaddy_admin = \"http://127.0.0.1:{admin_port}\"\nhttps_server = \"srv0\"\nhttp_server = \"srv1\"\n"
+        ),
     )
     .unwrap();
+
+    drop((admin_guard, https_guard, http_guard));
 
     let child = Command::new("caddy.exe")
         .args(["run", "--config"])
@@ -120,14 +129,6 @@ fn nook(app_data: &Path, local_app_data: &Path, arguments: &[&str]) -> Output {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn reserve_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn wait_for_admin(port: u16, child: &mut Child) {
