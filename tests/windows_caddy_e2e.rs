@@ -3,12 +3,14 @@
 use std::fs;
 use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
+use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
 
 struct CaddyChild(Child);
 
@@ -97,16 +99,42 @@ fn native_caddy_supports_status_and_owned_aliases() {
         String::from_utf8_lossy(&remove.stderr)
     );
 
+    let mut running = nook_command(&app_data, &local_app_data)
+        .args([
+            "run",
+            "--name",
+            "windows-stop",
+            "--",
+            "cmd.exe",
+            "/D",
+            "/C",
+            "ping -n 31 127.0.0.1 >NUL",
+        ])
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let state_path = local_app_data.join("Nook/state.json");
+    wait_for_state(&state_path, "windows-stop.localhost", &mut running);
+
+    // The managed run owns a different console. Stopping it must therefore
+    // use the named Job Object instead of GenerateConsoleCtrlEvent.
+    let stop = nook(&app_data, &local_app_data, &["stop", "windows-stop"]);
+    assert!(
+        stop.status.success(),
+        "stop from a separate process failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    wait_for_exit(&mut running, Duration::from_secs(10));
+
     drop(caddy);
     fs::remove_dir_all(root).unwrap();
 }
 
 fn nook(app_data: &Path, local_app_data: &Path, arguments: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nook"))
+    let mut child = nook_command(app_data, local_app_data)
         .args(arguments)
-        .env("APPDATA", app_data)
-        .env("LOCALAPPDATA", local_app_data)
-        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -125,6 +153,45 @@ fn nook(app_data: &Path, local_app_data: &Path, arguments: &[&str]) -> Output {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn nook_command(app_data: &Path, local_app_data: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nook"));
+    command
+        .env("APPDATA", app_data)
+        .env("LOCALAPPDATA", local_app_data)
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1");
+    command
+}
+
+fn wait_for_state(path: &Path, hostname: &str, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if fs::read_to_string(path).is_ok_and(|state| state.contains(hostname)) {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("nook run exited before writing its lease: {status}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("nook run did not write the {hostname} lease");
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    panic!("nook run did not exit after stop; stderr: {stderr}");
 }
 
 fn wait_for_admin(port: u16, child: &mut Child) {

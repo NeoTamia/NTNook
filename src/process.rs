@@ -656,6 +656,12 @@ fn spawn_managed_child(
             return Err(Error::Spawn(error));
         }
     };
+    #[cfg(windows)]
+    if let Err(error) = resume_process(&child) {
+        drop_job_handle(job);
+        let _ = child.wait();
+        return Err(Error::Spawn(error));
+    }
     Ok(ManagedChild {
         child,
         pid,
@@ -690,9 +696,12 @@ fn configure_child(command: &mut Command) {
 #[cfg(windows)]
 fn configure_child(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
 
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    // Keep the primary thread suspended until the process belongs to its Job
+    // Object. Otherwise a fast child could launch descendants before the job
+    // assignment and those descendants would escape process-tree cleanup.
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
 }
 
 #[cfg(unix)]
@@ -785,15 +794,45 @@ fn create_and_assign_job(
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
+fn resume_process(child: &Child) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtResumeProcess(process: HANDLE) -> i32;
+    }
+
+    let status = unsafe { NtResumeProcess(child.as_raw_handle() as HANDLE) };
+    if status < 0 {
+        Err(io::Error::other(format!(
+            "NtResumeProcess failed with NTSTATUS 0x{:08x}",
+            status as u32
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn drop_job_handle(job: windows_sys::Win32::Foundation::HANDLE) {
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
 fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Result<()> {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
     use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
     let succeeded = match signal {
-        ProcessSignal::Interrupt | ProcessSignal::Terminate => unsafe {
+        ProcessSignal::Interrupt => unsafe {
             GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.pid)
         },
-        ProcessSignal::Kill => unsafe { TerminateJobObject(child.job, 1) },
+        ProcessSignal::Terminate | ProcessSignal::Kill => unsafe {
+            TerminateJobObject(child.job, 1)
+        },
     };
     if succeeded == 0 {
         Err(io::Error::last_os_error())
@@ -811,14 +850,14 @@ fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
     use windows_sys::Win32::System::SystemServices::JOB_OBJECT_TERMINATE;
 
     match signal {
-        ProcessSignal::Interrupt | ProcessSignal::Terminate => {
+        ProcessSignal::Interrupt => {
             if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, lease.pid) } == 0 {
                 Err(io::Error::last_os_error())
             } else {
                 Ok(())
             }
         }
-        ProcessSignal::Kill => {
+        ProcessSignal::Terminate | ProcessSignal::Kill => {
             let name = job_name(lease.id);
             let job = unsafe { OpenJobObjectW(JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
             if job.is_null() {
