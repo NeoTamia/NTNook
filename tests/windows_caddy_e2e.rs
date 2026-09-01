@@ -14,6 +14,21 @@ use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
 
 struct CaddyChild(Child);
 
+#[test]
+fn graceful_child_helper() {
+    let Some(marker) = std::env::var_os("NOOK_GRACEFUL_STOP_MARKER") else {
+        return;
+    };
+    ctrlc::set_handler(move || {
+        fs::write(&marker, b"stopped gracefully").unwrap();
+        std::process::exit(0);
+    })
+    .unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 impl Drop for CaddyChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -115,17 +130,12 @@ fn native_caddy_supports_status_and_owned_aliases() {
     );
     assert_eq!(native_exit.status.code(), Some(300));
 
+    let graceful_marker = root.join("graceful-stop.txt");
     let mut running = nook_command(&app_data, &local_app_data)
-        .args([
-            "run",
-            "--name",
-            "windows-stop",
-            "--",
-            "cmd.exe",
-            "/D",
-            "/C",
-            "ping -n 31 127.0.0.1 >NUL",
-        ])
+        .args(["run", "--name", "windows-stop", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "graceful_child_helper", "--nocapture"])
+        .env("NOOK_GRACEFUL_STOP_MARKER", &graceful_marker)
         .creation_flags(CREATE_NEW_CONSOLE)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -134,8 +144,8 @@ fn native_caddy_supports_status_and_owned_aliases() {
     let state_path = local_app_data.join("Nook/state.json");
     wait_for_state(&state_path, "windows-stop.localhost", &mut running);
 
-    // The managed run owns a different console. Stopping it must therefore
-    // use the named Job Object instead of GenerateConsoleCtrlEvent.
+    // The managed run owns a different console. A normal stop must attach to
+    // that console and deliver CTRL_BREAK instead of terminating its Job Object.
     let stop = nook(&app_data, &local_app_data, &["stop", "windows-stop"]);
     assert!(
         stop.status.success(),
@@ -143,6 +153,7 @@ fn native_caddy_supports_status_and_owned_aliases() {
         String::from_utf8_lossy(&stop.stderr)
     );
     wait_for_exit(&mut running, Duration::from_secs(10));
+    assert_eq!(fs::read(&graceful_marker).unwrap(), b"stopped gracefully");
 
     drop(caddy);
     fs::remove_dir_all(root).unwrap();

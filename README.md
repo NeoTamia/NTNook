@@ -310,8 +310,10 @@ nook update --force
 
 - `list` distinguishes `starting`/`ready` runs from persistent aliases;
 - `status` checks the Admin API, servers, Nook containers, drift, and local CA trust;
-- `stop` sends SIGTERM to the currently managed run's process group;
-- `stop --force` waits up to two seconds, then uses SIGKILL if the same process is still alive;
+- `stop` gracefully signals the currently managed run's process group (SIGTERM on Unix,
+  CTRL_BREAK on Windows);
+- `stop --force` waits up to two seconds, then forcibly terminates the same process tree if it
+  is still alive;
 - `prune` removes dead leases and orphaned routes, replays pending operations, and restores missing routes;
 - `update` downloads the latest GitHub release, verifies its SHA-256 checksum, and replaces a binary installed by the installation script;
 - `update --force` reinstalls the latest release even when the installed version is already current;

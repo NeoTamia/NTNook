@@ -1021,12 +1021,10 @@ fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Resu
     use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
     let succeeded = match signal {
-        ProcessSignal::Interrupt => unsafe {
+        ProcessSignal::Interrupt | ProcessSignal::Terminate => unsafe {
             GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.pid)
         },
-        ProcessSignal::Terminate | ProcessSignal::Kill => unsafe {
-            TerminateJobObject(child.job, 1)
-        },
+        ProcessSignal::Kill => unsafe { TerminateJobObject(child.job, 1) },
     };
     if succeeded == 0 {
         Err(io::Error::last_os_error())
@@ -1037,21 +1035,44 @@ fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Resu
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
+fn generate_console_break(pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, CTRL_BREAK_EVENT, FreeConsole,
+        GenerateConsoleCtrlEvent,
+    };
+
+    // A separate `nook stop` process normally belongs to the caller's console,
+    // while the managed application may have been started in another one.
+    // Temporarily join the application's console so CTRL_BREAK can reach the
+    // process group created for it, then restore the caller's parent console.
+    let had_console = unsafe { FreeConsole() } != 0;
+    if unsafe { AttachConsole(pid) } == 0 {
+        let error = io::Error::last_os_error();
+        if had_console {
+            unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+        }
+        return Err(error);
+    }
+
+    let generated = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
+    let error = (generated == 0).then(io::Error::last_os_error);
+    unsafe { FreeConsole() };
+    if had_console {
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+    error.map_or(Ok(()), Err)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
 fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
     use windows_sys::Win32::System::JobObjects::{OpenJobObjectW, TerminateJobObject};
     use windows_sys::Win32::System::SystemServices::JOB_OBJECT_TERMINATE;
 
     match signal {
-        ProcessSignal::Interrupt => {
-            if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, lease.pid) } == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        }
-        ProcessSignal::Terminate | ProcessSignal::Kill => {
+        ProcessSignal::Interrupt | ProcessSignal::Terminate => generate_console_break(lease.pid),
+        ProcessSignal::Kill => {
             let name = job_name(lease.id);
             let job = unsafe { OpenJobObjectW(JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
             if job.is_null() {
