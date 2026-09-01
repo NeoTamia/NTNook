@@ -167,7 +167,15 @@ fn nook_command(app_data: &Path, local_app_data: &Path) -> Command {
 fn wait_for_state(path: &Path, hostname: &str, child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if fs::read_to_string(path).is_ok_and(|state| state.contains(hostname)) {
+        if fs::read_to_string(path).is_ok_and(|state| {
+            serde_json::from_str::<serde_json::Value>(&state).is_ok_and(|registry| {
+                registry["leases"].as_object().is_some_and(|leases| {
+                    leases
+                        .values()
+                        .any(|lease| lease["hostname"].as_str() == Some(hostname))
+                })
+            })
+        }) {
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
