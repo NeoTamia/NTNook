@@ -462,14 +462,30 @@ $parent = Get-Process -Id ([int]$env:NOOK_UPDATE_PARENT_PID) -ErrorAction Silent
 if ($null -ne $parent) {
     $parent | Wait-Process
 }
+function Get-NookPathIdentity([string]$path) {
+    $full = [IO.Path]::GetFullPath($path)
+    if ($full.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $full.Substring(8)
+    }
+    if ($full.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $full.Substring(4)
+    }
+    return $full
+}
 $destination = [IO.Path]::GetFullPath($env:NOOK_UPDATE_DESTINATION)
+$destinationIdentity = Get-NookPathIdentity $destination
 $blockers = @(
     Get-Process -ErrorAction SilentlyContinue | Where-Object {
         if ($_.Id -eq $PID) {
             return $false
         }
         try {
-            $null -ne $_.Path -and [IO.Path]::GetFullPath($_.Path) -ieq $destination
+            $null -ne $_.Path -and
+                [string]::Equals(
+                    (Get-NookPathIdentity $_.Path),
+                    $destinationIdentity,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
         } catch {
             $false
         }
@@ -842,7 +858,10 @@ mod tests {
             ])
             .env("NOOK_UPDATE_PARENT_PID", "2147483647")
             .env("NOOK_UPDATE_SOURCE", &source)
-            .env("NOOK_UPDATE_DESTINATION", &destination)
+            .env(
+                "NOOK_UPDATE_DESTINATION",
+                destination.canonicalize().unwrap(),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
