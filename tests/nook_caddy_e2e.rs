@@ -386,9 +386,19 @@ fn nook(config_home: &Path, state_home: &Path, arguments: &[&str]) -> Output {
 }
 
 fn https_body(hostname: &str) -> String {
-    let output = curl("https", 443, hostname);
-    assert_success(&output);
-    String::from_utf8(output.stdout).unwrap()
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let output = curl("https", 443, hostname);
+        if output.status.success() {
+            return String::from_utf8(output.stdout).unwrap();
+        }
+        if Instant::now() >= deadline {
+            assert_success(&output);
+        }
+        // Caddy acknowledges a dynamic configuration before its internal CA
+        // has necessarily finished issuing the first certificate for a host.
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn http_body(hostname: &str) -> String {
