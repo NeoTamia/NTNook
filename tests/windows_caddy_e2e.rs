@@ -36,28 +36,24 @@ fn native_caddy_supports_status_and_owned_aliases() {
     fs::create_dir_all(&caddy_data).unwrap();
 
     let admin_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let https_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let http_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let admin_port = admin_guard.local_addr().unwrap().port();
-    let https_port = https_guard.local_addr().unwrap().port();
-    let http_port = http_guard.local_addr().unwrap().port();
     let caddyfile = root.join("Caddyfile");
     fs::write(
         &caddyfile,
         format!(
-            "{{\n\tadmin 127.0.0.1:{admin_port}\n\tauto_https disable_redirects\n\tskip_install_trust\n\tservers {{\n\t\tprotocols h1 h2\n\t}}\n}}\n\nhttps://localhost:{https_port} {{\n\ttls internal\n\trespond 404\n}}\n\nhttp://localhost:{http_port} {{\n\trespond 404\n}}\n"
+            "{{\n\tadmin 127.0.0.1:{admin_port}\n\tauto_https disable_redirects\n\tskip_install_trust\n\tservers {{\n\t\tprotocols h1 h2\n\t}}\n}}\n\nhttps://localhost:443 {{\n\ttls internal\n\trespond 404\n}}\n"
         ),
     )
     .unwrap();
     fs::write(
         app_data.join("Nook/config.toml"),
         format!(
-            "format_version = 1\ncaddy_admin = \"http://127.0.0.1:{admin_port}\"\nhttps_server = \"srv0\"\nhttp_server = \"srv1\"\n"
+            "format_version = 1\ncaddy_admin = \"http://127.0.0.1:{admin_port}\"\nhttps_server = \"srv0\"\n"
         ),
     )
     .unwrap();
 
-    drop((admin_guard, https_guard, http_guard));
+    drop(admin_guard);
 
     let child = Command::new("caddy.exe")
         .args(["run", "--config"])
@@ -83,7 +79,7 @@ fn native_caddy_supports_status_and_owned_aliases() {
     let set = nook(
         &app_data,
         &local_app_data,
-        &["alias", "set", "windows-e2e", "3000", "--no-tls"],
+        &["alias", "set", "windows-e2e", "3000"],
     );
     assert!(
         set.status.success(),
