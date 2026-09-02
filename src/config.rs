@@ -6,10 +6,11 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::net::IpAddr;
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -263,15 +264,18 @@ fn write_global_at(path: &Path, config: &GlobalConfig, force: bool) -> Result<()
     let result = (|| {
         use std::io::Write;
 
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&temporary)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         if force {
-            fs::rename(&temporary, path)?;
+            crate::platform::replace_file(&temporary, path)?;
         } else {
             fs::hard_link(&temporary, path)?;
             fs::remove_file(&temporary)?;
@@ -288,6 +292,13 @@ fn write_global_at(path: &Path, config: &GlobalConfig, force: bool) -> Result<()
 }
 
 fn validate_global(config: &GlobalConfig) -> Result<(), Error> {
+    #[cfg(windows)]
+    if config.caddy_admin.starts_with("unix/") {
+        return Err(Error::InvalidGlobal {
+            field: "caddy_admin",
+            reason: "Unix sockets are not supported on Windows; use an HTTP(S) Admin API URL such as http://127.0.0.1:2019".into(),
+        });
+    }
     let valid_ip = config.caddy_loopback_host.parse::<IpAddr>().is_ok();
     if !valid_ip
         && (config.caddy_loopback_host.is_empty()
@@ -464,8 +475,8 @@ fn resolve_hostname(
 ) -> Result<String, Error> {
     let inferred = git_root
         .and_then(Path::file_name)
-        .or_else(|| current_directory.file_name())
-        .and_then(|name| name.to_str());
+        .and_then(|name| name.to_str())
+        .or_else(|| current_directory.file_name().and_then(|name| name.to_str()));
     normalize_hostname(
         cli_name
             .or(project_name)
@@ -561,13 +572,26 @@ fn find_git_root(current_directory: &Path) -> Option<PathBuf> {
     if !output.status.success() {
         return None;
     }
-    let mut path = output.stdout;
-    while path.last().is_some_and(u8::is_ascii_whitespace) {
-        path.pop();
-    }
-    (!path.is_empty()).then(|| PathBuf::from(OsString::from_vec(path)))
+    git_root_from_output(output.stdout)
 }
 
+#[cfg(unix)]
+fn git_root_from_output(mut output: Vec<u8>) -> Option<PathBuf> {
+    while output.last().is_some_and(u8::is_ascii_whitespace) {
+        output.pop();
+    }
+    (!output.is_empty()).then(|| PathBuf::from(OsString::from_vec(output)))
+}
+
+#[cfg(windows)]
+fn git_root_from_output(output: Vec<u8>) -> Option<PathBuf> {
+    let path = String::from_utf8_lossy(&output)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[cfg(unix)]
 fn global_config_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Error> {
     if let Some(directory) = get("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(directory).join("nook/config.toml"));
@@ -576,6 +600,18 @@ fn global_config_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<Pat
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".config/nook/config.toml"))
+        .ok_or(Error::MissingHome)
+}
+
+#[cfg(windows)]
+fn global_config_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Error> {
+    if let Some(directory) = get("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(directory).join("nook/config.toml"));
+    }
+    get("APPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|directory| directory.join("Nook/config.toml"))
         .ok_or(Error::MissingHome)
 }
 
@@ -630,6 +666,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    #[cfg(unix)]
     fn global_path_prefers_xdg_and_falls_back_to_home() {
         let xdg = global_config_path_with(|key| match key {
             "XDG_CONFIG_HOME" => Some(OsString::from("/xdg")),
@@ -642,6 +679,19 @@ mod tests {
             global_config_path_with(|key| (key == "HOME").then(|| OsString::from("/home/user")))
                 .unwrap();
         assert_eq!(home, Path::new("/home/user/.config/nook/config.toml"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn global_path_uses_roaming_app_data_on_windows() {
+        let path = global_config_path_with(|key| {
+            (key == "APPDATA").then(|| OsString::from(r"C:\Users\dev\AppData\Roaming"))
+        })
+        .unwrap();
+        assert_eq!(
+            path,
+            Path::new(r"C:\Users\dev\AppData\Roaming\Nook\config.toml")
+        );
     }
 
     #[test]
@@ -667,12 +717,12 @@ mod tests {
         assert!(write_global_at(&path, &config, false).is_err());
 
         let mut replacement = GlobalConfig::default();
-        replacement.set_caddy_admin("unix//run/caddy/admin.socket".into());
+        replacement.set_caddy_admin("http://127.0.0.1:2020".into());
         write_global_at(&path, &replacement, true).unwrap();
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("unix//run/caddy/admin.socket")
+                .contains("http://127.0.0.1:2020")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -955,6 +1005,19 @@ mod tests {
         );
         assert_eq!(
             resolve_hostname(None, None, None, Path::new("/work/current")).unwrap(),
+            "current.localhost"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_git_root_falls_back_to_the_current_directory_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let git_root = super::git_root_from_output(b"/roots/git-\xff\n".to_vec()).unwrap();
+        assert_eq!(git_root.as_os_str().as_bytes(), b"/roots/git-\xff");
+        assert_eq!(
+            resolve_hostname(None, None, Some(&git_root), Path::new("/work/current")).unwrap(),
             "current.localhost"
         );
     }

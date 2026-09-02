@@ -1,10 +1,11 @@
 # Nook
 
-Nook is a Linux CLI that exposes local applications under stable `*.localhost` domains by configuring an existing Caddy instance.
+Nook is a Linux and Windows CLI that exposes local applications under stable `*.localhost`
+domains by configuring an existing Caddy instance.
 
 ## Requirements and installation
 
-- Linux;
+- Linux x86-64 or Windows x86-64;
 - Caddy `2.11.x`, running natively or in Docker, already started and accessible through its Admin API;
 - unambiguous Caddy servers listening on `:443` for HTTPS and, when `--no-tls` is used, on `:80` for HTTP.
 
@@ -19,8 +20,22 @@ nook --help
 The script installs Nook into `$XDG_BIN_HOME`, or `~/.local/bin` by default, without using `sudo`.
 Use `NOOK_INSTALL_DIR` to select another directory and `NOOK_VERSION` to install a specific
 version. It also installs Bash and Zsh completion files under `${XDG_DATA_HOME:-~/.local/share}`
-and adds idempotent source blocks to `~/.bashrc` and `~/.zshrc`. Rust users can also build the
-published version from crates.io:
+and adds idempotent source blocks to `~/.bashrc` and `~/.zshrc`.
+
+On Windows x86-64, run the PowerShell installer without elevation:
+
+```powershell
+irm https://github.com/NeoTamia/NTNook/releases/latest/download/nook-installer.ps1 | iex
+nook --help
+```
+
+It verifies the release checksum, installs `nook.exe` under
+`%LOCALAPPDATA%\Programs\Nook\bin`, adds that directory to the user `PATH`, and configures
+PowerShell completion. `NOOK_INSTALL_DIR` and `NOOK_VERSION` provide the same overrides as the
+Linux installer. Open a new terminal after the first installation so it receives the updated
+`PATH`.
+
+Rust users on either platform can also build the published version from crates.io:
 
 ```sh
 cargo install ntnook --locked
@@ -34,11 +49,13 @@ cargo install --path .
 nook --help
 ```
 
-Nook neither starts nor installs Caddy. It never invokes `sudo`, modifies `/etc/hosts`, or installs the local CA. Names under `.localhost` are resolved natively to loopback by compatible browsers and operating systems.
+Nook neither starts nor installs Caddy. It never elevates privileges, modifies the hosts file, or
+installs the local CA. Names under `.localhost` are resolved natively to loopback by compatible
+browsers and operating systems.
 
 To run Caddy in Docker without installing its binary on the host, use the [Docker guide](docs/DOCKER.md). The official image is supported; `caddy-docker-proxy` is compatibility-tested, with a caveat concerning its reloads.
 
-## Bash and Zsh completion
+## Shell completion
 
 Nook generates completion scripts synchronized with the commands and options of the installed
 version. The release installer installs both scripts and adds idempotent source blocks to
@@ -53,6 +70,9 @@ source <(nook completions bash)
 autoload -Uz compinit
 compinit
 source <(nook completions zsh)
+
+# PowerShell
+nook completions power-shell | Out-String | Invoke-Expression
 ```
 
 For a persistent Bash installation:
@@ -79,6 +99,16 @@ autoload -Uz compinit
 compinit
 ```
 
+For a persistent manual PowerShell installation, generate the script and source it from your
+profile:
+
+```powershell
+$completion = Join-Path $env:LOCALAPPDATA "Nook\completions\nook.ps1"
+New-Item -ItemType Directory -Force (Split-Path $completion) | Out-Null
+nook completions power-shell | Set-Content -Encoding utf8 $completion
+Add-Content $PROFILE.CurrentUserAllHosts ". '$completion'"
+```
+
 Regenerate the file after every Nook update. The generated scripts complete canonical forms such
 as `nook run --name api` and `nook alias set api 3000`, as well as existing run names after
 `nook stop` and alias names after `nook alias remove`. They also offer the known names for the
@@ -98,6 +128,37 @@ https://localhost {
 ```
 
 If every command uses `--no-tls`, no HTTPS server is required. Caddy must then provide exactly one HTTP server on `:80`; Nook neither issues nor verifies certificates for these routes.
+
+### Windows: native Caddy (recommended)
+
+Download the official `caddy.exe`, or install the community-maintained Chocolatey/Scoop package,
+and place it on `%PATH%`. Caddy may run in a terminal or as a Windows service through `sc.exe` or
+WinSW. Nook does not manage that lifecycle. Keep the Admin API on its loopback TCP default:
+
+```caddyfile
+{
+	admin 127.0.0.1:2019
+}
+
+https://localhost {
+	tls internal
+	respond 404
+}
+```
+
+Then start Caddy using your chosen service configuration and run:
+
+```powershell
+caddy version
+nook status
+```
+
+If `local_ca` is reported as `not trusted`, run the exact `caddy trust --address ...` remediation
+printed by Nook from a terminal with the required Windows permissions. Nook diagnoses the current
+user's Windows `ROOT` certificate store but never modifies it. Unix socket addresses and
+`--caddy-socket` are not supported on Windows; use an HTTP(S) Admin API URL.
+
+### Linux: optional Unix Admin socket
 
 If the Admin API should use the standard Unix socket, also place this directive in the existing global block of the Caddyfile:
 
@@ -217,7 +278,7 @@ pnpm add --save-dev @neotamia/nook-run
 The wrapper passes its arguments directly to `nook run`, inherits the terminal and environment,
 forwards interruption signals, and preserves Nook's exit code. It has no dependencies or install
 hooks and never downloads Nook or Caddy. Nook must still be installed separately and available in
-`PATH`. The wrapper requires Node.js 22 or newer; Windows users must run it with Nook inside WSL.
+`PATH`. The wrapper requires Node.js 22 or newer and invokes `nook` or `nook.exe` through `PATH`.
 
 ## Persistent aliases
 
@@ -249,8 +310,10 @@ nook update --force
 
 - `list` distinguishes `starting`/`ready` runs from persistent aliases;
 - `status` checks the Admin API, servers, Nook containers, drift, and local CA trust;
-- `stop` sends SIGTERM to the currently managed run's process group;
-- `stop --force` waits up to two seconds, then uses SIGKILL if the same process is still alive;
+- `stop` gracefully signals the currently managed run's process group (SIGTERM on Unix,
+  CTRL_BREAK on Windows);
+- `stop --force` waits up to two seconds, then forcibly terminates the same process tree if it
+  is still alive;
 - `prune` removes dead leases and orphaned routes, replays pending operations, and restores missing routes;
 - `update` downloads the latest GitHub release, verifies its SHA-256 checksum, and replaces a binary installed by the installation script;
 - `update --force` reinstalls the latest release even when the installed version is already current;
@@ -350,17 +413,20 @@ command = ["pnpm", "run", "dev:app"]
 
 For npm, Yarn, or Bun, replace both occurrences of `pnpm` with `npm`, `yarn`, or `bun`,
 respectively. The fallback runs only when the binary is absent: a Nook, Caddy, or application
-error preserves its exit code and does not restart the server outside the proxy. This recipe uses
-the POSIX shell because Nook is currently limited to Linux.
+error preserves its exit code and does not restart the server outside the proxy. This particular
+recipe uses a POSIX shell; Windows projects should express the same fallback in a portable Node
+script or invoke `nook-run` directly.
 
 ## Global configuration
 
-The global file is `$XDG_CONFIG_HOME/nook/config.toml`, falling back to `~/.config/nook/config.toml`:
+On Linux, the global file is `$XDG_CONFIG_HOME/nook/config.toml`, falling back to
+`~/.config/nook/config.toml`. On Windows it is `%APPDATA%\Nook\config.toml`.
 
 Nook can create it, show its effective configuration, and change a value:
 
 ```sh
 nook config init
+# Linux only:
 nook config init --caddy-socket /run/caddy/admin.socket
 nook config show
 nook config path
@@ -424,7 +490,9 @@ nook ca export caddy-local-ca.pem --force
 
 Nook prints the SHA-256 fingerprint, refuses to overwrite by default, and never installs the certificate. With Caddy in Docker, the CA remains stable as long as the `/data` volume is preserved.
 
-Versioned state resides in `$XDG_STATE_HOME/nook/state.json`, falling back to `~/.local/state/nook/state.json`. Writes are atomic and locked; do not edit this registry while Nook is running.
+Versioned state resides in `$XDG_STATE_HOME/nook/state.json`, falling back to
+`~/.local/state/nook/state.json`, on Linux and `%LOCALAPPDATA%\Nook\state.json` on Windows. Writes
+are atomic and locked; do not edit this registry while Nook is running.
 
 ## Troubleshooting
 
@@ -438,11 +506,17 @@ Versioned state resides in `$XDG_STATE_HOME/nook/state.json`, falling back to `~
 - readiness warning: verify that the application listens on `HOST` and `PORT`; the route and process remain active.
 - strict port occupied: free the port, choose another one, or remove `--strict-port`.
 
-## MVP scope
+## Scope
 
-The MVP manages one service per project, local Caddy routes, persistent aliases, Linux processes, and recovery on the next CLI invocation.
+Nook manages one service per project, local Caddy routes, persistent aliases, supervised Linux or
+Windows process trees, and recovery on the next CLI invocation. Caddy may run natively on either
+platform. On Windows, native `caddy.exe` is the primary supported mode; Docker Desktop remains a
+secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
-Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying `/etc/hosts`, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration, LAN/mDNS, multiple services or workspaces, native Windows/macOS support, Tailscale Serve/Funnel, and any public exposure.
+Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
+file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
+LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Serve/Funnel, and any
+public exposure.
 
 ## Development
 
@@ -453,9 +527,11 @@ cargo test -- --test-threads=1
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Integration tests require Caddy `2.11.x`, OpenSSL, Python 3, curl with HTTP/2, `unshare`, and `ip`. They use only loopback ports and temporary directories, disable trust installation, and clean up their processes and files. The full Nook/Caddy test opens `:80` and `:443` in an isolated user network namespace; CI runs the same test on its disposable runner.
+Linux integration tests require Caddy `2.11.x`, OpenSSL, Python 3, curl with HTTP/2, `unshare`, and
+`ip`. Windows integration tests use the official `caddy.exe`. They use only loopback ports and
+temporary directories, install no CA, and clean up their processes and files.
 
-Linux CI enforces this gate with the toolchain pinned in `rust-toolchain.toml`. Each `v*` tag then
-produces a static Linux x86-64 binary, its SHA-256 checksum, and a GitHub attestation, before
-publishing the `ntnook` source package on crates.io. See the
+Linux and Windows CI enforce this gate with the toolchain pinned in `rust-toolchain.toml`. Each
+`v*` tag produces Linux and Windows x86-64 archives, SHA-256 checksums, installers, and GitHub
+attestations before publishing the `ntnook` source package on crates.io. See the
 [traceability matrix](docs/TRACEABILITY.md) and [release notes](RELEASE.md).

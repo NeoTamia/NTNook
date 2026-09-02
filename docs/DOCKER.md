@@ -1,6 +1,9 @@
 # Caddy in Docker
 
-Nook can remain installed on the Linux host while Caddy 2.11 runs in a container. The official image is the supported path. Nook does not control Docker and neither starts nor stops Caddy.
+Nook can remain installed on the Linux or Windows host while Caddy 2.11 runs in a container. The
+official image is the supported path. Nook does not control Docker and neither starts nor stops
+Caddy. On Windows, native `caddy.exe` is the primary supported mode; Docker Desktop is a secondary
+supported alternative.
 
 ## Recommended setup
 
@@ -19,6 +22,34 @@ Applications launched by Nook listen on this gateway, not on `0.0.0.0`. Caddy ro
 
 If the subnet must change, update the Compose `subnet` and `gateway`, `run_bind_address`, and `caddy_client_ip_ranges` together.
 
+## Windows with Docker Desktop (secondary mode)
+
+Install Nook natively on Windows first. Then create its configuration and start the same official
+Compose stack from PowerShell:
+
+```powershell
+$configDirectory = Join-Path $env:APPDATA "Nook"
+New-Item -ItemType Directory -Force $configDirectory | Out-Null
+Copy-Item docker/nook-config.windows.toml.example `
+  (Join-Path $configDirectory "config.toml")
+docker compose `
+  -f docker/compose.yaml `
+  -f docker/compose.windows.yaml `
+  up -d --wait
+nook status
+```
+
+The Admin API remains published only on `127.0.0.1`. Caddy reaches Windows applications through
+Docker Desktop's own `host.docker.internal` mapping. The Windows override removes the fixed Linux
+bridge mapping from the base Compose file; use both `-f` arguments for every Compose operation in
+this mode. Because Docker Desktop cannot reach a process bound only to Windows loopback, the
+example sets `run_bind_address = "0.0.0.0"`. Keep Windows Firewall enabled and do not add an inbound
+firewall rule for application ports. If the fixed `172.30.0.0/24` subnet conflicts with another
+network, change the Compose subnet/gateway and `caddy_client_ip_ranges` together.
+
+This mode does not require the Caddy Windows service or `caddy.exe` on the host. It also does not
+give Nook access to the Docker socket.
+
 ## Trust HTTPS
 
 Caddy stores its PKI in the named `caddy_data` volume. Export its public certificate once:
@@ -35,6 +66,15 @@ sudo update-ca-certificates
 ```
 
 On Windows, after verifying the displayed fingerprint, import the PEM into “Trusted Root Certification Authorities” for the current user. Some browsers use their own certificate store and require a separate import.
+
+An explicit current-user import from PowerShell is:
+
+```powershell
+Import-Certificate -FilePath .\caddy-local-ca.pem `
+  -CertStoreLocation Cert:\CurrentUser\Root
+```
+
+This is a deliberate user action; Nook never invokes it.
 
 You do not need to export the CA again after a restart or recreation that preserves `caddy_data`. Export it again if the volume is deleted or replaced, the PKI is regenerated, or the Caddy instance changes.
 
@@ -64,8 +104,11 @@ The tests destroy only their own Compose project and dedicated volumes:
 NOOK_DOCKER_E2E=1 tests/docker_e2e.sh
 NOOK_DOCKER_E2E=1 \
   NOOK_DOCKER_COMPOSE="$PWD/docker/compose.caddy-docker-proxy.yaml" \
-  tests/docker_e2e.sh
+tests/docker_e2e.sh
 ```
+
+The Windows override is configuration-validated in CI. Its host mapping depends on Docker Desktop
+and is therefore not exercised by the Linux Docker E2E.
 
 ## Platforms
 
@@ -74,8 +117,11 @@ NOOK_DOCKER_E2E=1 \
 | Linux | native | native | supported |
 | Linux | native | official Docker image | supported |
 | Linux | native | caddy-docker-proxy | compatibility-tested with reconciliation |
-| Windows | native | Docker Desktop | Caddy is feasible; Nook is not ported |
-| Windows + WSL | Linux in WSL | Docker Desktop | exploratory; not guaranteed |
+| Windows | native | native `caddy.exe` | supported; primary Windows path |
+| Windows | native | official image in Docker Desktop | supported; secondary path |
+| Windows | native | caddy-docker-proxy in Docker Desktop | not part of the Windows gate |
+| Windows + WSL | Linux in WSL | Docker Desktop | compatibility path; native Nook is preferred |
 | macOS | native | Docker Desktop | Caddy is feasible; Nook is not ported |
 
-Porting Nook to Windows remains a separate effort: `/proc`, process groups, POSIX signals, Unix sockets, XDG paths, and trust-store detection must be replaced or made conditional.
+The Windows CI gate uses native `caddy.exe`. Docker Desktop validation supplements that gate and
+never replaces it.

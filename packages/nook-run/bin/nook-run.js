@@ -4,8 +4,12 @@ import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
 import { constants } from "node:os";
 
-const INSTALL_URL =
-  "https://github.com/NeoTamia/NTNook/releases/latest/download/nook-installer.sh";
+import { installationGuidance } from "./install-guidance.js";
+import {
+  shouldLaunchFallback,
+  shouldSignalChild,
+} from "./signal-forwarding.js";
+
 let forwardedSignal;
 let child;
 const launchErrors = new WeakSet();
@@ -32,7 +36,10 @@ function spawnChild(executable, executableArgs) {
   });
 
   child.once("spawn", () => {
-    if (forwardedSignal !== undefined) {
+    if (
+      forwardedSignal !== undefined &&
+      shouldSignalChild(process.platform, forwardedSignal)
+    ) {
       child.kill(forwardedSignal);
     }
   });
@@ -45,7 +52,10 @@ function spawnChild(executable, executableArgs) {
 function forwardSignal(signal) {
   forwardedSignal ??= signal;
 
-  if (child.pid !== undefined) {
+  if (
+    child.pid !== undefined &&
+    shouldSignalChild(process.platform, signal)
+  ) {
     child.kill(signal);
   }
 }
@@ -72,10 +82,15 @@ function handleLaunchError(error) {
   if (error.code === "ENOENT") {
     report(`nook-run: warning: Nook was not found in PATH; running the command directly.
 
-Install Nook on Linux with:
-  curl --proto '=https' --tlsv1.2 -LsSf ${INSTALL_URL} | sh
+${installationGuidance(process.platform)}
 
 Nook features such as local domains and HTTPS will be unavailable.`);
+
+    if (!shouldLaunchFallback(forwardedSignal)) {
+      removeSignalHandlers();
+      process.exitCode = signalExitCode(forwardedSignal);
+      return;
+    }
 
     if (command.length === 0) {
       removeSignalHandlers();

@@ -5,7 +5,6 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +15,13 @@ use uuid::Uuid;
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_REPO: &str = "NeoTamia/NTNook";
 const DEFAULT_RELEASES_URL: &str = "https://api.github.com/repos/NeoTamia/NTNook/releases/latest";
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const ARCHIVE_NAME: &str = "nook-x86_64-pc-windows-msvc.zip";
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const CHECKSUM_NAME: &str = "nook-x86_64-pc-windows-msvc.zip.sha256";
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 const ARCHIVE_NAME: &str = "nook-x86_64-unknown-linux-musl.tar.xz";
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 const CHECKSUM_NAME: &str = "nook-x86_64-unknown-linux-musl.tar.xz.sha256";
 const PASSIVE_TIMEOUT: Duration = Duration::from_secs(1);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -165,9 +170,12 @@ fn check_latest(output: &mut impl Write, errors: &mut impl Write) -> Result<i32,
 }
 
 fn install_latest(force: bool, output: &mut impl Write) -> Result<i32, Error> {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    if !cfg!(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )) {
         return Err(Error::InstallMethod(
-            "self-update publishes x86_64 Linux binaries only; reinstall for this architecture"
+            "self-update publishes x86_64 Linux and Windows binaries only; reinstall for this architecture"
                 .into(),
         ));
     }
@@ -306,6 +314,7 @@ fn http_agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
+#[cfg(not(windows))]
 fn extract_nook(archive: &[u8]) -> Result<Vec<u8>, Error> {
     let mut decompressed = LimitedBuffer::new(ARCHIVE_SIZE_LIMIT);
     lzma_rs::xz_decompress(&mut Cursor::new(archive), &mut decompressed)
@@ -333,11 +342,31 @@ fn extract_nook(archive: &[u8]) -> Result<Vec<u8>, Error> {
     ))
 }
 
+#[cfg(windows)]
+fn extract_nook(archive: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(archive))
+        .map_err(|error| Error::Archive(error.to_string()))?;
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|error| Error::Archive(error.to_string()))?;
+        if entry.is_file() && Path::new(entry.name()).file_name() == Some(OsStr::new("nook.exe")) {
+            return read_limited(&mut entry, ARCHIVE_SIZE_LIMIT)
+                .map_err(|error| Error::Archive(error.to_string()));
+        }
+    }
+    Err(Error::Archive(
+        "archive does not contain a nook.exe binary".into(),
+    ))
+}
+
+#[cfg(not(windows))]
 struct LimitedBuffer {
     data: Vec<u8>,
     limit: u64,
 }
 
+#[cfg(not(windows))]
 impl LimitedBuffer {
     fn new(limit: u64) -> Self {
         Self {
@@ -347,6 +376,7 @@ impl LimitedBuffer {
     }
 }
 
+#[cfg(not(windows))]
 impl Write for LimitedBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let used = u64::try_from(self.data.len()).unwrap_or(u64::MAX);
@@ -380,6 +410,7 @@ fn read_limited(reader: &mut impl Read, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(unix)]
 fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
     let parent = destination.parent().ok_or_else(|| {
         io::Error::new(
@@ -396,22 +427,132 @@ fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
         Uuid::new_v4()
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o755);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        let mode = fs::metadata(destination)
-            .map(|metadata| metadata.permissions().mode() & 0o777)
-            .unwrap_or(0o755);
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
-        fs::rename(&temporary, destination)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(destination)
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .unwrap_or(0o755);
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        }
+        crate::platform::replace_file(&temporary, destination)?;
         Ok(())
     })();
     if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+const WINDOWS_UPDATE_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$parent = Get-Process -Id ([int]$env:NOOK_UPDATE_PARENT_PID) -ErrorAction SilentlyContinue
+if ($null -ne $parent) {
+    $parent | Wait-Process
+}
+function Get-NookPathIdentity([string]$path) {
+    $full = [IO.Path]::GetFullPath($path)
+    if ($full.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $full.Substring(8)
+    }
+    if ($full.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $full.Substring(4)
+    }
+    return $full
+}
+$destination = [IO.Path]::GetFullPath($env:NOOK_UPDATE_DESTINATION)
+$destinationIdentity = Get-NookPathIdentity $destination
+function Get-NookUpdateBlockers {
+    @(
+        Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            if ($_.Id -eq $PID) {
+                return $false
+            }
+            try {
+                $null -ne $_.Path -and
+                    [string]::Equals(
+                        (Get-NookPathIdentity $_.Path),
+                        $destinationIdentity,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )
+            } catch {
+                $false
+            }
+        }
+    )
+}
+$unexplainedFailures = 0
+while ($true) {
+    $blockers = @(Get-NookUpdateBlockers)
+    if ($blockers.Count -gt 0) {
+        $blockers | Wait-Process
+    }
+    try {
+        Move-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Destination $destination -Force
+        break
+    } catch {
+        $moveError = $_
+        if ((Get-NookUpdateBlockers).Count -gt 0) {
+            continue
+        }
+        $unexplainedFailures += 1
+        if ($unexplainedFailures -ge 3) {
+            Remove-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Force -ErrorAction SilentlyContinue
+            throw $moveError
+        }
+        Start-Sleep -Milliseconds 50
+    }
+}
+"#;
+
+#[cfg(windows)]
+fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
+    use std::process::{Command, Stdio};
+
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "binary path has no parent directory",
+        )
+    })?;
+    let temporary = parent.join(format!("nook.update.{}.exe", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    let result = (|| {
+        let mut file = options.write(true).create_new(true).open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+
+        Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_UPDATE_SCRIPT,
+            ])
+            .env("NOOK_UPDATE_PARENT_PID", std::process::id().to_string())
+            .env("NOOK_UPDATE_SOURCE", &temporary)
+            .env("NOOK_UPDATE_DESTINATION", destination)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
@@ -462,11 +603,20 @@ fn is_managed_install(path: &Path) -> bool {
             .any(|directory| paths_match(parent, directory))
 }
 
+#[cfg(unix)]
 fn is_default_user_bin(parent: &Path) -> bool {
     let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
         return false;
     };
     paths_match(parent, &PathBuf::from(home).join(".local/bin"))
+}
+
+#[cfg(windows)]
+fn is_default_user_bin(parent: &Path) -> bool {
+    env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .is_some_and(|local| paths_match(parent, &local.join("Programs/Nook/bin")))
 }
 
 fn installer_directories() -> Vec<PathBuf> {
@@ -523,6 +673,7 @@ fn update_check_disabled() -> bool {
     env::var_os("NOOK_DISABLE_UPDATE_CHECK").is_some_and(|value| value != "0")
 }
 
+#[cfg(unix)]
 fn cache_path() -> Option<PathBuf> {
     if let Some(directory) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(directory).join("nook/update-check.json"));
@@ -530,6 +681,16 @@ fn cache_path() -> Option<PathBuf> {
     env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(|home| PathBuf::from(home).join(".cache/nook/update-check.json"))
+}
+
+#[cfg(windows)]
+fn cache_path() -> Option<PathBuf> {
+    if let Some(directory) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(directory).join("nook/update-check.json"));
+    }
+    env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(|directory| PathBuf::from(directory).join("Nook/cache/update-check.json"))
 }
 
 fn load_cache() -> Option<UpdateCache> {
@@ -551,7 +712,7 @@ fn store_cache(latest: &str) -> io::Result<()> {
     let contents = serde_json::to_vec(&cache).map_err(io::Error::other)?;
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, contents)?;
-    fs::rename(temporary, path)?;
+    crate::platform::replace_file(&temporary, &path)?;
     Ok(())
 }
 
@@ -634,14 +795,110 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        InstallKind, LimitedBuffer, cache_is_fresh, install_kind, parse_sha256_file, parse_version,
-        read_limited, version_is_newer,
-    };
+    #[cfg(unix)]
+    use super::{InstallKind, LimitedBuffer, install_kind, read_limited};
+    use super::{cache_is_fresh, parse_sha256_file, parse_version, version_is_newer};
+    #[cfg(unix)]
     use std::env;
+    #[cfg(unix)]
     use std::io::{self, Cursor, Write};
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_windows_update_tolerates_an_absent_parent() {
+        use std::process::Command;
+
+        let directory = std::env::temp_dir().join(format!("nook-update-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let destination = directory.join("destination.exe");
+        std::fs::write(&source, b"replacement").unwrap();
+
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                super::WINDOWS_UPDATE_SCRIPT,
+            ])
+            .env("NOOK_UPDATE_PARENT_PID", "2147483647")
+            .env("NOOK_UPDATE_SOURCE", &source)
+            .env("NOOK_UPDATE_DESTINATION", &destination)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "PowerShell updater failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_windows_update_waits_for_an_active_destination() {
+        use std::process::{Command, Stdio};
+
+        let directory = std::env::temp_dir().join(format!("nook-update-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let destination = directory.join("nook.exe");
+        std::fs::write(&source, b"replacement").unwrap();
+        std::fs::copy(
+            std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()),
+            &destination,
+        )
+        .unwrap();
+
+        let mut blocker = Command::new(&destination)
+            .args(["/D", "/C", "ping -n 30 127.0.0.1 >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut updater = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                super::WINDOWS_UPDATE_SCRIPT,
+            ])
+            .env("NOOK_UPDATE_PARENT_PID", "2147483647")
+            .env("NOOK_UPDATE_SOURCE", &source)
+            .env(
+                "NOOK_UPDATE_DESTINATION",
+                destination.canonicalize().unwrap(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(updater.try_wait().unwrap().is_none());
+        assert!(source.exists());
+
+        blocker.kill().unwrap();
+        blocker.wait().unwrap();
+        let output = updater.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "PowerShell updater failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn parses_release_tags_and_compares_semver() {
@@ -674,6 +931,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn detects_cargo_development_and_managed_installs() {
         assert_eq!(
             install_kind(Path::new("/home/user/.cargo/bin/nook")),
@@ -705,6 +963,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn extraction_limits_reject_oversized_output() {
         let mut writer = LimitedBuffer::new(4);
         assert!(writer.write_all(b"abcd").is_ok());

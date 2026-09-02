@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -111,6 +110,7 @@ pub(crate) struct CompletionsArgs {
 pub(crate) enum CompletionShell {
     Bash,
     Zsh,
+    PowerShell,
 }
 
 #[derive(Debug, Args)]
@@ -473,15 +473,18 @@ fn write_project_config(path: &Path, contents: &[u8], force: bool) -> io::Result
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
         if force {
-            fs::rename(&temporary, path)?;
+            crate::platform::replace_file(&temporary, path)?;
         } else {
             fs::hard_link(&temporary, path)?;
             fs::remove_file(&temporary)?;
@@ -522,10 +525,26 @@ fn completions_command(arguments: CompletionsArgs, output: &mut impl Write) -> i
     let shell = match arguments.shell {
         CompletionShell::Bash => Shell::Bash,
         CompletionShell::Zsh => Shell::Zsh,
+        CompletionShell::PowerShell => Shell::PowerShell,
     };
     let mut command = Cli::command();
     command.set_bin_name("nook");
     command.build();
+    if arguments.shell == CompletionShell::PowerShell {
+        let mut generated = Vec::new();
+        shell.try_generate(&command, &mut generated)?;
+        let mut generated = String::from_utf8(generated)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let marker = "\n    $completions.Where{ $_.CompletionText -like \"$wordToComplete*\" }";
+        let position = generated.find(marker).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PowerShell completion template has an unsupported layout",
+            )
+        })?;
+        generated.insert_str(position, POWERSHELL_DYNAMIC_COMPLETION);
+        return output.write_all(generated.as_bytes());
+    }
     shell.try_generate(&command, output)?;
     match shell {
         Shell::Bash => output.write_all(BASH_DYNAMIC_COMPLETION.as_bytes()),
@@ -896,6 +915,115 @@ _nook_dynamic() {
 compdef _nook_dynamic nook
 "#;
 
+const POWERSHELL_DYNAMIC_COMPLETION: &str = r#"
+
+    # Complete names from Nook's local registry without invoking reconciliation
+    # or Caddy. Errors deliberately produce no dynamic candidates.
+    $nookWords = @(
+        foreach ($element in $commandElements) {
+            if ($element -is [StringConstantExpressionAst]) {
+                $element.Value
+            }
+        }
+    )
+    $currentIndex = $nookWords.Count
+    if ($currentIndex -gt 0 -and $nookWords[-1] -eq $wordToComplete) {
+        $currentIndex -= 1
+    }
+
+    $namePosition = {
+        param([string]$kind, [int]$index)
+        while ($index -lt $currentIndex) {
+            $value = $nookWords[$index]
+            if ($value -eq '--caddy-socket') {
+                if ($index + 1 -eq $currentIndex) { return $false }
+                $index += 2
+            } elseif ($value.StartsWith('--caddy-socket=')) {
+                $index += 1
+            } elseif ($value -eq '--force' -and $kind -eq 'runs') {
+                $index += 1
+            } elseif ($value -in @('-h', '--help', '--')) {
+                $index += 1
+            } else {
+                return $false
+            }
+        }
+        return -not $wordToComplete.StartsWith('-')
+    }
+
+    $commandIndex = 1
+    while ($commandIndex -lt $currentIndex) {
+        $value = $nookWords[$commandIndex]
+        if ($value -eq '--caddy-socket') {
+            if ($commandIndex + 1 -eq $currentIndex) { break }
+            $commandIndex += 2
+        } elseif ($value.StartsWith('--caddy-socket=')) {
+            $commandIndex += 1
+        } else {
+            break
+        }
+    }
+
+    $dynamicKind = $null
+    if ($commandIndex -eq $currentIndex) {
+        if (-not $wordToComplete.StartsWith('-')) { $dynamicKind = 'runs' }
+    } elseif ($commandIndex -lt $nookWords.Count) {
+        $subcommand = $nookWords[$commandIndex]
+        if ($subcommand -eq 'stop' -and
+            (& $namePosition 'runs' ($commandIndex + 1))) {
+            $dynamicKind = 'runs'
+        } elseif ($subcommand -eq 'alias') {
+            $actionIndex = $commandIndex + 1
+            while ($actionIndex -lt $currentIndex) {
+                $value = $nookWords[$actionIndex]
+                if ($value -eq '--caddy-socket') {
+                    if ($actionIndex + 1 -eq $currentIndex) { break }
+                    $actionIndex += 2
+                } elseif ($value.StartsWith('--caddy-socket=')) {
+                    $actionIndex += 1
+                } else {
+                    break
+                }
+            }
+            if ($actionIndex -lt $nookWords.Count -and
+                $nookWords[$actionIndex] -eq 'remove' -and
+                (& $namePosition 'aliases' ($actionIndex + 1))) {
+                $dynamicKind = 'aliases'
+            } elseif ((& $namePosition 'aliases' ($commandIndex + 1)) -and
+                $wordToComplete -notin @('set', 'remove', 'list', 'help')) {
+                $dynamicKind = 'aliases'
+            }
+        } elseif ($subcommand -notin @(
+            'init', 'run', 'list', 'status', 'prune', 'ca', 'config',
+            'completions', 'update', 'help'
+        ) -and $currentIndex -eq $commandIndex + 1 -and
+            'run'.StartsWith($wordToComplete)) {
+            $completions += [CompletionResult]::new(
+                'run', 'run', [CompletionResultType]::ParameterValue,
+                'Run this named route'
+            )
+        }
+    }
+
+    if ($null -ne $dynamicKind -and $nookWords.Count -gt 0) {
+        try {
+            $nookExecutable = $nookWords[0]
+            foreach ($candidate in @(& $nookExecutable __complete $dynamicKind 2>$null)) {
+                if ($candidate -and $candidate.StartsWith(
+                    $wordToComplete, [StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $completions += [CompletionResult]::new(
+                        $candidate, $candidate, [CompletionResultType]::ParameterValue,
+                        'Managed Nook name'
+                    )
+                }
+            }
+        } catch {
+            # Completion must remain available when the registry cannot be read.
+        }
+    }
+"#;
+
 fn config_command(arguments: ConfigArgs, output: &mut impl Write) -> crate::Result<()> {
     match arguments.command {
         ConfigCommand::Init(arguments) => {
@@ -1016,15 +1144,18 @@ fn write_certificate(path: &Path, contents: &[u8], force: bool) -> io::Result<()
         uuid::Uuid::new_v4()
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
         if force {
-            fs::rename(&temporary, path)?;
+            crate::platform::replace_file(&temporary, path)?;
         } else {
             fs::hard_link(&temporary, path)?;
             fs::remove_file(&temporary)?;
@@ -1080,9 +1211,20 @@ fn run_command(
 fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<()> {
     let hostname = crate::config::normalize_hostname(&arguments.name)?;
     let store = state_store()?;
-    let mut system = crate::process::LinuxStopSystem;
-    crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
-    writeln!(output, "sent SIGTERM to {hostname}")?;
+    let mut system = crate::process::NativeStopSystem;
+    let signal = crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
+    let signal_name = match signal {
+        #[cfg(unix)]
+        crate::process::ProcessSignal::Terminate => "SIGTERM",
+        #[cfg(unix)]
+        crate::process::ProcessSignal::Kill => "SIGKILL",
+        #[cfg(windows)]
+        crate::process::ProcessSignal::Terminate => "CTRL_BREAK",
+        #[cfg(windows)]
+        crate::process::ProcessSignal::Kill => "forced termination",
+        crate::process::ProcessSignal::Interrupt => "interrupt",
+    };
+    writeln!(output, "sent {signal_name} to {hostname}")?;
     Ok(())
 }
 
@@ -1531,6 +1673,7 @@ fn looks_like_option(value: &OsStr) -> bool {
 mod tests {
     use std::ffi::OsString;
     use std::io::{self, Write};
+    #[cfg(unix)]
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     use clap::error::ErrorKind;
@@ -1605,6 +1748,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preserves_non_utf8_child_arguments() {
         let argument = OsString::from_vec(vec![b'a', 0x80, b'b']);
         let cli = parse_from([
@@ -1683,6 +1827,7 @@ mod tests {
         for (shell, expected) in [
             ("bash", CompletionShell::Bash),
             ("zsh", CompletionShell::Zsh),
+            ("power-shell", CompletionShell::PowerShell),
         ] {
             let cli = parse(&["completions", shell]);
             let Command::Completions(arguments) = cli.command else {
