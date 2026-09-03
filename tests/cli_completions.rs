@@ -159,6 +159,7 @@ fn powershell_completion_proposes_dynamic_names() {
     let path = format!("{};{}", bin_directory.display(), path.to_string_lossy());
     for (line, expected) in [
         ("nook stop a", "api"),
+        ("nook stop A", "api"),
         ("nook stop --force a", "api"),
         ("nook alias remove d", "docs"),
         ("nook alias d", "docs"),

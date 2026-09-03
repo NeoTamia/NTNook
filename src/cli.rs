@@ -1009,7 +1009,9 @@ const POWERSHELL_DYNAMIC_COMPLETION: &str = r#"
         try {
             $nookExecutable = $nookWords[0]
             foreach ($candidate in @(& $nookExecutable __complete $dynamicKind 2>$null)) {
-                if ($candidate -and $candidate.StartsWith($wordToComplete)) {
+                if ($candidate -and $candidate.StartsWith(
+                    $wordToComplete, [StringComparison]::OrdinalIgnoreCase
+                )) {
                     $completions += [CompletionResult]::new(
                         $candidate, $candidate, [CompletionResultType]::ParameterValue,
                         'Managed Nook name'
