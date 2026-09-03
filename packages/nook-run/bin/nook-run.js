@@ -4,8 +4,8 @@ import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
 import { constants } from "node:os";
 
-const INSTALL_URL =
-  "https://github.com/NeoTamia/NTNook/releases/latest/download/nook-installer.sh";
+import { installationGuidance } from "./install-guidance.js";
+
 let forwardedSignal;
 let child;
 const launchErrors = new WeakSet();
@@ -72,8 +72,7 @@ function handleLaunchError(error) {
   if (error.code === "ENOENT") {
     report(`nook-run: warning: Nook was not found in PATH; running the command directly.
 
-Install Nook on Linux with:
-  curl --proto '=https' --tlsv1.2 -LsSf ${INSTALL_URL} | sh
+${installationGuidance(process.platform)}
 
 Nook features such as local domains and HTTPS will be unavailable.`);
 
