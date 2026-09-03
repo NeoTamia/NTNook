@@ -12,7 +12,7 @@ concurrency:
 jobs:
   release-please:
     name: Release Please
-    uses: NeoTamia/actions/.github/workflows/release-please.yml@19c096d7414b3b1756eea45e5aa5c7a3eaed3455 # main
+    uses: NeoTamia/actions/.github/workflows/release-please.yml@0837340474974aab525d7b540d2c1a78250c4944 # main
     permissions:
       contents: write
       pull-requests: write
@@ -22,7 +22,7 @@ jobs:
     name: Gitflow release
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
-    uses: NeoTamia/actions/.github/workflows/gitflow-release.yml@19c096d7414b3b1756eea45e5aa5c7a3eaed3455 # main
+    uses: NeoTamia/actions/.github/workflows/gitflow-release.yml@0837340474974aab525d7b540d2c1a78250c4944 # main
     permissions:
       contents: write
     secrets: inherit
@@ -34,7 +34,7 @@ jobs:
     name: Gitflow nook-run release
     needs: release-please
     if: ${{ fromJSON(needs.release-please.outputs.outputs)['packages/nook-run--release_created'] == 'true' }}
-    uses: NeoTamia/actions/.github/workflows/gitflow-release.yml@19c096d7414b3b1756eea45e5aa5c7a3eaed3455 # main
+    uses: NeoTamia/actions/.github/workflows/gitflow-release.yml@0837340474974aab525d7b540d2c1a78250c4944 # main
     permissions:
       contents: write
     secrets: inherit
