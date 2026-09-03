@@ -678,8 +678,7 @@ fn spawn_managed_child(
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
     let Some(identity) = read_process_identity(pid) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        cleanup_unidentified_child(&mut child, pid);
         return Err(Error::ProcessIdentity(pid));
     };
     #[cfg(windows)]
@@ -705,6 +704,25 @@ fn spawn_managed_child(
         #[cfg(windows)]
         job,
     })
+}
+
+fn cleanup_unidentified_child(child: &mut Child, _pid: u32) {
+    #[cfg(unix)]
+    {
+        // configure_child creates a process group whose id is the child's pid.
+        // The leader may already be gone while descendants still occupy that
+        // group, so killing only the Child handle would leave them unmanaged.
+        if i32::try_from(_pid)
+            .ok()
+            .and_then(|pgid| send_group_signal(pgid, libc::SIGKILL).ok())
+            .is_none()
+        {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(windows)]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(unix)]
@@ -1362,11 +1380,15 @@ mod tests {
     use std::ffi::OsString;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, TcpListener};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
         Error, Liveness, ProcIdentity, ProcessSignal, StopError, StopSystem, child_environment,
-        identity_liveness, parse_stat, readiness_probe_address, reserve_port, spawn_child,
-        start_run, start_run_with_hook, stop_managed, substitute_port,
+        cleanup_unidentified_child, configure_child, identity_liveness, parse_stat,
+        read_process_identity, readiness_probe_address, reserve_port, spawn_child, start_run,
+        start_run_with_hook, stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -1431,6 +1453,43 @@ mod tests {
                 start_time_ticks: 98765
             })
         );
+    }
+
+    #[test]
+    fn unidentified_exited_leader_does_not_leave_its_worker_running() {
+        let directory = std::env::temp_dir().join(format!("nook-orphan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("worker.pid");
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args([
+                "-c",
+                "import os,subprocess; p=subprocess.Popen(['/bin/sleep','30']); open(os.environ['NOOK_WORKER_PID'],'w').write(str(p.pid))",
+            ])
+            .env("NOOK_WORKER_PID", &marker);
+        configure_child(&mut command);
+        let mut leader = command.spawn().unwrap();
+        let leader_pid = leader.id();
+        assert!(leader.wait().unwrap().success());
+        let worker_pid: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        let worker_was_alive = read_process_identity(worker_pid)
+            .is_some_and(|identity| !matches!(identity.state, b'Z' | b'X'));
+
+        cleanup_unidentified_child(&mut leader, leader_pid);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && read_process_identity(worker_pid)
+                .is_some_and(|identity| !matches!(identity.state, b'Z' | b'X'))
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(worker_was_alive);
+        assert!(
+            read_process_identity(worker_pid)
+                .is_none_or(|identity| matches!(identity.state, b'Z' | b'X'))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
