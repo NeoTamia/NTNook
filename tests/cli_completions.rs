@@ -35,6 +35,7 @@ fn completion_scripts_are_generated_without_configuration_or_caddy() {
             "power-shell",
             &[
                 "Register-ArgumentCompleter",
+                "__complete $dynamicKind",
                 "--readiness-warn-after",
                 "--local",
                 "--print",
@@ -130,6 +131,62 @@ fn generated_zsh_completion_has_valid_syntax() {
         "{}",
         String::from_utf8_lossy(&syntax.stderr)
     );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn powershell_completion_proposes_dynamic_names() {
+    let directory = temporary_directory("dynamic-powershell");
+    let state_home = directory.join("state");
+    let state_directory = state_home.join("nook");
+    let bin_directory = directory.join("bin");
+    fs::create_dir_all(&state_directory).unwrap();
+    fs::create_dir(&bin_directory).unwrap();
+    write_registry(&state_directory.join("state.json"));
+    fs::copy(env!("CARGO_BIN_EXE_nook"), bin_directory.join("nook.exe")).unwrap();
+
+    let script_path = directory.join("nook.ps1");
+    let script = Command::new(env!("CARGO_BIN_EXE_nook"))
+        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+        .args(["completions", "power-shell"])
+        .output()
+        .unwrap();
+    assert!(script.status.success());
+    fs::write(&script_path, script.stdout).unwrap();
+
+    let path = std::env::var_os("PATH").unwrap();
+    let path = format!("{};{}", bin_directory.display(), path.to_string_lossy());
+    for (line, expected) in [
+        ("nook stop a", "api"),
+        ("nook stop --force a", "api"),
+        ("nook alias remove d", "docs"),
+        ("nook alias d", "docs"),
+    ] {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                ". $env:NOOK_COMPLETION_SCRIPT; (TabExpansion2 $env:NOOK_COMPLETION_LINE $env:NOOK_COMPLETION_CURSOR).CompletionMatches.CompletionText",
+            ])
+            .env("PATH", &path)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+            .env("NOOK_COMPLETION_SCRIPT", &script_path)
+            .env("NOOK_COMPLETION_LINE", line)
+            .env("NOOK_COMPLETION_CURSOR", line.len().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+
     fs::remove_dir_all(directory).unwrap();
 }
 

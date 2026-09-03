@@ -530,6 +530,21 @@ fn completions_command(arguments: CompletionsArgs, output: &mut impl Write) -> i
     let mut command = Cli::command();
     command.set_bin_name("nook");
     command.build();
+    if arguments.shell == CompletionShell::PowerShell {
+        let mut generated = Vec::new();
+        shell.try_generate(&command, &mut generated)?;
+        let mut generated = String::from_utf8(generated)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let marker = "\n    $completions.Where{ $_.CompletionText -like \"$wordToComplete*\" }";
+        let position = generated.find(marker).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PowerShell completion template has an unsupported layout",
+            )
+        })?;
+        generated.insert_str(position, POWERSHELL_DYNAMIC_COMPLETION);
+        return output.write_all(generated.as_bytes());
+    }
     shell.try_generate(&command, output)?;
     match shell {
         Shell::Bash => output.write_all(BASH_DYNAMIC_COMPLETION.as_bytes()),
@@ -898,6 +913,113 @@ _nook_dynamic() {
 }
 
 compdef _nook_dynamic nook
+"#;
+
+const POWERSHELL_DYNAMIC_COMPLETION: &str = r#"
+
+    # Complete names from Nook's local registry without invoking reconciliation
+    # or Caddy. Errors deliberately produce no dynamic candidates.
+    $nookWords = @(
+        foreach ($element in $commandElements) {
+            if ($element -is [StringConstantExpressionAst]) {
+                $element.Value
+            }
+        }
+    )
+    $currentIndex = $nookWords.Count
+    if ($currentIndex -gt 0 -and $nookWords[-1] -eq $wordToComplete) {
+        $currentIndex -= 1
+    }
+
+    $namePosition = {
+        param([string]$kind, [int]$index)
+        while ($index -lt $currentIndex) {
+            $value = $nookWords[$index]
+            if ($value -eq '--caddy-socket') {
+                if ($index + 1 -eq $currentIndex) { return $false }
+                $index += 2
+            } elseif ($value.StartsWith('--caddy-socket=')) {
+                $index += 1
+            } elseif ($value -eq '--force' -and $kind -eq 'runs') {
+                $index += 1
+            } elseif ($value -in @('-h', '--help', '--')) {
+                $index += 1
+            } else {
+                return $false
+            }
+        }
+        return -not $wordToComplete.StartsWith('-')
+    }
+
+    $commandIndex = 1
+    while ($commandIndex -lt $currentIndex) {
+        $value = $nookWords[$commandIndex]
+        if ($value -eq '--caddy-socket') {
+            if ($commandIndex + 1 -eq $currentIndex) { break }
+            $commandIndex += 2
+        } elseif ($value.StartsWith('--caddy-socket=')) {
+            $commandIndex += 1
+        } else {
+            break
+        }
+    }
+
+    $dynamicKind = $null
+    if ($commandIndex -eq $currentIndex) {
+        if (-not $wordToComplete.StartsWith('-')) { $dynamicKind = 'runs' }
+    } elseif ($commandIndex -lt $nookWords.Count) {
+        $subcommand = $nookWords[$commandIndex]
+        if ($subcommand -eq 'stop' -and
+            (& $namePosition 'runs' ($commandIndex + 1))) {
+            $dynamicKind = 'runs'
+        } elseif ($subcommand -eq 'alias') {
+            $actionIndex = $commandIndex + 1
+            while ($actionIndex -lt $currentIndex) {
+                $value = $nookWords[$actionIndex]
+                if ($value -eq '--caddy-socket') {
+                    if ($actionIndex + 1 -eq $currentIndex) { break }
+                    $actionIndex += 2
+                } elseif ($value.StartsWith('--caddy-socket=')) {
+                    $actionIndex += 1
+                } else {
+                    break
+                }
+            }
+            if ($actionIndex -lt $nookWords.Count -and
+                $nookWords[$actionIndex] -eq 'remove' -and
+                (& $namePosition 'aliases' ($actionIndex + 1))) {
+                $dynamicKind = 'aliases'
+            } elseif ((& $namePosition 'aliases' ($commandIndex + 1)) -and
+                $wordToComplete -notin @('set', 'remove', 'list', 'help')) {
+                $dynamicKind = 'aliases'
+            }
+        } elseif ($subcommand -notin @(
+            'init', 'run', 'list', 'status', 'prune', 'ca', 'config',
+            'completions', 'update', 'help'
+        ) -and $currentIndex -eq $commandIndex + 1 -and
+            'run'.StartsWith($wordToComplete)) {
+            $completions += [CompletionResult]::new(
+                'run', 'run', [CompletionResultType]::ParameterValue,
+                'Run this named route'
+            )
+        }
+    }
+
+    if ($null -ne $dynamicKind -and $nookWords.Count -gt 0) {
+        try {
+            $nookExecutable = $nookWords[0]
+            foreach ($candidate in @(& $nookExecutable __complete $dynamicKind 2>$null)) {
+                if ($candidate -and $candidate.StartsWith($wordToComplete)) {
+                    $completions += [CompletionResult]::new(
+                        $candidate, $candidate, [CompletionResultType]::ParameterValue,
+                        'Managed Nook name'
+                    )
+                }
+            }
+        } catch {
+            # Completion must remain available when the registry cannot be read.
+        }
+    }
 "#;
 
 fn config_command(arguments: ConfigArgs, output: &mut impl Write) -> crate::Result<()> {
