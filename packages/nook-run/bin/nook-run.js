@@ -5,6 +5,7 @@ import { writeSync } from "node:fs";
 import { constants } from "node:os";
 
 import { installationGuidance } from "./install-guidance.js";
+import { shouldSignalChild } from "./signal-forwarding.js";
 
 let forwardedSignal;
 let child;
@@ -32,7 +33,10 @@ function spawnChild(executable, executableArgs) {
   });
 
   child.once("spawn", () => {
-    if (forwardedSignal !== undefined) {
+    if (
+      forwardedSignal !== undefined &&
+      shouldSignalChild(process.platform, forwardedSignal)
+    ) {
       child.kill(forwardedSignal);
     }
   });
@@ -45,7 +49,10 @@ function spawnChild(executable, executableArgs) {
 function forwardSignal(signal) {
   forwardedSignal ??= signal;
 
-  if (child.pid !== undefined) {
+  if (
+    child.pid !== undefined &&
+    shouldSignalChild(process.platform, signal)
+  ) {
     child.kill(signal);
   }
 }

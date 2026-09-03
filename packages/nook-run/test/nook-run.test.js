@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { installationGuidance } from "../bin/install-guidance.js";
+import { shouldSignalChild } from "../bin/signal-forwarding.js";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = path.join(packageRoot, "bin", "nook-run.js");
@@ -79,6 +80,12 @@ test("selects installation guidance for the host platform", () => {
   assert.match(windowsGuidance, /nook-installer\.ps1/);
   assert.match(windowsGuidance, /\| iex/);
   assert.doesNotMatch(windowsGuidance, /nook-installer\.sh/);
+});
+
+test("lets Windows broadcast Ctrl+C to Nook for graceful cleanup", () => {
+  assert.equal(shouldSignalChild("win32", "SIGINT"), false);
+  assert.equal(shouldSignalChild("win32", "SIGTERM"), true);
+  assert.equal(shouldSignalChild("linux", "SIGINT"), true);
 });
 
 test("distinguishes a non-executable Nook binary", async (t) => {
