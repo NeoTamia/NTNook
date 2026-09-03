@@ -160,7 +160,12 @@ jobs:
       - name: Validate Compose files
         run: |
           docker compose -f docker/compose.yaml config --quiet
+          docker compose -f docker/compose.yaml -f docker/compose.windows.yaml config --quiet
           docker compose -f docker/compose.caddy-docker-proxy.yaml config --quiet
+          if docker compose -f docker/compose.yaml -f docker/compose.windows.yaml config --format json | jq -e '.services.caddy.extra_hosts | length > 0' >/dev/null; then
+            echo "Windows override retained the Linux host gateway mapping" >&2
+            exit 1
+          fi
 
       - name: Test official Caddy image
         env:

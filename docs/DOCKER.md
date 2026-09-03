@@ -32,16 +32,20 @@ $configDirectory = Join-Path $env:APPDATA "Nook"
 New-Item -ItemType Directory -Force $configDirectory | Out-Null
 Copy-Item docker/nook-config.windows.toml.example `
   (Join-Path $configDirectory "config.toml")
-docker compose -f docker/compose.yaml up -d --wait
+docker compose `
+  -f docker/compose.yaml `
+  -f docker/compose.windows.yaml `
+  up -d --wait
 nook status
 ```
 
 The Admin API remains published only on `127.0.0.1`. Caddy reaches Windows applications through
-`host.docker.internal`. Because Docker Desktop cannot reach a process bound only to Windows
-loopback in this bridge setup, the example sets `run_bind_address = "0.0.0.0"`. Keep Windows
-Firewall enabled and do not add an inbound firewall rule for application ports. If the fixed
-`172.30.0.0/24` subnet conflicts with another network, change the Compose subnet/gateway and
-`caddy_client_ip_ranges` together.
+Docker Desktop's own `host.docker.internal` mapping. The Windows override removes the fixed Linux
+bridge mapping from the base Compose file; use both `-f` arguments for every Compose operation in
+this mode. Because Docker Desktop cannot reach a process bound only to Windows loopback, the
+example sets `run_bind_address = "0.0.0.0"`. Keep Windows Firewall enabled and do not add an inbound
+firewall rule for application ports. If the fixed `172.30.0.0/24` subnet conflicts with another
+network, change the Compose subnet/gateway and `caddy_client_ip_ranges` together.
 
 This mode does not require the Caddy Windows service or `caddy.exe` on the host. It also does not
 give Nook access to the Docker socket.
@@ -100,8 +104,11 @@ The tests destroy only their own Compose project and dedicated volumes:
 NOOK_DOCKER_E2E=1 tests/docker_e2e.sh
 NOOK_DOCKER_E2E=1 \
   NOOK_DOCKER_COMPOSE="$PWD/docker/compose.caddy-docker-proxy.yaml" \
-  tests/docker_e2e.sh
+tests/docker_e2e.sh
 ```
+
+The Windows override is configuration-validated in CI. Its host mapping depends on Docker Desktop
+and is therefore not exercised by the Linux Docker E2E.
 
 ## Platforms
 
