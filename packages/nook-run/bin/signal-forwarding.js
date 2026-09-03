@@ -4,3 +4,7 @@ export function shouldSignalChild(platform, signal) {
   // console handler perform graceful route and process cleanup.
   return platform !== "win32" || signal !== "SIGINT";
 }
+
+export function shouldLaunchFallback(forwardedSignal) {
+  return forwardedSignal === undefined;
+}

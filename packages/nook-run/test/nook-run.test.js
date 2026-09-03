@@ -7,7 +7,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { installationGuidance } from "../bin/install-guidance.js";
-import { shouldSignalChild } from "../bin/signal-forwarding.js";
+import {
+  shouldLaunchFallback,
+  shouldSignalChild,
+} from "../bin/signal-forwarding.js";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = path.join(packageRoot, "bin", "nook-run.js");
@@ -86,6 +89,12 @@ test("lets Windows broadcast Ctrl+C to Nook for graceful cleanup", () => {
   assert.equal(shouldSignalChild("win32", "SIGINT"), false);
   assert.equal(shouldSignalChild("win32", "SIGTERM"), true);
   assert.equal(shouldSignalChild("linux", "SIGINT"), true);
+});
+
+test("does not start a fallback command after an interrupt", () => {
+  assert.equal(shouldLaunchFallback(undefined), true);
+  assert.equal(shouldLaunchFallback("SIGINT"), false);
+  assert.equal(shouldLaunchFallback("SIGTERM"), false);
 });
 
 test("distinguishes a non-executable Nook binary", async (t) => {

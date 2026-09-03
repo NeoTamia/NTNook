@@ -5,7 +5,10 @@ import { writeSync } from "node:fs";
 import { constants } from "node:os";
 
 import { installationGuidance } from "./install-guidance.js";
-import { shouldSignalChild } from "./signal-forwarding.js";
+import {
+  shouldLaunchFallback,
+  shouldSignalChild,
+} from "./signal-forwarding.js";
 
 let forwardedSignal;
 let child;
@@ -82,6 +85,12 @@ function handleLaunchError(error) {
 ${installationGuidance(process.platform)}
 
 Nook features such as local domains and HTTPS will be unavailable.`);
+
+    if (!shouldLaunchFallback(forwardedSignal)) {
+      removeSignalHandlers();
+      process.exitCode = signalExitCode(forwardedSignal);
+      return;
+    }
 
     if (command.length === 0) {
       removeSignalHandlers();
