@@ -163,10 +163,25 @@ impl ManagedChild {
         self.wait_with_signals(&mut signals)
     }
 
+    fn signal_foreground(&self, signal: ProcessSignal) -> Result<(), Error> {
+        #[cfg(unix)]
+        {
+            self.signal(signal)
+        }
+        #[cfg(windows)]
+        {
+            signal_with_forced_fallback(signal, |signal| signal_managed_child(self, signal))
+                .map_err(Error::Spawn)
+        }
+    }
+
     fn wait_with_signals(&mut self, signals: &mut ForwardedSignals) -> Result<i32, Error> {
         loop {
             for signal in signals.pending() {
+                #[cfg(unix)]
                 let _ = self.signal(signal);
+                #[cfg(windows)]
+                self.signal_foreground(signal)?;
             }
             if let Some(status) = self.child.try_wait().map_err(Error::Spawn)? {
                 #[cfg(unix)]
@@ -448,7 +463,7 @@ impl RunningChild {
         let mut warned = false;
         loop {
             for signal in self.signals.pending() {
-                self.child.signal(signal)?;
+                self.child.signal_foreground(signal)?;
             }
             if TcpStream::connect_timeout(
                 &SocketAddr::new(readiness_probe_address(self.bind_address), self.port),
@@ -1065,6 +1080,17 @@ fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Resu
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn signal_with_forced_fallback(
+    signal: ProcessSignal,
+    mut send: impl FnMut(ProcessSignal) -> io::Result<()>,
+) -> io::Result<()> {
+    match send(signal) {
+        Err(_) if signal != ProcessSignal::Kill => send(ProcessSignal::Kill),
+        result => result,
     }
 }
 
@@ -1960,8 +1986,8 @@ mod windows_tests {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     use super::{
-        Liveness, ProcessSignal, lease_liveness, read_process_identity, spawn_child,
-        substitute_port, windows_batch_command_line,
+        Liveness, ProcessSignal, lease_liveness, read_process_identity,
+        signal_with_forced_fallback, spawn_child, substitute_port, windows_batch_command_line,
     };
     use crate::state::{Lease, LeaseState, Scheme};
     use uuid::Uuid;
@@ -2053,6 +2079,21 @@ mod windows_tests {
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains("line breaks"));
         }
+    }
+
+    #[test]
+    fn failed_foreground_break_forces_job_termination() {
+        let mut delivered = Vec::new();
+        signal_with_forced_fallback(ProcessSignal::Interrupt, |signal| {
+            delivered.push(signal);
+            if signal == ProcessSignal::Interrupt {
+                Err(std::io::Error::other("console is not attached"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(delivered, [ProcessSignal::Interrupt, ProcessSignal::Kill]);
     }
 
     #[test]
