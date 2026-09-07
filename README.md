@@ -320,6 +320,8 @@ nook update --force
 - `update --check` reports whether a newer version exists without installing it.
 
 A binary installed with Cargo must be updated with `cargo install ntnook --locked --force`. Nook warns on stderr when an update is available; `NOOK_DISABLE_UPDATE_CHECK=1` disables this check.
+On Windows, Nook schedules the verified replacement after the current process exits. If that
+deferred replacement fails, the next Nook invocation reports the persisted failure on stderr.
 
 Nook never changes a foreign Caddy route, even with `--force`. Nook routes carry an owner UUID, so an old process cannot delete its replacement's route.
 

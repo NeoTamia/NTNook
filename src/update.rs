@@ -28,6 +28,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const ARCHIVE_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
+#[cfg(windows)]
+const WINDOWS_UPDATE_ERROR_NAME: &str = "nook.update-error.txt";
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -117,6 +119,7 @@ struct UpdateCache {
 }
 
 pub(crate) fn warn_if_available(errors: &mut impl Write) {
+    warn_deferred_update_failure(errors);
     if update_check_disabled() {
         return;
     }
@@ -137,6 +140,7 @@ pub(crate) fn perform(
     output: &mut impl Write,
     errors: &mut impl Write,
 ) -> Result<i32, Error> {
+    warn_deferred_update_failure(errors);
     if check {
         return check_latest(output, errors);
     }
@@ -222,16 +226,32 @@ fn install_latest(force: bool, output: &mut impl Write) -> Result<i32, Error> {
     }
     let binary = extract_nook(&archive)?;
     replace_binary(&executable, &binary)?;
-    if release.version == CURRENT_VERSION {
-        writeln!(output, "reinstalled nook {}", release.version)?;
+    report_installed_release(&release.version, output)?;
+    Ok(0)
+}
+
+#[cfg(not(windows))]
+fn report_installed_release(version: &str, output: &mut impl Write) -> io::Result<()> {
+    if version == CURRENT_VERSION {
+        writeln!(output, "reinstalled nook {version}")
+    } else {
+        writeln!(output, "updated nook from {CURRENT_VERSION} to {version}")
+    }
+}
+
+#[cfg(windows)]
+fn report_installed_release(version: &str, output: &mut impl Write) -> io::Result<()> {
+    if version == CURRENT_VERSION {
+        writeln!(
+            output,
+            "downloaded nook {version}; reinstallation is scheduled after this process exits"
+        )
     } else {
         writeln!(
             output,
-            "updated nook from {CURRENT_VERSION} to {}",
-            release.version
-        )?;
+            "downloaded nook {version}; update from {CURRENT_VERSION} is scheduled after this process exits"
+        )
     }
-    Ok(0)
 }
 
 fn cached_or_fetch() -> Option<String> {
@@ -474,6 +494,7 @@ function Get-NookPathIdentity([string]$path) {
 }
 $destination = [IO.Path]::GetFullPath($env:NOOK_UPDATE_DESTINATION)
 $destinationIdentity = Get-NookPathIdentity $destination
+$resultPath = [IO.Path]::GetFullPath($env:NOOK_UPDATE_RESULT)
 function Get-NookUpdateBlockers {
     @(
         Get-Process -ErrorAction SilentlyContinue | Where-Object {
@@ -509,6 +530,8 @@ while ($true) {
         }
         $unexplainedFailures += 1
         if ($unexplainedFailures -ge 3) {
+            $message = "deferred Nook update failed: $($moveError.Exception.Message)"
+            [IO.File]::WriteAllText($resultPath, $message, [Text.UTF8Encoding]::new($false))
             Remove-Item -LiteralPath $env:NOOK_UPDATE_SOURCE -Force -ErrorAction SilentlyContinue
             throw $moveError
         }
@@ -528,6 +551,12 @@ fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
         )
     })?;
     let temporary = parent.join(format!("nook.update.{}.exe", Uuid::new_v4()));
+    let result_path = parent.join(WINDOWS_UPDATE_ERROR_NAME);
+    if let Err(error) = fs::remove_file(&result_path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
     let mut options = OpenOptions::new();
     let result = (|| {
         let mut file = options.write(true).create_new(true).open(&temporary)?;
@@ -546,6 +575,7 @@ fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
             .env("NOOK_UPDATE_PARENT_PID", std::process::id().to_string())
             .env("NOOK_UPDATE_SOURCE", &temporary)
             .env("NOOK_UPDATE_DESTINATION", destination)
+            .env("NOOK_UPDATE_RESULT", &result_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -556,6 +586,41 @@ fn replace_binary(destination: &Path, contents: &[u8]) -> Result<(), Error> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(windows)]
+fn warn_deferred_update_failure(errors: &mut impl Write) {
+    let Ok(executable) = current_executable() else {
+        return;
+    };
+    let Some(parent) = executable.parent() else {
+        return;
+    };
+    report_deferred_update_failure(&parent.join(WINDOWS_UPDATE_ERROR_NAME), errors);
+}
+
+#[cfg(not(windows))]
+fn warn_deferred_update_failure(_errors: &mut impl Write) {}
+
+#[cfg(windows)]
+fn report_deferred_update_failure(path: &Path, errors: &mut impl Write) {
+    match fs::read_to_string(path) {
+        Ok(message) => {
+            let _ = fs::remove_file(path);
+            let message = message.trim();
+            if !message.is_empty() {
+                let _ = writeln!(errors, "warning: {message}");
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = writeln!(
+                errors,
+                "warning: cannot read the deferred update result at {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn current_executable() -> Result<PathBuf, Error> {
@@ -815,6 +880,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let source = directory.join("source.exe");
         let destination = directory.join("destination.exe");
+        let result_path = directory.join("update-result.txt");
         std::fs::write(&source, b"replacement").unwrap();
 
         let output = Command::new("powershell.exe")
@@ -828,6 +894,7 @@ mod tests {
             .env("NOOK_UPDATE_PARENT_PID", "2147483647")
             .env("NOOK_UPDATE_SOURCE", &source)
             .env("NOOK_UPDATE_DESTINATION", &destination)
+            .env("NOOK_UPDATE_RESULT", &result_path)
             .output()
             .unwrap();
         assert!(
@@ -837,6 +904,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
         assert!(!source.exists());
+        assert!(!result_path.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -849,6 +917,7 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let source = directory.join("source.exe");
         let destination = directory.join("nook.exe");
+        let result_path = directory.join("update-result.txt");
         std::fs::write(&source, b"replacement").unwrap();
         std::fs::copy(
             std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()),
@@ -877,6 +946,7 @@ mod tests {
                 "NOOK_UPDATE_DESTINATION",
                 destination.canonicalize().unwrap(),
             )
+            .env("NOOK_UPDATE_RESULT", &result_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -897,7 +967,56 @@ mod tests {
         );
         assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
         assert!(!source.exists());
+        assert!(!result_path.exists());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_windows_update_persists_and_reports_a_terminal_failure() {
+        use std::process::Command;
+
+        let directory = std::env::temp_dir().join(format!("nook-update-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let destination = directory.join("missing/destination.exe");
+        let result_path = directory.join("update-result.txt");
+        std::fs::write(&source, b"replacement").unwrap();
+
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                super::WINDOWS_UPDATE_SCRIPT,
+            ])
+            .env("NOOK_UPDATE_PARENT_PID", "2147483647")
+            .env("NOOK_UPDATE_SOURCE", &source)
+            .env("NOOK_UPDATE_DESTINATION", &destination)
+            .env("NOOK_UPDATE_RESULT", &result_path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!source.exists());
+
+        let mut warning = Vec::new();
+        super::report_deferred_update_failure(&result_path, &mut warning);
+        let warning = String::from_utf8(warning).unwrap();
+        assert!(warning.contains("warning: deferred Nook update failed:"));
+        assert!(!result_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_output_reports_a_scheduled_replacement() {
+        let mut output = Vec::new();
+        super::report_installed_release("99.0.0", &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("downloaded nook 99.0.0"));
+        assert!(output.contains("scheduled after this process exits"));
+        assert!(!output.contains("updated nook"));
     }
 
     #[test]
