@@ -658,7 +658,7 @@ fn spawn_managed_child(
         arguments,
         raw_argument,
         internal_environment,
-    } = prepare_windows_command(program, arguments, environment, lease_id);
+    } = prepare_windows_command(program, arguments, environment, lease_id)?;
     let mut command = Command::new(program);
     command.args(arguments).envs(environment.iter().cloned());
     #[cfg(windows)]
@@ -760,14 +760,14 @@ fn prepare_windows_command(
     arguments: Vec<OsString>,
     environment: &[(OsString, OsString)],
     lease_id: Uuid,
-) -> PreparedWindowsCommand {
+) -> Result<PreparedWindowsCommand, Error> {
     let Some(resolved) = resolve_windows_program(&program, environment) else {
-        return PreparedWindowsCommand {
+        return Ok(PreparedWindowsCommand {
             program,
             arguments,
             raw_argument: None,
             internal_environment: None,
-        };
+        });
     };
     let is_batch = resolved
         .extension()
@@ -776,12 +776,12 @@ fn prepare_windows_command(
             extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
         });
     if !is_batch {
-        return PreparedWindowsCommand {
+        return Ok(PreparedWindowsCommand {
             program: resolved.into_os_string(),
             arguments,
             raw_argument: None,
             internal_environment: None,
-        };
+        });
     }
 
     let interpreter =
@@ -794,13 +794,14 @@ fn prepare_windows_command(
     ];
     let percent_variable = format!("NOOK_INTERNAL_PERCENT_{}", lease_id.simple());
     let command_line =
-        windows_batch_command_line(resolved.as_os_str(), &arguments, &percent_variable);
-    PreparedWindowsCommand {
+        windows_batch_command_line(resolved.as_os_str(), &arguments, &percent_variable)
+            .map_err(Error::Spawn)?;
+    Ok(PreparedWindowsCommand {
         program: interpreter,
         arguments: shell_arguments,
         raw_argument: Some(command_line),
         internal_environment: Some((OsString::from(percent_variable), OsString::from("%"))),
-    }
+    })
 }
 
 #[cfg(windows)]
@@ -808,7 +809,7 @@ fn windows_batch_command_line(
     program: &std::ffi::OsStr,
     arguments: &[OsString],
     percent_variable: &str,
-) -> OsString {
+) -> io::Result<OsString> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
     let mut command_line = vec![b'"' as u16];
@@ -819,6 +820,15 @@ fn windows_batch_command_line(
         .chain(arguments.iter().map(OsString::as_os_str))
         .enumerate()
     {
+        if argument
+            .encode_wide()
+            .any(|unit| unit == b'\r' as u16 || unit == b'\n' as u16)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "batch command arguments cannot contain line breaks",
+            ));
+        }
         if index != 0 {
             command_line.push(b' ' as u16);
         }
@@ -848,7 +858,7 @@ fn windows_batch_command_line(
         }
     }
     command_line.push(b'"' as u16);
-    OsString::from_wide(&command_line)
+    Ok(OsString::from_wide(&command_line))
 }
 
 #[cfg(windows)]
@@ -1951,7 +1961,7 @@ mod windows_tests {
 
     use super::{
         Liveness, ProcessSignal, lease_liveness, read_process_identity, spawn_child,
-        substitute_port,
+        substitute_port, windows_batch_command_line,
     };
     use crate::state::{Lease, LeaseState, Scheme};
     use uuid::Uuid;
@@ -2029,6 +2039,20 @@ mod windows_tests {
         .unwrap();
         assert_eq!(child.wait().unwrap(), 7);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn batch_shim_arguments_reject_line_breaks() {
+        for argument in ["before\nafter", "before\rafter"] {
+            let error = windows_batch_command_line(
+                std::ffi::OsStr::new("shim.cmd"),
+                &[OsString::from(argument)],
+                "NOOK_INTERNAL_PERCENT_TEST",
+            )
+            .expect_err("line breaks must not enter a cmd.exe command string");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("line breaks"));
+        }
     }
 
     #[test]

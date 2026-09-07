@@ -486,8 +486,7 @@ fn write_project_config(path: &Path, contents: &[u8], force: bool) -> io::Result
         if force {
             crate::platform::replace_file(&temporary, path)?;
         } else {
-            fs::hard_link(&temporary, path)?;
-            fs::remove_file(&temporary)?;
+            crate::platform::move_new_file(&temporary, path)?;
         }
         Ok(())
     })();
@@ -1157,8 +1156,7 @@ fn write_certificate(path: &Path, contents: &[u8], force: bool) -> io::Result<()
         if force {
             crate::platform::replace_file(&temporary, path)?;
         } else {
-            fs::hard_link(&temporary, path)?;
-            fs::remove_file(&temporary)?;
+            crate::platform::move_new_file(&temporary, path)?;
         }
         Ok(())
     })();

@@ -277,8 +277,7 @@ fn write_global_at(path: &Path, config: &GlobalConfig, force: bool) -> Result<()
         if force {
             crate::platform::replace_file(&temporary, path)?;
         } else {
-            fs::hard_link(&temporary, path)?;
-            fs::remove_file(&temporary)?;
+            crate::platform::move_new_file(&temporary, path)?;
         }
         Ok::<(), io::Error>(())
     })();

@@ -1,13 +1,24 @@
 //! Small operating-system primitives shared by persistence and installers.
 
+use std::fs;
 use std::io;
 use std::path::Path;
 
 #[cfg(unix)]
-use std::fs;
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
 
 #[cfg(unix)]
-pub(crate) fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn move_new_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::hard_link(source, destination)?;
+    fs::remove_file(source)
+}
+
+#[cfg(windows)]
+pub(crate) fn move_new_file(source: &Path, destination: &Path) -> io::Result<()> {
+    // A same-directory rename preserves create-new semantics on Windows without
+    // requiring hard-link support (for example on FAT/exFAT volumes or shares).
     fs::rename(source, destination)
 }
 
