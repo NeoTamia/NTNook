@@ -33,7 +33,9 @@ It verifies the release checksum, installs `nook.exe` under
 `%LOCALAPPDATA%\Programs\Nook\bin`, adds that directory to the user `PATH`, and configures
 PowerShell completion. `NOOK_INSTALL_DIR` and `NOOK_VERSION` provide the same overrides as the
 Linux installer. Open a new terminal after the first installation so it receives the updated
-`PATH`.
+`PATH`. If an active Nook process delays replacement during a reinstall, the installer reports the
+operation as scheduled; a terminal replacement failure is persisted and shown by the next Nook or
+installer invocation.
 
 Rust users on either platform can also build the published version from crates.io:
 

@@ -53,6 +53,14 @@ try {
 
     New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
     $installedBinary = Join-Path $installDirectory "nook.exe"
+    $resultPath = Join-Path $installDirectory "nook.update-error.txt"
+    if (Test-Path -LiteralPath $resultPath) {
+        $previousResult = (Get-Content -Raw -LiteralPath $resultPath).Trim()
+        Remove-Item -Force -LiteralPath $resultPath
+        if ($previousResult) {
+            Write-Warning $previousResult
+        }
+    }
     $stagedBinary = Join-Path $installDirectory "nook.install.$([guid]::NewGuid()).exe"
     Copy-Item -LiteralPath $binary.FullName -Destination $stagedBinary
 
@@ -119,6 +127,7 @@ function Get-NookPathIdentity([string]$path) {
 }
 $destination = [IO.Path]::GetFullPath($env:NOOK_INSTALL_DESTINATION)
 $identity = Get-NookPathIdentity $destination
+$resultPath = [IO.Path]::GetFullPath($env:NOOK_INSTALL_RESULT)
 function Get-NookInstallBlockers {
     @(
         Get-Process -ErrorAction SilentlyContinue | Where-Object {
@@ -148,6 +157,8 @@ while ($true) {
         if ((Get-NookInstallBlockers).Count -gt 0) { continue }
         $unexplainedFailures += 1
         if ($unexplainedFailures -ge 3) {
+            $message = "deferred Nook installation failed: $($moveError.Exception.Message)"
+            [IO.File]::WriteAllText($resultPath, $message, [Text.UTF8Encoding]::new($false))
             Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath $env:NOOK_INSTALL_SOURCE
             throw $moveError
         }
@@ -165,12 +176,12 @@ while ($true) {
         $startInfo.CreateNoWindow = $true
         $startInfo.EnvironmentVariables["NOOK_INSTALL_SOURCE"] = $stagedBinary
         $startInfo.EnvironmentVariables["NOOK_INSTALL_DESTINATION"] = $installedBinary
+        $startInfo.EnvironmentVariables["NOOK_INSTALL_RESULT"] = $resultPath
         $replacementProcess = [Diagnostics.Process]::Start($startInfo)
         if (-not $replacementProcess) {
             throw "nook: cannot start deferred binary replacement"
         }
         $deferredReplacementStarted = $true
-        Write-Host "nook: binary replacement will finish after active Nook processes exit"
     }
 
     $profilePath = $PROFILE.CurrentUserAllHosts
@@ -204,7 +215,11 @@ $end
         Write-Host "nook: added $installDirectory to the user PATH; open a new terminal"
     }
 
-    Write-Host "nook: installed $installedBinary"
+    if ($replacementDeferred) {
+        Write-Host "nook: installation of $installedBinary is scheduled after active Nook processes exit"
+    } else {
+        Write-Host "nook: installed $installedBinary"
+    }
     Write-Host "nook: installed PowerShell completions"
 } finally {
     if (-not $deferredReplacementStarted -and $stagedBinary -and
