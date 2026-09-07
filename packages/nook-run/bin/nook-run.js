@@ -9,6 +9,7 @@ import {
   shouldLaunchFallback,
   shouldSignalChild,
 } from "./signal-forwarding.js";
+import { prepareWindowsFallback } from "./windows-command.js";
 
 let forwardedSignal;
 let child;
@@ -27,12 +28,13 @@ const args = process.argv.slice(2);
 const separatorIndex = args.indexOf("--");
 const command = separatorIndex === -1 ? [] : args.slice(separatorIndex + 1);
 
-function spawnChild(executable, executableArgs) {
+function spawnChild(executable, executableArgs, options = {}) {
   child = spawn(executable, executableArgs, {
     cwd: process.cwd(),
     env: process.env,
     shell: false,
     stdio: "inherit",
+    ...options,
   });
 
   child.once("spawn", () => {
@@ -99,7 +101,30 @@ Nook features such as local domains and HTTPS will be unavailable.`);
       return;
     }
 
-    const fallback = spawnChild(command[0], command.slice(1));
+    let invocation = {
+      executable: command[0],
+      args: command.slice(1),
+      options: {},
+    };
+    try {
+      if (process.platform === "win32") {
+        invocation = prepareWindowsFallback(command[0], command.slice(1), {
+          cwd: process.cwd(),
+          environment: process.env,
+        });
+      }
+    } catch (fallbackError) {
+      removeSignalHandlers();
+      report(`nook-run: failed to start ${command[0]}: ${fallbackError.message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const fallback = spawnChild(
+      invocation.executable,
+      invocation.args,
+      invocation.options,
+    );
     fallback.once("error", (fallbackError) => {
       launchErrors.add(fallback);
       removeSignalHandlers();
