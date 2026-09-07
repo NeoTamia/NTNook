@@ -561,41 +561,82 @@ pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
 #[allow(unsafe_code)]
 pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
     use windows_sys::Win32::Security::Cryptography::{
-        CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateContext,
+        CERT_QUERY_ENCODING_TYPE, CERT_STORE_OPEN_EXISTING_FLAG, CERT_STORE_PROV_SYSTEM_W,
+        CERT_STORE_READONLY_FLAG, CERT_SYSTEM_STORE_LOCAL_MACHINE, CertCloseStore,
+        CertEnumCertificatesInStore, CertFreeCertificateContext, CertOpenStore,
         CertOpenSystemStoreW,
     };
 
     let (_, expected) = canonical_local_ca(pem)?;
     let store_name: Vec<u16> = "ROOT".encode_utf16().chain(Some(0)).collect();
-    let store = unsafe { CertOpenSystemStoreW(0, store_name.as_ptr()) };
-    if store.is_null() {
-        return Err(Error::AdminRequest(format!(
-            "cannot open the Windows ROOT certificate store: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let mut previous = std::ptr::null();
-    let mut trusted = false;
-    loop {
-        let context = unsafe { CertEnumCertificatesInStore(store, previous) };
-        if context.is_null() {
-            break;
+    let contains_certificate = |store| {
+        let mut previous = std::ptr::null();
+        loop {
+            let context = unsafe { CertEnumCertificatesInStore(store, previous) };
+            if context.is_null() {
+                return false;
+            }
+            let certificate = unsafe {
+                std::slice::from_raw_parts(
+                    (*context).pbCertEncoded,
+                    usize::try_from((*context).cbCertEncoded).unwrap_or(0),
+                )
+            };
+            if certificate == expected {
+                unsafe { CertFreeCertificateContext(context) };
+                return true;
+            }
+            previous = context;
         }
-        let certificate = unsafe {
-            std::slice::from_raw_parts(
-                (*context).pbCertEncoded,
-                usize::try_from((*context).cbCertEncoded).unwrap_or(0),
-            )
-        };
-        if certificate == expected {
-            trusted = true;
-            unsafe { CertFreeCertificateContext(context) };
-            break;
+    };
+
+    let current_user = unsafe { CertOpenSystemStoreW(0, store_name.as_ptr()) };
+    let current_user_error = current_user.is_null().then(std::io::Error::last_os_error);
+    if !current_user.is_null() {
+        let trusted = contains_certificate(current_user);
+        unsafe { CertCloseStore(current_user, 0) };
+        if trusted {
+            return Ok(true);
         }
-        previous = context;
     }
-    unsafe { CertCloseStore(store, 0) };
-    Ok(trusted)
+
+    // Caddy may be installed as a service and trust its local CA in the
+    // machine-wide store instead of the interactive user's ROOT store.
+    let local_machine = unsafe {
+        CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_W,
+            CERT_QUERY_ENCODING_TYPE::default(),
+            0,
+            CERT_SYSTEM_STORE_LOCAL_MACHINE
+                | CERT_STORE_OPEN_EXISTING_FLAG
+                | CERT_STORE_READONLY_FLAG,
+            store_name.as_ptr() as _,
+        )
+    };
+    let local_machine_error = local_machine.is_null().then(std::io::Error::last_os_error);
+    if !local_machine.is_null() {
+        let trusted = contains_certificate(local_machine);
+        unsafe { CertCloseStore(local_machine, 0) };
+        if trusted {
+            return Ok(true);
+        }
+    }
+
+    if current_user_error.is_none() && local_machine_error.is_none() {
+        return Ok(false);
+    }
+
+    let mut details = Vec::new();
+    if let Some(error) = current_user_error {
+        details.push(format!("CurrentUser: {error}"));
+    }
+    if let Some(error) = local_machine_error {
+        details.push(format!("LocalMachine: {error}"));
+    }
+    Err(Error::AdminRequest(format!(
+        "cannot open the Windows ROOT certificate stores: {}",
+        details.join("; ")
+    )))
 }
 
 pub(crate) fn canonical_local_ca(pem: &str) -> Result<(String, Vec<u8>), Error> {
