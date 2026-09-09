@@ -1,0 +1,10 @@
+format_version = 1
+caddy_admin = "http://127.0.0.1:2019"
+
+# Docker Desktop reaches host applications through this DNS name. Applications
+# must listen beyond Windows loopback; keep the Windows Firewall enabled.
+run_bind_address = "0.0.0.0"
+caddy_loopback_host = "host.docker.internal"
+
+# Requests published by the fixed Compose bridge arrive from its gateway.
+caddy_client_ip_ranges = ["172.30.0.1/32"]

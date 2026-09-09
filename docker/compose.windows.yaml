@@ -1,0 +1,5 @@
+services:
+  caddy:
+    # Docker Desktop supplies this hostname with the correct Windows host
+    # address. Remove the Linux bridge override from compose.yaml.
+    extra_hosts: !reset []

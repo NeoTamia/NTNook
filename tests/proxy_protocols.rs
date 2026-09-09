@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 mod support;
 
 use std::io::{Read, Write};
@@ -46,20 +48,31 @@ https://localhost:{} {{
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.ends_with("ok"));
     }
-    assert_eq!(
-        ureq::get(format!("{}/ok", harness.https_url()))
+    let https_url = format!("{}/ok", harness.https_url());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = ureq::get(&https_url)
             .config()
             .tls_config(
                 ureq::tls::TlsConfig::builder()
                     .disable_verification(true)
-                    .build()
+                    .build(),
             )
             .build()
-            .call()
-            .unwrap()
-            .status(),
-        200
-    );
+            .call();
+        match response {
+            Ok(response) => {
+                assert_eq!(response.status(), 200);
+                break;
+            }
+            Err(_) if Instant::now() < deadline => {
+                // Caddy can briefly reject the first handshake while its
+                // internal CA issues the certificate for a reloaded site.
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("HTTPS route did not become ready: {error}"),
+        }
+    }
 
     let headers_response = raw_request(harness.http_port(), "preserve.localhost", "/headers", &[]);
     let headers = response_body(&headers_response);

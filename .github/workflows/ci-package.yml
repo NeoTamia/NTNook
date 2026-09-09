@@ -88,3 +88,24 @@ jobs:
         env:
           PACKAGE_MANAGER: ${{ matrix.package-manager }}
         run: node packages/nook-run/scripts/package-manager-smoke.js
+
+  windows-package:
+    name: Windows batch fallback
+    runs-on: windows-2025
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: packages/nook-run
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Test Windows command preparation and execution
+        run: node --test test/windows-command.test.js
