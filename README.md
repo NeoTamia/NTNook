@@ -239,6 +239,7 @@ nook run --name legacy --no-tls -- ./server
 
 - `--name <name>` selects the domain; `.localhost` is appended automatically;
 - `--no-tls` uses the HTTP frontend exclusively;
+- `--run-bind-address <IP>` overrides the project and global bind address (IPv4 or IPv6), also injected as `HOST`;
 - `--app-port <port>` requests a port, with an explicit fallback if it is occupied;
 - `--strict-port` disables that fallback and requires `--app-port`;
 - `--force` transfers a hostname already owned by Nook without stopping the old process;
@@ -335,6 +336,7 @@ Create a documented project configuration in the current directory:
 nook init
 nook init --name api --app-port 5173 -- pnpm run dev
 nook init --local
+nook init --local --run-bind-address 0.0.0.0
 nook init --print
 ```
 

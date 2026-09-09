@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -76,6 +77,9 @@ pub(crate) struct InitArgs {
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Application bind IP address, also injected as HOST.
+    #[arg(long, value_name = "IP")]
+    pub(crate) run_bind_address: Option<IpAddr>,
     /// Preferred application port.
     #[arg(long, value_name = "PORT")]
     pub(crate) app_port: Option<u16>,
@@ -187,6 +191,9 @@ pub(crate) struct RunArgs {
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Application bind IP address, also injected as HOST.
+    #[arg(long, value_name = "IP")]
+    pub(crate) run_bind_address: Option<IpAddr>,
     /// Preferred application port.
     #[arg(long, value_name = "PORT")]
     pub(crate) app_port: Option<u16>,
@@ -437,9 +444,14 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
             "# Delay before the readiness warning.\n# readiness_warn_after_seconds = 30\n",
         ),
     }
-    contents.push_str(
-        "\n# Interface used to bind the application and injected as HOST.\n# run_bind_address = \"127.0.0.1\"\n",
-    );
+    contents.push_str("\n# Interface used to bind the application and injected as HOST.\n");
+    match arguments.run_bind_address {
+        Some(address) => contents.push_str(&format!(
+            "run_bind_address = {}\n",
+            toml_string(&address.to_string())
+        )),
+        None => contents.push_str("# run_bind_address = \"127.0.0.1\"\n"),
+    }
     Ok(contents)
 }
 
@@ -1727,6 +1739,30 @@ mod tests {
         assert!(run.local);
         assert_eq!(run.readiness_warn_after, Some(12));
         assert_eq!(run.command, ["bun", "dev"]);
+    }
+
+    #[test]
+    fn bind_address_accepts_ip_addresses_and_rejects_invalid_values() {
+        for command in ["run", "init"] {
+            for address in ["127.0.0.2", "0.0.0.0", "::1", "::"] {
+                let cli = try_parse(&[command, "--run-bind-address", address]).unwrap();
+                let parsed = match cli.command {
+                    Command::Run(args) => args.run_bind_address,
+                    Command::Init(args) => args.run_bind_address,
+                    _ => unreachable!(),
+                };
+                assert_eq!(parsed, Some(address.parse().unwrap()));
+            }
+            for address in ["localhost", "127.0.0.1:3000", "invalid"] {
+                assert_eq!(
+                    try_parse(&[command, "--run-bind-address", address])
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::ValueValidation
+                );
+            }
+            assert!(try_parse(&[command, "--run-bind-address"]).is_err());
+        }
     }
 
     #[test]

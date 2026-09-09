@@ -461,7 +461,10 @@ fn merge_run(
             .readiness_warn_after
             .or(project.readiness_warn_after_seconds)
             .unwrap_or(DEFAULT_READINESS_WARN_AFTER_SECONDS),
-        bind_address: project.run_bind_address.unwrap_or(default_bind_address),
+        bind_address: arguments
+            .run_bind_address
+            .or(project.run_bind_address)
+            .unwrap_or(default_bind_address),
         ignored_local_config: None,
     })
 }
@@ -792,6 +795,32 @@ mod tests {
         assert!(!resolved.strict_port);
         assert!(!resolved.force);
         assert_eq!(resolved.readiness_warn_after_seconds, 20);
+    }
+
+    #[test]
+    fn bind_address_precedence_is_cli_then_project_then_global() {
+        for (cli, project_address, expected) in [
+            (Some("::1"), Some("127.0.0.2"), "::1"),
+            (Some("0.0.0.0"), None, "0.0.0.0"),
+            (None, Some("127.0.0.2"), "127.0.0.2"),
+            (None, None, "127.0.0.3"),
+        ] {
+            let mut project = project();
+            project.run_bind_address = project_address.map(|address| address.parse().unwrap());
+            let args = match cli {
+                Some(address) => run_args(&["run", "--run-bind-address", address]),
+                None => run_args(&["run"]),
+            };
+            let resolved = merge_run(
+                &args,
+                Some(project),
+                None,
+                Path::new("/cwd"),
+                "127.0.0.3".parse().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(resolved.bind_address.to_string(), expected);
+        }
     }
 
     #[test]
