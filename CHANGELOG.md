@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.7.0](https://github.com/NeoTamia/NTNook/compare/v0.6.0...v0.7.0) (2026-09-09)
+
+
+### ✨ Features
+
+* **windows:** Add dynamic PowerShell completion ([86f3073](https://github.com/NeoTamia/NTNook/commit/86f30736de4f8fc826b14b3539213c3d4bdbe711))
+* **windows:** Add native runtime and release support ([eacb9ba](https://github.com/NeoTamia/NTNook/commit/eacb9badf401f99789544fe2c3c6cfd25c9df5f0))
+
+
+### 🐛 Bug Fixes
+
+* **docker:** Preserve Windows host gateway ([ab653a2](https://github.com/NeoTamia/NTNook/commit/ab653a2045d840dcb0c741bd21bf953463d649d0))
+* **nook-run:** Launch Windows batch fallbacks ([ebf8d82](https://github.com/NeoTamia/NTNook/commit/ebf8d82d7361f377026c902c61fa95bd155c90fc))
+* Probe loopback for wildcard application binds ([1adc9af](https://github.com/NeoTamia/NTNook/commit/1adc9afe069bc3c23d6084f6e9690a1af87a57e6))
+* **unix:** Kill orphaned child groups ([db1f9bc](https://github.com/NeoTamia/NTNook/commit/db1f9bca4be014cb9b64ebe62e4016c1be30e35b))
+* **unix:** Preserve raw git root paths ([b2fb19d](https://github.com/NeoTamia/NTNook/commit/b2fb19db2517274fc7361d0ffded0cfa7f5d72ae))
+* **windows:** Check machine root certificates ([920dba1](https://github.com/NeoTamia/NTNook/commit/920dba1fe9a3867f7056d65a9224c586b6abb0c7))
+* **windows:** Defer installer replacement ([ce80a1b](https://github.com/NeoTamia/NTNook/commit/ce80a1bd80b5a674a463d7445b55731acfd840a5))
+* **windows:** Defer percent insertion for batch shims ([a02d40a](https://github.com/NeoTamia/NTNook/commit/a02d40a6cb3445b73c80563cb1015bd6bdd6851c))
+* **windows:** Defer updates until binary unlocks ([278214d](https://github.com/NeoTamia/NTNook/commit/278214dc7c75fcf61cf076b8e1951769bafb818c))
+* **windows:** Force failed foreground interrupts ([43588d2](https://github.com/NeoTamia/NTNook/commit/43588d2c4001dc1197f2299be6db8e333c1ea6af))
+* **windows:** Force stop without console ([78a41e6](https://github.com/NeoTamia/NTNook/commit/78a41e613a236e7371b45722beae887566da354a))
+* **windows:** Harden cross-console process supervision ([0eef5bd](https://github.com/NeoTamia/NTNook/commit/0eef5bd9bc5cfb65ad07b89690d67d6601d6f11a))
+* **windows:** Harden portable file and shim handling ([8adecd9](https://github.com/NeoTamia/NTNook/commit/8adecd959e578bb2028a6f16ef5a97e4f6f9dd2d))
+* **windows:** Match completions case-insensitively ([e2c3618](https://github.com/NeoTamia/NTNook/commit/e2c3618fc37fc16e3a9581891694da1b7407dec1))
+* **windows:** Normalize updater blocker paths ([fda8935](https://github.com/NeoTamia/NTNook/commit/fda8935b99fc47dc869fe5ff93438dc3eeb74435))
+* **windows:** Persist deferred installer failures ([6eb62ae](https://github.com/NeoTamia/NTNook/commit/6eb62aee6f488073755dd11cd3b1ad4fc7d282c8))
+* **windows:** Preserve graceful stop semantics ([57a4a04](https://github.com/NeoTamia/NTNook/commit/57a4a045e908e06dcdd154034f64dded13a4a8ea))
+* **windows:** Preserve native child exit codes ([463d336](https://github.com/NeoTamia/NTNook/commit/463d3369ece4b606227c1b15bc1ff9e47621b6bb))
+* **windows:** Preserve percent signs in batch arguments ([f1b2c50](https://github.com/NeoTamia/NTNook/commit/f1b2c50837a74e4000a99655239f14acf3042a60))
+* **windows:** Quote batch shim command lines ([c38fda7](https://github.com/NeoTamia/NTNook/commit/c38fda7edca438ebff4633351c6faa219b6b28ce))
+* **windows:** Resolve package command shims ([41fbfb6](https://github.com/NeoTamia/NTNook/commit/41fbfb64e3bc1efc044e022e1026952240c6fc5e))
+* **windows:** Retry deferred replacements ([12dd0fb](https://github.com/NeoTamia/NTNook/commit/12dd0fbd3ec490644eb7848ccad3071392ed5566))
+* **windows:** Surface deferred update failures ([f1019df](https://github.com/NeoTamia/NTNook/commit/f1019df67bdfb4d08a73269940c9c8bc3aac8001))
+* **windows:** Tolerate completed updater parent ([6f37b3c](https://github.com/NeoTamia/NTNook/commit/6f37b3cbd812649b831c3e93054ada24c8503133))
+
+
+### 📚 Documentation
+
+* **windows:** Define native and Docker Desktop support ([4736db2](https://github.com/NeoTamia/NTNook/commit/4736db2b04cd19026e2c42b854b026bc23e1039b))
+
+
+### 🧪 Tests
+
+* Wait for Caddy certificate issuance ([efdb99a](https://github.com/NeoTamia/NTNook/commit/efdb99a9e07919b231262374eab7b99db058a5a2))
+* **windows:** Avoid reserved HTTP ports in Caddy E2E ([da9ba06](https://github.com/NeoTamia/NTNook/commit/da9ba0638611fb4b49ae42f321a2c306e1bf5bbf))
+* **windows:** Bound native Caddy E2E commands ([3932f77](https://github.com/NeoTamia/NTNook/commit/3932f77c982b43477f3e3919f12a16602ab5633f))
+* **windows:** Disable implicit Caddy redirect listener ([a93b8de](https://github.com/NeoTamia/NTNook/commit/a93b8de3d29defe036f7235ce66b26ad760db7f6))
+* **windows:** Exercise native Caddy over HTTPS ([ef62b69](https://github.com/NeoTamia/NTNook/commit/ef62b69328fb662a679a9aa0d8385c40d778c404))
+* **windows:** Isolate platform-specific CLI coverage ([d5b4b4d](https://github.com/NeoTamia/NTNook/commit/d5b4b4da5898b38450285fde84798c456ae62828))
+* **windows:** Keep global config fixture portable ([2c26c43](https://github.com/NeoTamia/NTNook/commit/2c26c430576ac6ad42a26a62398d7a162ff69cc8))
+* **windows:** Keep native Caddy E2E on TCP ([a8dca66](https://github.com/NeoTamia/NTNook/commit/a8dca663b727f68154af56b9b3e203d6eafc7f74))
+* **windows:** Make completion checks platform-aware ([6e796a6](https://github.com/NeoTamia/NTNook/commit/6e796a6a260b811171386c334f1dcc83bed0b302))
+* **windows:** Report native Caddy startup failures ([4d56aa7](https://github.com/NeoTamia/NTNook/commit/4d56aa73b2777eb6978fa689353481a859cf321f))
+* **windows:** Skip privileged Caddy trust install ([5fe3c80](https://github.com/NeoTamia/NTNook/commit/5fe3c808f6400b86eb4d44a08b50edc2d5d45259))
+* **windows:** Tolerate rejected config without artifacts ([89055d6](https://github.com/NeoTamia/NTNook/commit/89055d64db9f9e7ec0a935ed12146f9c61c21196))
+* **windows:** Verify batch shim arguments ([35a1049](https://github.com/NeoTamia/NTNook/commit/35a1049c8db89b0ee103e8461bd85c873b61c6e3))
+* **windows:** Wait for managed lease before stop ([3d3df19](https://github.com/NeoTamia/NTNook/commit/3d3df19c21ee4043807590b75e47e1b6645a1a1c))
+
+
+### 🔧 Build System
+
+* **deps:** Update pnpm to v11.25.0 ([#34](https://github.com/NeoTamia/NTNook/issues/34)) ([373a874](https://github.com/NeoTamia/NTNook/commit/373a87436b0a3cbcdb2bdf4a583a55a2b226ffeb))
+* **deps:** Update pnpm/setup action to v2.1.0 ([#28](https://github.com/NeoTamia/NTNook/issues/28)) ([d51a8ad](https://github.com/NeoTamia/NTNook/commit/d51a8ad9b8c1e7a5b73a752c108059143f748d3b))
+
 ## [0.6.0](https://github.com/NeoTamia/NTNook/compare/v0.5.0...v0.6.0) (2026-08-31)
 
 
