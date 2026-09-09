@@ -3,6 +3,7 @@
 mod caddy;
 mod cli;
 mod config;
+mod platform;
 mod process;
 mod reconcile;
 mod state;
@@ -10,7 +11,6 @@ mod update;
 
 use std::fmt;
 use std::io;
-use std::process::ExitCode;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
@@ -65,17 +65,13 @@ impl std::error::Error for Error {
 }
 
 impl Error {
-    fn exit_code(&self) -> ExitCode {
+    fn exit_code(&self) -> i32 {
         match self {
-            Self::Caddy(_) => ExitCode::FAILURE,
-            Self::Cli(error) => {
-                u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from)
-            }
-            Self::Config(_) => ExitCode::FAILURE,
-            Self::State(_) | Self::Alias(_) | Self::Run(_) | Self::Stop(_) | Self::Update(_) => {
-                ExitCode::FAILURE
-            }
-            Self::Io(_) => ExitCode::FAILURE,
+            Self::Caddy(_) => 1,
+            Self::Cli(error) => error.exit_code(),
+            Self::Config(_) => 1,
+            Self::State(_) | Self::Alias(_) | Self::Run(_) | Self::Stop(_) | Self::Update(_) => 1,
+            Self::Io(_) => 1,
         }
     }
 }
@@ -134,11 +130,11 @@ impl From<update::Error> for Error {
     }
 }
 
-fn main() -> ExitCode {
-    match cli::run() {
-        Ok(code) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),
+fn main() {
+    let code = match cli::run() {
+        Ok(code) => code,
         Err(Error::Cli(error)) => {
-            let code = u8::try_from(error.exit_code()).map_or(ExitCode::FAILURE, ExitCode::from);
+            let code = error.exit_code();
             let _ = error.print();
             code
         }
@@ -146,5 +142,8 @@ fn main() -> ExitCode {
             eprintln!("error: {error}");
             error.exit_code()
         }
-    }
+    };
+    // std::process::exit preserves the full 32-bit native status on Windows;
+    // Unix consumers continue to observe the platform's low eight bits.
+    std::process::exit(code)
 }

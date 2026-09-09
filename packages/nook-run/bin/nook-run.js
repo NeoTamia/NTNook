@@ -4,8 +4,13 @@ import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
 import { constants } from "node:os";
 
-const INSTALL_URL =
-  "https://github.com/NeoTamia/NTNook/releases/latest/download/nook-installer.sh";
+import { installationGuidance } from "./install-guidance.js";
+import {
+  shouldLaunchFallback,
+  shouldSignalChild,
+} from "./signal-forwarding.js";
+import { prepareWindowsFallback } from "./windows-command.js";
+
 let forwardedSignal;
 let child;
 const launchErrors = new WeakSet();
@@ -23,16 +28,20 @@ const args = process.argv.slice(2);
 const separatorIndex = args.indexOf("--");
 const command = separatorIndex === -1 ? [] : args.slice(separatorIndex + 1);
 
-function spawnChild(executable, executableArgs) {
+function spawnChild(executable, executableArgs, options = {}) {
   child = spawn(executable, executableArgs, {
     cwd: process.cwd(),
     env: process.env,
     shell: false,
     stdio: "inherit",
+    ...options,
   });
 
   child.once("spawn", () => {
-    if (forwardedSignal !== undefined) {
+    if (
+      forwardedSignal !== undefined &&
+      shouldSignalChild(process.platform, forwardedSignal)
+    ) {
       child.kill(forwardedSignal);
     }
   });
@@ -45,7 +54,10 @@ function spawnChild(executable, executableArgs) {
 function forwardSignal(signal) {
   forwardedSignal ??= signal;
 
-  if (child.pid !== undefined) {
+  if (
+    child.pid !== undefined &&
+    shouldSignalChild(process.platform, signal)
+  ) {
     child.kill(signal);
   }
 }
@@ -72,10 +84,15 @@ function handleLaunchError(error) {
   if (error.code === "ENOENT") {
     report(`nook-run: warning: Nook was not found in PATH; running the command directly.
 
-Install Nook on Linux with:
-  curl --proto '=https' --tlsv1.2 -LsSf ${INSTALL_URL} | sh
+${installationGuidance(process.platform)}
 
 Nook features such as local domains and HTTPS will be unavailable.`);
+
+    if (!shouldLaunchFallback(forwardedSignal)) {
+      removeSignalHandlers();
+      process.exitCode = signalExitCode(forwardedSignal);
+      return;
+    }
 
     if (command.length === 0) {
       removeSignalHandlers();
@@ -84,7 +101,30 @@ Nook features such as local domains and HTTPS will be unavailable.`);
       return;
     }
 
-    const fallback = spawnChild(command[0], command.slice(1));
+    let invocation = {
+      executable: command[0],
+      args: command.slice(1),
+      options: {},
+    };
+    try {
+      if (process.platform === "win32") {
+        invocation = prepareWindowsFallback(command[0], command.slice(1), {
+          cwd: process.cwd(),
+          environment: process.env,
+        });
+      }
+    } catch (fallbackError) {
+      removeSignalHandlers();
+      report(`nook-run: failed to start ${command[0]}: ${fallbackError.message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const fallback = spawnChild(
+      invocation.executable,
+      invocation.args,
+      invocation.options,
+    );
     fallback.once("error", (fallbackError) => {
       launchErrors.add(fallback);
       removeSignalHandlers();

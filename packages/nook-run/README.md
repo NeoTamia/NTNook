@@ -31,4 +31,6 @@ nook-run --name api --app-port 3000 --strict-port -- node server.js
 
 The command inherits the terminal and environment, forwards `SIGINT` and `SIGTERM`, and returns the launched process's exit code.
 
-When Nook is not installed, `nook-run` prints a warning and runs the command after `--` directly. This lets the project start on a new development machine and on currently unsupported platforms such as Windows, without Nook's local domains or HTTPS features.
+When Nook is not installed, `nook-run` prints a warning and runs the command after `--` directly.
+This lets the project start on a new development machine without Nook's local domains or HTTPS
+features. Native Nook installations on Linux and Windows are discovered through `PATH`.

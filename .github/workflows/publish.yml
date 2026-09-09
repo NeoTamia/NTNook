@@ -90,9 +90,67 @@ jobs:
           done
           gh release upload "$RELEASE_TAG" release-assets/* --clobber
 
+  windows-release-assets:
+    name: Windows release assets
+    if: ${{ startsWith(github.ref_name, 'v') }}
+    runs-on: windows-2025
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Build Windows release binary
+        run: cargo build --locked --release
+
+      - name: Package Windows release assets
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart("v")
+          $target = "x86_64-pc-windows-msvc"
+          $archive = "nook-$target.zip"
+          New-Item -ItemType Directory -Path dist, release-assets | Out-Null
+          Copy-Item target/release/nook.exe, README.md, RELEASE.md, LICENSE -Destination dist
+          Compress-Archive -Path dist/* -DestinationPath "release-assets/$archive"
+          $hash = (Get-FileHash -Algorithm SHA256 "release-assets/$archive").Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Encoding ascii "release-assets/$archive.sha256"
+          Copy-Item install.ps1 "release-assets/nook-installer.ps1"
+          $actual = & target/release/nook.exe --version
+          if ($actual -ne "nook $version") { throw "unexpected version: $actual" }
+
+      - name: Attest Windows release assets
+        if: ${{ github.event.repository.private == false }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: release-assets/*
+
+      - name: Upload Windows release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            gh release view $env:RELEASE_TAG 2>$null
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 12) { throw "GitHub Release $env:RELEASE_TAG was not created" }
+            Start-Sleep -Seconds 5
+          }
+          gh release upload $env:RELEASE_TAG release-assets/* --clobber
+
   crates-io:
     name: crates.io
-    needs: release-assets
+    needs: [release-assets, windows-release-assets]
     runs-on: ubuntu-24.04
     environment: release
     permissions:

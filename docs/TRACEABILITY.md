@@ -4,11 +4,11 @@ This matrix links product requirements to implementation tickets and checks trac
 
 | Verifiable requirement | Tickets | Test or verification |
 | --- | --- | --- |
-| A Linux Rust binary crate with internal modules and consistent public errors | NOOK-10, NOOK-32 | `cargo check`; `src/main.rs` and modules |
+| A Linux/Windows Rust binary crate with internal modules and consistent public errors | NOOK-10, NOOK-32, NOOK-53 | Linux check plus `cargo check --target x86_64-pc-windows-msvc`; `src/main.rs` and platform guards |
 | `run` CLI, short form, opaque arguments, and stable help | NOOK-11, NOOK-32 | `cli::tests::*` tests; `cli_alias::help_is_successful_*` |
 | Versioned global/project configuration, management through `nook config`, and CLI → project → default precedence | NOOK-12 | `config::tests::*`, `cli::tests::parses_global_configuration_commands`, and `cli_config` tests |
 | Name normalized as a DNS label with project/Git/directory fallback | NOOK-17 | `config::tests::name_priority_*`, `normalizes_valid_names`, `rejects_invalid_dns_labels` |
-| Versioned XDG registry without argv, written atomically and locked | NOOK-15, NOOK-16, NOOK-38 | `state::tests::*`, including concurrency and temporary-file recovery |
+| Versioned XDG/Windows registry without argv, written atomically and locked | NOOK-15, NOOK-16, NOOK-38, NOOK-53 | `state::tests::*`, including Windows paths, concurrency and temporary-file recovery |
 | Admin API client without starting Caddy and with actionable errors | NOOK-18, NOOK-32 | `caddy::tests::admin_client_*`; `cli_alias::status_has_a_stable_failure_*` |
 | Safe discovery of `:443`/`:80` servers, overrides, and ambiguities | NOOK-18 | `discovers_*`, `available_server_*`, `ambiguity_*`, `no_tls_*` tests |
 | Nook containers placed before catch-all without altering foreign routes | NOOK-19, NOOK-20 | `containers_partition_*`, `container_is_repositioned_*`, `empty_container_*` tests |
@@ -18,7 +18,7 @@ This matrix links product requirements to implementation tickets and checks trac
 | Upstream port or HTTP(S) URL, strict validation, and TLS never disabled | NOOK-28, NOOK-41 | Caddy validation tests; valid/expired/untrusted/wrong-hostname `alias_tls` cases |
 | Persistent aliases, short forms, idempotent removal, and `--force` limited to Nook | NOOK-26, NOOK-28, NOOK-29, NOOK-30, NOOK-38 | reconciliation tests; `cli_alias::alias_shortcuts_*`, `force_refuses_a_foreign_*` |
 | Port allocation, `{port}`, environment, and no relaunch after a race | NOOK-22, NOOK-38 | process tests for `reserve_port`, `substitution`, `child_environment`, `lost_port_race_*` |
-| Grouped processes, readiness, warning, signals, and preserved exit code | NOOK-24, NOOK-25, NOOK-27, NOOK-32, NOOK-38 | process tests; SIGINT before/after readiness, SIGTERM, stop/force, and cleanup-code integrations |
+| Grouped process trees, readiness, interruption, forced stop, identity, and preserved exit code | NOOK-24, NOOK-25, NOOK-27, NOOK-32, NOOK-38, NOOK-57 | POSIX group tests and Windows Job Object/creation-time tests in `process` |
 | No orphaned child/lease/route after an impossible spawn or supervisor death | NOOK-25, NOOK-27, NOOK-38 | `failed_spawn_*`, `caddy_failure_before_run_*`, `prune_recovers_after_*` |
 | Convergent transaction journals at every mutation boundary | NOOK-13, NOOK-16, NOOK-38 | `recovers_journals_left_at_every_external_mutation_boundary`; reconciliation tests |
 | Every operational command reconciles first; selection and timestamps persist | NOOK-13, NOOK-33, NOOK-38 | `ordinary_list_reconciles_reload_and_records_synchronization`; real Caddy reload in `nook_caddy_e2e` |
@@ -30,13 +30,16 @@ This matrix links product requirements to implementation tickets and checks trac
 | Secure official Compose setup and persistent volumes | NOOK-47 | `docker/compose.yaml`, `docker/Caddyfile`, `docker compose config`, restart/fingerprint E2E |
 | caddy-docker-proxy coexistence and restoration after reload | NOOK-48 | `docker/compose.caddy-docker-proxy.yaml`, label/reconciliation scenario |
 | Official/proxy Docker CI gate | NOOK-49 | `docker` job in `.github/workflows/ci.yml` |
-| Docker documentation and cross-platform matrix | NOOK-51, NOOK-50 | `docs/DOCKER.md`, README, release notes, and YouTrack specification |
+| Native `caddy.exe`, TCP Admin API, Windows trust store, and HTTP alias E2E | NOOK-50, NOOK-55 | `tests/windows_caddy_e2e.rs`; Windows `caddy::tests`; `windows` CI job |
+| Docker Desktop as a secondary Windows mode | NOOK-50, NOOK-56 | `docker/nook-config.windows.toml.example`, `docs/DOCKER.md`, existing Docker gate |
+| Windows ZIP, checksum, PowerShell installer/completion, and deferred self-update | NOOK-50, NOOK-54 | Windows build/publish jobs, installer parser validation, update tests |
+| Docker documentation and cross-platform matrix | NOOK-51, NOOK-50, NOOK-56 | `docs/DOCKER.md`, README, release notes, and YouTrack specification |
 | Preserved Host, forwarded headers, WebSocket, SSE, streaming, HTTP/2, 502, and upstream TLS | NOOK-41 | `tests/proxy_protocols.rs`; `tests/alias_tls.rs` |
-| Static and registry-backed Bash/Zsh completion for runs, aliases, and shortcuts | NOOK-52 | `tests/cli_completions.rs`; generated scripts perform read-only completion queries |
+| Bash/Zsh completion plus native PowerShell completion | NOOK-52, NOOK-54 | `tests/cli_completions.rs`; Windows CI generates and parses the PowerShell script |
 | `nook update` replaces a GitHub binary after SHA-256 verification; a cached check warns when a newer version exists | post-MVP | `update::tests::*`, `cli_update` tests |
 | Package-manager-neutral JavaScript wrapper reports a missing Nook and preserves arguments, exit codes, and signals | post-MVP | `packages/nook-run/test`; Node 22/24 and npm/pnpm/Yarn/Bun CI jobs |
 | Documentation for requirements, safeguards, troubleshooting, and out-of-scope items | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
-| Linux gate compiles, formats, lints, runs tests/integrations, and produces a verifiable binary | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43 | `.github/workflows/ci.yml`; archive, SHA-256, and attestation through `.github/workflows/publish.yml` |
+| Linux and Windows gates compile, format, lint, run native Caddy integrations, and produce verifiable binaries | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43, NOOK-58 | `.github/workflows/ci-crate.yml`; both archives, SHA-256 files, installers and attestations through `.github/workflows/publish.yml` |
 
 ## Release gate
 
