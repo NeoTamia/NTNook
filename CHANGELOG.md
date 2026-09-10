@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/NeoTamia/NTNook/compare/v0.7.0...v0.8.0) (2026-09-10)
+
+
+### ✨ Features
+
+* **cli:** Add run bind address option ([fea4575](https://github.com/NeoTamia/NTNook/commit/fea45751d747a2d7473304bab754432648952e14))
+
+
+### 🔧 Build System
+
+* **deps:** Update rust crate toml to v1.1.5 ([#35](https://github.com/NeoTamia/NTNook/issues/35)) ([8a07a61](https://github.com/NeoTamia/NTNook/commit/8a07a61beb2336585c13e81c8f334cf68b397b9e))
+* **deps:** Update rust crate uuid to v1.26.1 ([#22](https://github.com/NeoTamia/NTNook/issues/22)) ([6820cf4](https://github.com/NeoTamia/NTNook/commit/6820cf4da08e473ddeb4a0feea0d9c730703d5a7))
+
 ## [0.7.0](https://github.com/NeoTamia/NTNook/compare/v0.6.0...v0.7.0) (2026-09-09)
 
 
