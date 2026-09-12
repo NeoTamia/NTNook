@@ -36,38 +36,6 @@ impl Framework {
         }
     }
 
-    fn from_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Option<Self> {
-        let mut found = None::<Self>;
-        for token in tokens {
-            let Some(name) = executable_name(OsStr::new(token)) else {
-                continue;
-            };
-            let Some(candidate) = Self::from_program(&name) else {
-                continue;
-            };
-            found = Some(match found {
-                None => candidate,
-                Some(current) => current.more_specific(candidate),
-            });
-        }
-        found
-    }
-
-    fn more_specific(self, other: Self) -> Self {
-        if self.specificity() >= other.specificity() {
-            self
-        } else {
-            other
-        }
-    }
-
-    fn specificity(self) -> u8 {
-        match self {
-            Self::Next | Self::Nuxt | Self::Astro | Self::Nitro => 2,
-            Self::Vite => 1,
-        }
-    }
-
     /// Extra environment variables layered on top of `PORT` / `HOST` / `NOOK_URL`.
     pub(crate) fn environment(
         self,
@@ -314,7 +282,39 @@ fn detect_from_package_script(argv: &[OsString], directory: &Path) -> Option<Fra
     let contents = fs::read_to_string(directory.join("package.json")).ok()?;
     let package: serde_json::Value = serde_json::from_str(&contents).ok()?;
     let command = package.get("scripts")?.get(&script)?.as_str()?;
-    Framework::from_tokens(command.split_whitespace())
+    detect_from_script(command)
+}
+
+fn detect_from_script(command: &str) -> Option<Framework> {
+    if has_shell_control(command) {
+        return None;
+    }
+    let tokens: Vec<OsString> = command
+        .split_whitespace()
+        .filter(|token| !is_env_assignment(token))
+        .map(OsString::from)
+        .collect();
+    detect_from_argv(&tokens)
+}
+
+fn has_shell_control(command: &str) -> bool {
+    command.contains("&&")
+        || command.contains("||")
+        || command.contains("$(")
+        || command.contains('|')
+        || command.contains(';')
+        || command.contains('`')
+        || command.contains('&')
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn package_script_name(argv: &[OsString]) -> Option<String> {
@@ -488,6 +488,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_compound_package_scripts() {
+        let directory = temporary_directory();
+        fs::write(
+            directory.join("package.json"),
+            r#"{"scripts":{
+                "dev":"vite && node server.js",
+                "echo":"echo vite",
+                "prod":"NODE_ENV=production nuxt dev",
+                "wrapped":"npx vite"
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(detect(&argv(&["npm", "run", "dev"]), &directory), None);
+        assert_eq!(detect(&argv(&["npm", "run", "echo"]), &directory), None);
+        assert_eq!(
+            detect(&argv(&["npm", "run", "prod"]), &directory),
+            Some(Framework::Nuxt)
+        );
+        assert_eq!(
+            detect(&argv(&["npm", "run", "wrapped"]), &directory),
+            Some(Framework::Vite)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn disabled_choice_skips_detection() {
         let directory = temporary_directory();
         fs::write(
@@ -539,8 +565,7 @@ mod tests {
         let mut command = argv(&["npm", "run"]);
         command.push(OsString::from_vec(vec![0xff]));
         command.push(OsString::from("dev"));
-        let injected =
-            Framework::Vite.inject_argv(command, 5173, bind(), "app.localhost", false);
+        let injected = Framework::Vite.inject_argv(command, 5173, bind(), "app.localhost", false);
         assert_eq!(injected[4], "--");
         assert_eq!(injected[5], "--host");
     }
@@ -615,15 +640,7 @@ mod tests {
                 "app.localhost",
                 false
             ),
-            argv(&[
-                "bun",
-                "run",
-                "dev",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "3000"
-            ])
+            argv(&["bun", "run", "dev", "--host", "127.0.0.1", "--port", "3000"])
         );
     }
 

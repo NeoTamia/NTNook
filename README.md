@@ -374,7 +374,7 @@ Detection is conservative:
 3. the child command itself (`vite`, `nuxt`/`nuxi`, `next`, `nitro`, `astro`, including `npx vite`)
 4. a package-manager `run` / `run-script` whose `package.json` script invokes one of those tools
 
-A Python server in a repo that happens to depend on Vite is not aligned. `bun --watch src/server.ts` is not aligned. `pnpm dev` without `run` is not aligned.
+A Python server in a repo that happens to depend on Vite is not aligned. `bun --watch src/server.ts` is not aligned. `pnpm dev` without `run` is not aligned. Compound scripts such as `vite && node server.js` are not aligned.
 
 Injected flags are skipped when already present. For `npm run dev` / `bun run dev` / `pnpm run dev` / `yarn run dev`, Nook inserts `--` before the extra flags. Angular is not a dedicated target: `HOST` and `PORT` are enough for `ng serve`.
 
