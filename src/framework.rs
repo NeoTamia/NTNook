@@ -281,7 +281,9 @@ fn package_script_name(argv: &[OsString]) -> Option<String> {
     }
     let mut saw_run = false;
     for argument in argv.iter().skip(1) {
-        let value = argument.to_str()?;
+        let Some(value) = argument.to_str() else {
+            continue;
+        };
         if value == "--" {
             break;
         }
@@ -468,6 +470,21 @@ mod tests {
             already,
             argv(&["vite", "--host", "0.0.0.0", "--port=4000", "--strictPort"])
         );
+    }
+
+    #[test]
+    #[test]
+    #[cfg(unix)]
+    fn package_script_name_skips_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut command = argv(&["npm", "run"]);
+        command.push(OsString::from_vec(vec![0xff]));
+        command.push(OsString::from("dev"));
+        let injected =
+            Framework::Vite.inject_argv(command, 5173, bind(), "app.localhost", false);
+        assert_eq!(injected[4], "--");
+        assert_eq!(injected[5], "--host");
     }
 
     #[test]
