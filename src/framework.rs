@@ -557,7 +557,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     #[cfg(unix)]
     fn package_script_name_skips_non_utf8_arguments() {
         use std::os::unix::ffi::OsStringExt;
