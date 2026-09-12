@@ -1,5 +1,6 @@
 //! Conservative detection of JS dev servers and argv/env alignment.
 
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::net::IpAddr;
@@ -79,10 +80,12 @@ impl Framework {
         let mut variables = Vec::new();
         match self {
             Self::Vite | Self::Nuxt | Self::Astro => {
-                variables.push((
-                    OsString::from("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"),
-                    OsString::from(hostname),
-                ));
+                if let Some(value) = additional_vite_hosts(hostname) {
+                    variables.push((
+                        OsString::from("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"),
+                        value,
+                    ));
+                }
             }
             Self::Next | Self::Nitro => {}
         }
@@ -219,6 +222,26 @@ impl FrameworkChoice {
     }
 }
 
+fn additional_vite_hosts(hostname: &str) -> Option<OsString> {
+    match env::var_os("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS") {
+        Some(existing) => Some(merge_allowed_hosts(&existing, hostname)?),
+        None => Some(OsString::from(hostname)),
+    }
+}
+
+fn merge_allowed_hosts(existing: &OsStr, hostname: &str) -> Option<OsString> {
+    let existing = existing.to_str()?;
+    let trimmed = existing.trim();
+    if trimmed.is_empty() {
+        return Some(OsString::from(hostname));
+    }
+    if trimmed.split(',').any(|host| host.trim() == hostname) {
+        Some(OsString::from(existing))
+    } else {
+        Some(OsString::from(format!("{existing},{hostname}")))
+    }
+}
+
 fn detect(argv: &[OsString], directory: &Path) -> Option<Framework> {
     if let Some(framework) = detect_from_argv(argv) {
         return Some(framework);
@@ -312,7 +335,7 @@ fn has_exact(argv: &[OsString], value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Framework, FrameworkChoice, detect, executable_name};
+    use super::{Framework, FrameworkChoice, detect, executable_name, merge_allowed_hosts};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
@@ -501,6 +524,31 @@ mod tests {
                 "--allowed-hosts",
                 "docs.localhost"
             ])
+        );
+    }
+
+    #[test]
+    fn merge_allowed_hosts_appends_without_duplicating() {
+        assert_eq!(
+            merge_allowed_hosts(OsStr::new("staging.example.com"), "app.localhost")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "staging.example.com,app.localhost"
+        );
+        assert_eq!(
+            merge_allowed_hosts(OsStr::new("app.localhost,other.localhost"), "app.localhost")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "app.localhost,other.localhost"
+        );
+        assert_eq!(
+            merge_allowed_hosts(OsStr::new("  "), "app.localhost")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "app.localhost"
         );
     }
 
