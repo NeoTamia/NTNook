@@ -86,7 +86,12 @@ impl Framework {
         let flags = self.flags(port, bind_address, hostname, strict_port);
         let missing: Vec<_> = flags
             .into_iter()
-            .filter(|(names, _)| !has_option(&argv, names))
+            .filter(|(names, arguments)| {
+                if is_port_option(names) {
+                    return !overwrite_option(&mut argv, names, arguments.last());
+                }
+                !has_option(&argv, names)
+            })
             .collect();
         if missing.is_empty() {
             return argv;
@@ -119,7 +124,7 @@ impl Framework {
                     vec![OsString::from("--host"), OsString::from(&host)],
                 ));
                 flags.push((
-                    &["--port"][..],
+                    &["--port", "-p"][..],
                     vec![OsString::from("--port"), OsString::from(&port)],
                 ));
                 if strict_port {
@@ -155,7 +160,7 @@ impl Framework {
                     vec![OsString::from("--host"), OsString::from(&host)],
                 ));
                 flags.push((
-                    &["--port"][..],
+                    &["--port", "-p"][..],
                     vec![OsString::from("--port"), OsString::from(&port)],
                 ));
                 flags.push((
@@ -193,22 +198,16 @@ impl FrameworkChoice {
 }
 
 fn additional_vite_hosts(hostname: &str) -> Option<OsString> {
-    match env::var_os("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS") {
-        Some(existing) => Some(merge_allowed_hosts(&existing, hostname)?),
-        None => Some(OsString::from(hostname)),
-    }
+    vite_hosts_override(
+        env::var_os("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS").as_deref(),
+        hostname,
+    )
 }
 
-fn merge_allowed_hosts(existing: &OsStr, hostname: &str) -> Option<OsString> {
-    let existing = existing.to_str()?;
-    let trimmed = existing.trim();
-    if trimmed.is_empty() {
-        return Some(OsString::from(hostname));
-    }
-    if trimmed.split(',').any(|host| host.trim() == hostname) {
-        Some(OsString::from(existing))
-    } else {
-        Some(OsString::from(format!("{existing},{hostname}")))
+fn vite_hosts_override(existing: Option<&OsStr>, hostname: &str) -> Option<OsString> {
+    match existing {
+        Some(value) if !value.is_empty() => None,
+        _ => Some(OsString::from(hostname)),
     }
 }
 
@@ -269,11 +268,14 @@ fn next_operand_index(arguments: &[OsString]) -> Option<usize> {
                 after_separator = true;
                 continue;
             }
-            if value.starts_with("--package=") {
+            if value.starts_with("--package=") || value.starts_with("--workspace=") {
                 continue;
             }
             if value.starts_with('-') {
-                if matches!(value, "--package" | "-p" | "-c" | "--call") {
+                if matches!(
+                    value,
+                    "--package" | "-p" | "-c" | "--call" | "--workspace" | "-w"
+                ) {
                     skip_value = true;
                 }
                 continue;
@@ -383,6 +385,35 @@ fn executable_name(argument: &OsStr) -> Option<String> {
     )
 }
 
+fn is_port_option(names: &[&str]) -> bool {
+    names.iter().any(|name| *name == "--port" || *name == "-p")
+}
+
+fn overwrite_option(argv: &mut [OsString], names: &[&str], value: Option<&OsString>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    for index in 0..argv.len() {
+        let Some(current) = argv[index].to_str() else {
+            continue;
+        };
+        for name in names {
+            if current == *name {
+                if index + 1 < argv.len() {
+                    argv[index + 1] = value.clone();
+                }
+                return true;
+            }
+            let prefix = format!("{name}=");
+            if current.starts_with(&prefix) {
+                argv[index] = OsString::from(format!("{name}={}", value.to_string_lossy()));
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn has_option(argv: &[OsString], names: &[&str]) -> bool {
     names.iter().any(|name| has_named_option(argv, name))
 }
@@ -403,7 +434,7 @@ fn has_exact(argv: &[OsString], value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Framework, FrameworkChoice, detect, executable_name, merge_allowed_hosts};
+    use super::{Framework, FrameworkChoice, detect, executable_name, vite_hosts_override};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
@@ -496,6 +527,13 @@ mod tests {
             detect(&argv(&["npx", "--package=vite", "vite"]), nowhere()),
             Some(Framework::Vite)
         );
+        assert_eq!(
+            detect(
+                &argv(&["npm", "exec", "--workspace", "next", "--", "vite"]),
+                nowhere()
+            ),
+            Some(Framework::Vite)
+        );
     }
 
     #[test]
@@ -583,7 +621,17 @@ mod tests {
         );
         assert_eq!(
             already,
-            argv(&["vite", "--host", "0.0.0.0", "--port=4000", "--strictPort"])
+            argv(&["vite", "--host", "0.0.0.0", "--port=5173", "--strictPort"])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["vite", "--port", "4000"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&["vite", "--port", "5173", "--host", "127.0.0.1"])
         );
     }
 
@@ -750,23 +798,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_allowed_hosts_appends_without_duplicating() {
-        assert_eq!(
-            merge_allowed_hosts(OsStr::new("staging.example.com"), "app.localhost")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "staging.example.com,app.localhost"
+    fn additional_vite_hosts_preserves_an_inherited_value() {
+        assert!(
+            vite_hosts_override(Some(OsStr::new("staging.example.com")), "app.localhost").is_none()
         );
         assert_eq!(
-            merge_allowed_hosts(OsStr::new("app.localhost,other.localhost"), "app.localhost")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "app.localhost,other.localhost"
-        );
-        assert_eq!(
-            merge_allowed_hosts(OsStr::new("  "), "app.localhost")
+            vite_hosts_override(None, "app.localhost")
                 .unwrap()
                 .to_str()
                 .unwrap(),
