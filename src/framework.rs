@@ -300,7 +300,10 @@ fn package_script_name(argv: &[OsString]) -> Option<String> {
 }
 
 fn needs_package_script_separator(argv: &[OsString]) -> bool {
-    package_script_name(argv).is_some()
+    let Some(program) = argv.first().and_then(|argument| executable_name(argument)) else {
+        return false;
+    };
+    matches!(program.as_str(), "npm") && package_script_name(argv).is_some()
 }
 
 fn executable_name(argument: &OsStr) -> Option<String> {
@@ -488,9 +491,9 @@ mod tests {
     }
 
     #[test]
-    fn package_scripts_receive_a_separator_before_flags() {
+    fn npm_run_inserts_a_separator_before_flags() {
         let injected = Framework::Nuxt.inject_argv(
-            argv(&["bun", "run", "dev"]),
+            argv(&["npm", "run", "dev"]),
             3000,
             bind(),
             "app.localhost",
@@ -499,10 +502,68 @@ mod tests {
         assert_eq!(
             injected,
             argv(&[
-                "bun",
+                "npm",
                 "run",
                 "dev",
                 "--",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "3000"
+            ])
+        );
+    }
+
+    #[test]
+    fn pnpm_and_yarn_scripts_receive_flags_without_a_separator() {
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["pnpm", "run", "dev"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "pnpm",
+                "run",
+                "dev",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["yarn", "run", "dev"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "yarn",
+                "run",
+                "dev",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
+        );
+        assert_eq!(
+            Framework::Nuxt.inject_argv(
+                argv(&["bun", "run", "dev"]),
+                3000,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "bun",
+                "run",
+                "dev",
                 "--host",
                 "127.0.0.1",
                 "--port",
