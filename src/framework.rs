@@ -250,20 +250,63 @@ fn detect(argv: &[OsString], directory: &Path) -> Option<Framework> {
 }
 
 fn detect_from_argv(argv: &[OsString]) -> Option<Framework> {
-    let mut found = None::<Framework>;
-    for argument in argv {
-        let Some(name) = executable_name(argument) else {
-            continue;
-        };
-        let Some(candidate) = Framework::from_program(&name) else {
-            continue;
-        };
-        found = Some(match found {
-            None => candidate,
-            Some(current) => current.more_specific(candidate),
-        });
+    let program = executable_name(argv.first()?)?;
+    if let Some(framework) = Framework::from_program(&program) {
+        return Some(framework);
     }
-    found
+    Framework::from_program(&wrapper_package(argv)?)
+}
+
+fn wrapper_package(argv: &[OsString]) -> Option<String> {
+    let program = executable_name(argv.first()?)?;
+    let rest = argv.get(1..).unwrap_or(&[]);
+    match program.as_str() {
+        "npx" | "bunx" | "pnpx" => first_operand(rest),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            let (subcommand, remaining) = split_first_operand(rest)?;
+            match subcommand.as_str() {
+                "exec" | "dlx" | "x" => first_operand(remaining),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn first_operand(arguments: &[OsString]) -> Option<String> {
+    split_first_operand(arguments).map(|(name, _)| name)
+}
+
+fn split_first_operand(arguments: &[OsString]) -> Option<(String, &[OsString])> {
+    let mut skip_value = false;
+    let mut after_separator = false;
+    for (index, argument) in arguments.iter().enumerate() {
+        let Some(value) = argument.to_str() else {
+            continue;
+        };
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if !after_separator {
+            if value == "--" {
+                after_separator = true;
+                continue;
+            }
+            if let Some(package) = value.strip_prefix("--package=") {
+                return executable_name(OsStr::new(package))
+                    .map(|name| (name, &arguments[index + 1..]));
+            }
+            if value.starts_with('-') {
+                if matches!(value, "--package" | "-p" | "-c" | "--call") {
+                    skip_value = true;
+                }
+                continue;
+            }
+        }
+        return executable_name(argument).map(|name| (name, &arguments[index + 1..]));
+    }
+    None
 }
 
 fn detect_from_package_script(argv: &[OsString], directory: &Path) -> Option<Framework> {
@@ -374,12 +417,20 @@ mod tests {
     fn detects_framework_binaries_from_argv() {
         assert_eq!(detect(&argv(&["vite"]), nowhere()), Some(Framework::Vite));
         assert_eq!(
-            detect(&argv(&["npx", "nuxt", "dev"]), nowhere()),
+            detect(&argv(&["npx", "--yes", "nuxt", "dev"]), nowhere()),
             Some(Framework::Nuxt)
         );
         assert_eq!(
             detect(&argv(&["bunx", "next", "dev"]), nowhere()),
             Some(Framework::Next)
+        );
+        assert_eq!(
+            detect(&argv(&["pnpm", "exec", "vite"]), nowhere()),
+            Some(Framework::Vite)
+        );
+        assert_eq!(
+            detect(&argv(&["bun", "x", "astro"]), nowhere()),
+            Some(Framework::Astro)
         );
         assert_eq!(
             detect(&argv(&["astro", "dev"]), nowhere()),
@@ -409,7 +460,11 @@ mod tests {
             detect(&argv(&["bun", "--watch", "src/server.ts"]), nowhere()),
             None
         );
-        assert_eq!(detect(&argv(&["python3", "app.py"]), nowhere()), None);
+        assert_eq!(
+            detect(&argv(&["python3", "app.py", "next"]), nowhere()),
+            None
+        );
+        assert_eq!(detect(&argv(&["npm", "run", "next"]), nowhere()), None);
     }
 
     #[test]
