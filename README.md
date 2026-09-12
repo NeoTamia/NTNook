@@ -246,9 +246,11 @@ nook run --name legacy --no-tls -- ./server
 - `--config <path>` explicitly selects the project file;
 - `--local` applies the `nook.local.toml` next to a file selected with `--config`;
 - `--readiness-warn-after <seconds>` sets the readiness warning delay;
+- `--framework <name>` forces Vite, Nuxt, Next, Nitro, or Astro alignment (`none` disables it);
+- `--no-framework` disables detection and flag injection;
 - arguments after `--` are passed through directly, without an implicit shell.
 
-Nook replaces `{port}` literally in each argument and injects `PORT`, `HOST` (the value of `run_bind_address`, `127.0.0.1` by default), and `NOOK_URL`. The process receives the terminal's stdin/stdout/stderr, and its exit code is preserved even if Caddy cleanup must be retried later.
+Nook replaces `{port}` literally in each argument and injects `PORT`, `HOST` (the value of `run_bind_address`, `127.0.0.1` by default), and `NOOK_URL`. When a supported framework is detected, it also injects that framework's host/port flags and related environment variables without rewriting project files. The process receives the terminal's stdin/stdout/stderr, and its exit code is preserved even if Caddy cleanup must be retried later.
 
 After reserving the route and starting the process, Nook always prints the selected domain, public URL, and effective application port, including when the name and port are inferred:
 
@@ -356,9 +358,31 @@ app_port = 5173
 strict_port = false
 readiness_warn_after_seconds = 30
 run_bind_address = "127.0.0.1"
+# framework = "vite"
 ```
 
 Without a command after `--`, `command` is required. Name precedence is: `--name`, project file, Git root basename, then current-directory basename. CLI values override file values.
+
+### Framework alignment
+
+Nook can pass bind address, port, and hostname allow-lists to common JavaScript dev servers without editing `vite.config.*`, `nuxt.config.*`, `next.config.*`, or `astro.config.*`.
+
+Detection is conservative:
+
+1. `--framework` / `--no-framework`
+2. `framework` in `nook.toml` or `nook.local.toml` (`vite`, `nuxt`, `next`, `nitro`, `astro`, or `none`)
+3. the child command itself (`vite`, `nuxt`/`nuxi`, `next`, `nitro`, `astro`, including `npx vite`)
+4. a package-manager `run` / `run-script` whose `package.json` script invokes one of those tools
+
+A Python server in a repo that happens to depend on Vite is not aligned. `bun --watch src/server.ts` is not aligned. `pnpm dev` without `run` is not aligned.
+
+Injected flags are skipped when already present. For `npm run dev` / `bun run dev` / `pnpm run dev` / `yarn run dev`, Nook inserts `--` before the extra flags. Angular is not a dedicated target: `HOST` and `PORT` are enough for `ng serve`.
+
+```sh
+nook run -- nuxt dev
+nook run --framework vite -- bun run dev
+nook run --no-framework -- python app.py
+```
 
 Each developer can add a `nook.local.toml` in the same directory. Its fields override those in
 `nook.toml` without changing the shared configuration:
@@ -521,8 +545,8 @@ secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Serve/Funnel, and any
-public exposure.
+LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Serve/Funnel, rewriting
+framework config files, Angular-specific origin allow-lists, and any public exposure.
 
 ## Development
 

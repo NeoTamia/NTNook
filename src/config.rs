@@ -15,6 +15,7 @@ use std::os::unix::ffi::OsStringExt;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::RunArgs;
+use crate::framework::FrameworkChoice;
 
 const FORMAT_VERSION: u32 = 1;
 const DEFAULT_CADDY_ADMIN: &str = "http://127.0.0.1:2019";
@@ -61,6 +62,10 @@ pub(crate) enum Error {
         field: &'static str,
         reason: String,
     },
+    InvalidFramework {
+        value: String,
+        reason: String,
+    },
     Serialize(toml::ser::Error),
 }
 
@@ -100,6 +105,9 @@ impl fmt::Display for Error {
                     "invalid global configuration `{field}`: {reason}"
                 )
             }
+            Self::InvalidFramework { value, reason } => {
+                write!(formatter, "invalid framework `{value}`: {reason}")
+            }
             Self::Serialize(error) => {
                 write!(formatter, "cannot serialize global configuration: {error}")
             }
@@ -129,6 +137,7 @@ struct ProjectConfig {
     strict_port: Option<bool>,
     readiness_warn_after_seconds: Option<u64>,
     run_bind_address: Option<IpAddr>,
+    framework: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,6 +208,8 @@ pub(crate) struct ResolvedRunConfig {
     pub(crate) readiness_warn_after_seconds: u64,
     pub(crate) bind_address: IpAddr,
     pub(crate) ignored_local_config: Option<PathBuf>,
+    pub(crate) framework: FrameworkChoice,
+    pub(crate) working_directory: PathBuf,
 }
 
 pub(crate) fn load_global() -> Result<GlobalConfig, Error> {
@@ -412,6 +423,7 @@ fn merge_project(
             .readiness_warn_after_seconds
             .or(base.readiness_warn_after_seconds),
         run_bind_address: local.run_bind_address.or(base.run_bind_address),
+        framework: local.framework.or(base.framework),
     })
 }
 
@@ -431,6 +443,7 @@ fn merge_run(
         strict_port: None,
         readiness_warn_after_seconds: None,
         run_bind_address: None,
+        framework: None,
     });
     let hostname = resolve_hostname(
         arguments.name.as_deref(),
@@ -466,6 +479,28 @@ fn merge_run(
             .or(project.run_bind_address)
             .unwrap_or(default_bind_address),
         ignored_local_config: None,
+        framework: resolve_framework(arguments, project.framework.as_deref())?,
+        working_directory: current_directory.to_path_buf(),
+    })
+}
+
+fn resolve_framework(arguments: &RunArgs, project: Option<&str>) -> Result<FrameworkChoice, Error> {
+    if arguments.no_framework {
+        return Ok(FrameworkChoice::Disabled);
+    }
+    if let Some(value) = arguments.framework.as_deref() {
+        return parse_framework(value);
+    }
+    match project {
+        Some(value) => parse_framework(value),
+        None => Ok(FrameworkChoice::Auto),
+    }
+}
+
+fn parse_framework(value: &str) -> Result<FrameworkChoice, Error> {
+    FrameworkChoice::parse(value).map_err(|reason| Error::InvalidFramework {
+        value: value.to_owned(),
+        reason,
     })
 }
 
@@ -661,6 +696,7 @@ mod tests {
         write_global_at,
     };
     use crate::cli::{Cli, Command};
+    use crate::framework::{Framework, FrameworkChoice};
     use clap::Parser;
     use std::ffi::OsString;
     use std::fs;
@@ -1000,6 +1036,43 @@ mod tests {
     }
 
     #[test]
+    fn framework_comes_from_project_then_cli() {
+        let directory = temporary_directory();
+        fs::write(
+            directory.join("nook.toml"),
+            "format_version = 1\nname = \"app\"\ncommand = [\"nuxt\", \"dev\"]\nframework = \"nuxt\"\n",
+        )
+        .unwrap();
+        let from_file = resolve_run(&run_args(&["run"]), &directory).unwrap();
+        assert_eq!(
+            from_file.framework,
+            FrameworkChoice::Forced(Framework::Nuxt)
+        );
+
+        let from_cli = resolve_run(&run_args(&["run", "--framework", "vite"]), &directory).unwrap();
+        assert_eq!(from_cli.framework, FrameworkChoice::Forced(Framework::Vite));
+
+        let disabled = resolve_run(&run_args(&["run", "--no-framework"]), &directory).unwrap();
+        assert_eq!(disabled.framework, FrameworkChoice::Disabled);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unknown_framework_is_rejected() {
+        let directory = temporary_directory();
+        fs::write(
+            directory.join("nook.toml"),
+            "format_version = 1\ncommand = [\"server\"]\nframework = \"angular\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_run(&run_args(&["run"]), &directory),
+            Err(Error::InvalidFramework { value, .. }) if value == "angular"
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn name_priority_is_cli_then_project_then_git_then_current_directory() {
         assert_eq!(
             resolve_hostname(
@@ -1095,6 +1168,7 @@ mod tests {
             strict_port: Some(false),
             readiness_warn_after_seconds: Some(20),
             run_bind_address: None,
+            framework: None,
         }
     }
 

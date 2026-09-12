@@ -89,6 +89,9 @@ pub(crate) struct InitArgs {
     /// Seconds before warning that the application is not ready.
     #[arg(long, value_name = "SECONDS")]
     pub(crate) readiness_warn_after: Option<u64>,
+    /// Align Vite, Nuxt, Next, Nitro, or Astro; `none` disables detection.
+    #[arg(long, value_name = "NAME", value_parser = ["vite", "nuxt", "next", "nitro", "astro", "none"])]
+    pub(crate) framework: Option<String>,
     /// Child argv to store in the project configuration.
     #[arg(last = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
@@ -212,6 +215,12 @@ pub(crate) struct RunArgs {
     /// Seconds before warning that the application is not ready.
     #[arg(long, value_name = "SECONDS")]
     pub(crate) readiness_warn_after: Option<u64>,
+    /// Align Vite, Nuxt, Next, Nitro, or Astro; `none` disables detection.
+    #[arg(long, value_name = "NAME", value_parser = ["vite", "nuxt", "next", "nitro", "astro", "none"])]
+    pub(crate) framework: Option<String>,
+    /// Do not detect or inject framework host and port flags.
+    #[arg(long, conflicts_with = "framework")]
+    pub(crate) no_framework: bool,
     /// Child argv, preserved exactly and never passed through a shell.
     #[arg(last = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
@@ -451,6 +460,13 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
             toml_string(&address.to_string())
         )),
         None => contents.push_str("# run_bind_address = \"127.0.0.1\"\n"),
+    }
+    contents.push_str(
+        "\n# Align Vite, Nuxt, Next, Nitro, or Astro from the command. Use \"none\" to disable.\n",
+    );
+    match arguments.framework.as_deref() {
+        Some(framework) => contents.push_str(&format!("framework = {}\n", toml_string(framework))),
+        None => contents.push_str("# framework = \"vite\"\n"),
     }
     Ok(contents)
 }
@@ -1773,6 +1789,20 @@ mod tests {
         };
         assert_eq!(run.name.as_deref(), Some("api"));
         assert_eq!(run.command, ["server", "--flag"]);
+    }
+
+    #[test]
+    fn parses_framework_options_and_rejects_conflicts() {
+        let cli = parse(&["run", "--framework", "astro", "--", "astro", "dev"]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(run.framework.as_deref(), Some("astro"));
+        assert!(!run.no_framework);
+        assert!(try_parse(&["run", "--framework", "angular", "--", "ng", "serve"]).is_err());
+        assert!(
+            try_parse(&["run", "--framework", "vite", "--no-framework", "--", "vite"]).is_err()
+        );
     }
 
     #[test]

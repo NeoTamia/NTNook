@@ -38,6 +38,7 @@ This matrix links product requirements to implementation tickets and checks trac
 | Bash/Zsh completion plus native PowerShell completion | NOOK-52, NOOK-54 | `tests/cli_completions.rs`; Windows CI generates and parses the PowerShell script |
 | `nook update` replaces a GitHub binary after SHA-256 verification; a cached check warns when a newer version exists | post-MVP | `update::tests::*`, `cli_update` tests |
 | Package-manager-neutral JavaScript wrapper reports a missing Nook and preserves arguments, exit codes, and signals | post-MVP | `packages/nook-run/test`; Node 22/24 and npm/pnpm/Yarn/Bun CI jobs |
+| Conservative Vite/Nuxt/Next/Nitro/Astro detection and argv/env injection without rewriting project files | NOOK-62, NOOK-72, NOOK-71, NOOK-67, NOOK-69, NOOK-73, NOOK-68 | `framework::tests::*`; `config::tests::framework_*`; `process` alignment test; CLI `--framework` / `--no-framework` |
 | Documentation for requirements, safeguards, troubleshooting, and out-of-scope items | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
 | Linux and Windows gates compile, format, lint, run native Caddy integrations, and produce verifiable binaries | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43, NOOK-58 | `.github/workflows/ci-crate.yml`; both archives, SHA-256 files, installers and attestations through `.github/workflows/publish.yml` |
 

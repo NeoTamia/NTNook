@@ -371,7 +371,22 @@ fn start_run_with_hook(
     })?;
 
     let argv = substitute_port(&config.command, port);
-    let environment = child_environment(port, config.bind_address, &config.hostname, config.tls);
+    let framework = config.framework.resolve(&argv, &config.working_directory);
+    let argv = match framework {
+        Some(framework) => framework.inject_argv(
+            argv,
+            port,
+            config.bind_address,
+            &config.hostname,
+            config.strict_port,
+        ),
+        None => argv,
+    };
+    let mut environment =
+        child_environment(port, config.bind_address, &config.hostname, config.tls).to_vec();
+    if let Some(framework) = framework {
+        environment.extend(framework.environment(port, config.bind_address, &config.hostname));
+    }
     let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
     if !conflicts.is_empty() {
         warnings.push(format!(
@@ -1416,6 +1431,7 @@ mod tests {
     use std::ffi::OsString;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, TcpListener};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1629,6 +1645,29 @@ mod tests {
                 OsString::from("https://api.localhost")
             )
         );
+    }
+
+    #[test]
+    fn framework_alignment_appends_flags_and_environment() {
+        let (store, path) = temporary_store();
+        let marker = path.parent().unwrap().join("argv.env");
+        let code = format!(
+            "import os,sys; open(r'{}','w').write('\\n'.join(sys.argv)+'\\n'+os.environ.get('__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS',''))",
+            marker.display()
+        );
+        let mut config = run_config(vec!["/usr/bin/python3", "-c", &code], 1);
+        config.framework =
+            crate::framework::FrameworkChoice::Forced(crate::framework::Framework::Vite);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let _ = running.wait_for_readiness(&store, |_| {});
+        running.finish(&store, &mut routes).unwrap();
+        let dumped = std::fs::read_to_string(&marker).unwrap();
+        assert!(dumped.contains("--host"));
+        assert!(dumped.contains("127.0.0.1"));
+        assert!(dumped.contains("--port"));
+        assert!(dumped.contains("api.localhost"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -1970,6 +2009,8 @@ mod tests {
             readiness_warn_after_seconds: readiness,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ignored_local_config: None,
+            framework: crate::framework::FrameworkChoice::Disabled,
+            working_directory: PathBuf::from("/nook-framework-no-package"),
         }
     }
 
