@@ -91,7 +91,9 @@ impl Framework {
         if missing.is_empty() {
             return argv;
         }
-        if needs_package_script_separator(&argv) && !has_exact(&argv, "--") {
+        if let Some(index) = npm_exec_separator_index(&argv) {
+            argv.insert(index, OsString::from("--"));
+        } else if needs_package_script_separator(&argv) && !has_exact(&argv, "--") {
             argv.push(OsString::from("--"));
         }
         for (_, arguments) in missing {
@@ -246,6 +248,12 @@ fn first_operand(arguments: &[OsString]) -> Option<String> {
 }
 
 fn split_first_operand(arguments: &[OsString]) -> Option<(String, &[OsString])> {
+    let index = next_operand_index(arguments)?;
+    let name = executable_name(&arguments[index])?;
+    Some((name, &arguments[index + 1..]))
+}
+
+fn next_operand_index(arguments: &[OsString]) -> Option<usize> {
     let mut skip_value = false;
     let mut after_separator = false;
     for (index, argument) in arguments.iter().enumerate() {
@@ -261,9 +269,8 @@ fn split_first_operand(arguments: &[OsString]) -> Option<(String, &[OsString])> 
                 after_separator = true;
                 continue;
             }
-            if let Some(package) = value.strip_prefix("--package=") {
-                return executable_name(OsStr::new(package))
-                    .map(|name| (name, &arguments[index + 1..]));
+            if value.starts_with("--package=") {
+                continue;
             }
             if value.starts_with('-') {
                 if matches!(value, "--package" | "-p" | "-c" | "--call") {
@@ -272,9 +279,22 @@ fn split_first_operand(arguments: &[OsString]) -> Option<(String, &[OsString])> 
                 continue;
             }
         }
-        return executable_name(argument).map(|name| (name, &arguments[index + 1..]));
+        return Some(index);
     }
     None
+}
+
+fn npm_exec_separator_index(argv: &[OsString]) -> Option<usize> {
+    let program = executable_name(argv.first()?)?;
+    if program != "npm" || has_exact(argv, "--") {
+        return None;
+    }
+    let exec_index = next_operand_index(&argv[1..])? + 1;
+    let subcommand = executable_name(&argv[exec_index])?;
+    if !matches!(subcommand.as_str(), "exec" | "x") {
+        return None;
+    }
+    next_operand_index(&argv[exec_index + 1..]).map(|index| index + exec_index + 1)
 }
 
 fn detect_from_package_script(argv: &[OsString], directory: &Path) -> Option<Framework> {
@@ -465,6 +485,17 @@ mod tests {
             None
         );
         assert_eq!(detect(&argv(&["npm", "run", "next"]), nowhere()), None);
+        assert_eq!(
+            detect(
+                &argv(&["npx", "--package=vite", "--", "node", "server.js"]),
+                nowhere()
+            ),
+            None
+        );
+        assert_eq!(
+            detect(&argv(&["npx", "--package=vite", "vite"]), nowhere()),
+            Some(Framework::Vite)
+        );
     }
 
     #[test]
@@ -567,6 +598,48 @@ mod tests {
         let injected = Framework::Vite.inject_argv(command, 5173, bind(), "app.localhost", false);
         assert_eq!(injected[4], "--");
         assert_eq!(injected[5], "--host");
+    }
+
+    #[test]
+    fn npm_exec_inserts_a_separator_before_the_package() {
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npm", "exec", "vite"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npm",
+                "exec",
+                "--",
+                "vite",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npm", "x", "--", "vite"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npm",
+                "x",
+                "--",
+                "vite",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
+        );
     }
 
     #[test]
