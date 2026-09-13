@@ -4,7 +4,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Supported development servers that Nook can align without rewriting project files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub(crate) enum FrameworkChoice {
 
 impl Framework {
     fn from_program(name: &str) -> Option<Self> {
-        match name {
+        match strip_package_version(name) {
             "vite" => Some(Self::Vite),
             "nuxt" | "nuxi" => Some(Self::Nuxt),
             "next" => Some(Self::Next),
@@ -297,6 +297,11 @@ fn flag_takes_value(flag: &str) -> bool {
             | "--workspace"
             | "-w"
             | "--package"
+            | "--dir"
+            | "-C"
+            | "--cwd"
+            | "--prefix"
+            | "--call"
     )
 }
 
@@ -322,14 +327,17 @@ fn next_operand_index(arguments: &[OsString]) -> Option<usize> {
                 after_separator = true;
                 continue;
             }
-            if value.starts_with("--package=") || value.starts_with("--workspace=") {
+            if value.starts_with("--package=")
+                || value.starts_with("--workspace=")
+                || value.starts_with("--dir=")
+                || value.starts_with("--cwd=")
+                || value.starts_with("--prefix=")
+                || value.starts_with("--filter=")
+            {
                 continue;
             }
             if value.starts_with('-') {
-                if matches!(
-                    value,
-                    "--package" | "-p" | "-c" | "--call" | "--workspace" | "-w"
-                ) {
+                if flag_takes_value(value) {
                     skip_value = true;
                 }
                 continue;
@@ -391,10 +399,73 @@ fn npm_exec_separator_index(argv: &[OsString]) -> Option<usize> {
 
 fn detect_from_package_script(argv: &[OsString], directory: &Path) -> Option<Framework> {
     let script = package_script_name(argv)?;
-    let contents = fs::read_to_string(directory.join("package.json")).ok()?;
+    let package_dir = package_directory(argv, directory)?;
+    let contents = fs::read_to_string(package_dir.join("package.json")).ok()?;
     let package: serde_json::Value = serde_json::from_str(&contents).ok()?;
     let command = package.get("scripts")?.get(&script)?.as_str()?;
     detect_from_script(command)
+}
+
+fn package_directory(argv: &[OsString], directory: &Path) -> Option<PathBuf> {
+    if let Some(path) = option_value(argv, &["--dir", "-C", "--cwd", "--prefix"]) {
+        let resolved = resolve_against(directory, &path);
+        return resolved.join("package.json").is_file().then_some(resolved);
+    }
+    if let Some(workspace) = option_value(argv, &["--workspace", "-w", "--filter"]) {
+        return find_workspace_package(directory, &workspace);
+    }
+    Some(directory.to_path_buf())
+}
+
+fn option_value(argv: &[OsString], names: &[&str]) -> Option<String> {
+    let mut skip_value = false;
+    for (index, argument) in argv.iter().enumerate() {
+        let Some(value) = argument.to_str() else {
+            continue;
+        };
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if value == "--" {
+            break;
+        }
+        for name in names {
+            if value == *name {
+                return argv.get(index + 1)?.to_str().map(str::to_owned);
+            }
+            if let Some(rest) = value.strip_prefix(&format!("{name}=")) {
+                return Some(rest.to_owned());
+            }
+        }
+        if value.starts_with('-') && !value.contains('=') && flag_takes_value(value) {
+            skip_value = true;
+        }
+    }
+    None
+}
+
+fn resolve_against(directory: &Path, path: &str) -> PathBuf {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        directory.join(candidate)
+    }
+}
+
+fn find_workspace_package(directory: &Path, workspace: &str) -> Option<PathBuf> {
+    let direct = resolve_against(directory, workspace);
+    if direct.join("package.json").is_file() {
+        return Some(direct);
+    }
+    for folder in ["packages", "apps"] {
+        let candidate = directory.join(folder).join(workspace);
+        if candidate.join("package.json").is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn detect_from_script(command: &str) -> Option<Framework> {
@@ -435,10 +506,15 @@ fn package_script_name(argv: &[OsString]) -> Option<String> {
         return None;
     }
     let mut saw_run = false;
+    let mut skip_value = false;
     for argument in argv.iter().skip(1) {
         let Some(value) = argument.to_str() else {
             continue;
         };
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
         if value == "--" {
             break;
         }
@@ -446,7 +522,13 @@ fn package_script_name(argv: &[OsString]) -> Option<String> {
             saw_run = true;
             continue;
         }
-        if !saw_run || value.starts_with('-') {
+        if !saw_run {
+            continue;
+        }
+        if value.starts_with('-') {
+            if !value.contains('=') && flag_takes_value(value) {
+                skip_value = true;
+            }
             continue;
         }
         return Some(value.to_owned());
@@ -473,6 +555,13 @@ fn executable_name(argument: &OsStr) -> Option<String> {
             .unwrap_or(&lower)
             .to_owned(),
     )
+}
+
+fn strip_package_version(name: &str) -> &str {
+    match name.rfind('@') {
+        Some(index) if index > 0 => &name[..index],
+        _ => name,
+    }
 }
 
 fn is_port_option(names: &[&str]) -> bool {
@@ -566,6 +655,14 @@ mod tests {
             Some(Framework::Next)
         );
         assert_eq!(
+            detect(&argv(&["npx", "vite@latest"]), nowhere()),
+            Some(Framework::Vite)
+        );
+        assert_eq!(
+            detect(&argv(&["npm", "exec", "--", "vite@6"]), nowhere()),
+            Some(Framework::Vite)
+        );
+        assert_eq!(
             detect(&argv(&["pnpm", "exec", "vite"]), nowhere()),
             Some(Framework::Vite)
         );
@@ -649,6 +746,35 @@ mod tests {
             Some(Framework::Vite)
         );
         assert_eq!(detect(&argv(&["pnpm", "dev"]), &directory), None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reads_package_scripts_from_workspace_and_dir() {
+        let directory = temporary_directory();
+        fs::write(
+            directory.join("package.json"),
+            r#"{"scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        let app = directory.join("app");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).unwrap();
+        assert_eq!(
+            detect(
+                &argv(&["npm", "run", "dev", "--workspace", "app"]),
+                &directory
+            ),
+            Some(Framework::Vite)
+        );
+        assert_eq!(
+            detect(&argv(&["pnpm", "--dir", "app", "run", "dev"]), &directory),
+            Some(Framework::Vite)
+        );
+        assert_eq!(
+            detect(&argv(&["npm", "run", "dev"]), &directory),
+            Some(Framework::Next)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
