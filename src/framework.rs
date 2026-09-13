@@ -93,14 +93,7 @@ impl Framework {
                 !has_option(&argv, names)
             })
             .collect();
-        if missing.is_empty() {
-            return argv;
-        }
-        if let Some(index) = npm_exec_separator_index(&argv) {
-            argv.insert(index, OsString::from("--"));
-        } else if needs_package_script_separator(&argv) && !has_exact(&argv, "--") {
-            argv.push(OsString::from("--"));
-        }
+        insert_npm_separators(&mut argv);
         for (_, arguments) in missing {
             argv.extend(arguments);
         }
@@ -221,20 +214,22 @@ fn detect(argv: &[OsString], directory: &Path) -> Option<Framework> {
 fn detect_from_argv(argv: &[OsString]) -> Option<Framework> {
     let program = executable_name(argv.first()?)?;
     if let Some(framework) = Framework::from_program(&program) {
-        return Some(framework);
+        return serving_invocation(framework, &argv[1..]).then_some(framework);
     }
-    Framework::from_program(&wrapper_package(argv)?)
+    let (package, rest) = wrapper_invocation(argv)?;
+    let framework = Framework::from_program(&package)?;
+    serving_invocation(framework, rest).then_some(framework)
 }
 
-fn wrapper_package(argv: &[OsString]) -> Option<String> {
+fn wrapper_invocation(argv: &[OsString]) -> Option<(String, &[OsString])> {
     let program = executable_name(argv.first()?)?;
     let rest = argv.get(1..).unwrap_or(&[]);
     match program.as_str() {
-        "npx" | "bunx" | "pnpx" => first_operand(rest),
+        "npx" | "bunx" | "pnpx" => split_first_operand(rest),
         "npm" | "pnpm" | "yarn" | "bun" => {
             let (subcommand, remaining) = split_first_operand(rest)?;
             match subcommand.as_str() {
-                "exec" | "dlx" | "x" => first_operand(remaining),
+                "exec" | "dlx" | "x" => split_first_operand(remaining),
                 _ => None,
             }
         }
@@ -242,8 +237,55 @@ fn wrapper_package(argv: &[OsString]) -> Option<String> {
     }
 }
 
-fn first_operand(arguments: &[OsString]) -> Option<String> {
-    split_first_operand(arguments).map(|(name, _)| name)
+fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
+    match first_subcommand(arguments).as_deref() {
+        None => matches!(framework, Framework::Vite),
+        Some("dev" | "start" | "preview" | "serve") => true,
+        _ => false,
+    }
+}
+
+fn first_subcommand(arguments: &[OsString]) -> Option<String> {
+    let mut skip_value = false;
+    for argument in arguments {
+        let Some(value) = argument.to_str() else {
+            continue;
+        };
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if value == "--" {
+            continue;
+        }
+        if value.starts_with('-') {
+            if !value.contains('=') && flag_takes_value(value) {
+                skip_value = true;
+            }
+            continue;
+        }
+        return Some(value.to_owned());
+    }
+    None
+}
+
+fn flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--port"
+            | "-p"
+            | "--host"
+            | "--hostname"
+            | "-H"
+            | "--allowed-hosts"
+            | "--mode"
+            | "--config"
+            | "-c"
+            | "--filter"
+            | "--workspace"
+            | "-w"
+            | "--package"
+    )
 }
 
 fn split_first_operand(arguments: &[OsString]) -> Option<(String, &[OsString])> {
@@ -284,6 +326,14 @@ fn next_operand_index(arguments: &[OsString]) -> Option<usize> {
         return Some(index);
     }
     None
+}
+
+fn insert_npm_separators(argv: &mut Vec<OsString>) {
+    if let Some(index) = npm_exec_separator_index(argv) {
+        argv.insert(index, OsString::from("--"));
+    } else if needs_package_script_separator(argv) && !has_exact(argv, "--") {
+        argv.push(OsString::from("--"));
+    }
 }
 
 fn npm_exec_separator_index(argv: &[OsString]) -> Option<usize> {
@@ -480,7 +530,7 @@ mod tests {
             Some(Framework::Vite)
         );
         assert_eq!(
-            detect(&argv(&["bun", "x", "astro"]), nowhere()),
+            detect(&argv(&["bun", "x", "astro", "dev"]), nowhere()),
             Some(Framework::Astro)
         );
         assert_eq!(
@@ -492,9 +542,11 @@ mod tests {
             Some(Framework::Nitro)
         );
         assert_eq!(
-            detect(&argv(&["node_modules/.bin/nuxi"]), nowhere()),
+            detect(&argv(&["node_modules/.bin/nuxi", "dev"]), nowhere()),
             Some(Framework::Nuxt)
         );
+        assert_eq!(detect(&argv(&["next", "build"]), nowhere()), None);
+        assert_eq!(detect(&argv(&["vite", "build"]), nowhere()), None);
     }
 
     #[test]
@@ -686,6 +738,18 @@ mod tests {
                 "127.0.0.1",
                 "--port",
                 "5173"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npm", "exec", "vite", "--host", "0.0.0.0", "--port", "4000"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npm", "exec", "--", "vite", "--host", "0.0.0.0", "--port", "5173"
             ])
         );
     }
