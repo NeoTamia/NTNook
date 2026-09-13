@@ -98,9 +98,7 @@ impl Framework {
             })
             .collect();
         insert_npm_separators(&mut argv);
-        let insert_at = framework_executable_index(&argv)
-            .map(|index| framework_args_end(&argv, index + 1))
-            .unwrap_or(argv.len());
+        let insert_at = flag_insertion_index(&argv);
         let mut inserted = 0;
         for (_, arguments) in missing {
             for argument in arguments {
@@ -236,11 +234,11 @@ fn wrapper_invocation(argv: &[OsString]) -> Option<(String, &[OsString])> {
     let program = executable_name(argv.first()?)?;
     let rest = argv.get(1..).unwrap_or(&[]);
     match program.as_str() {
-        "npx" | "bunx" | "pnpx" => split_first_operand(rest),
+        "npx" | "bunx" | "pnpx" => split_first_operand(&program, rest),
         "npm" | "pnpm" | "yarn" | "bun" => {
-            let (subcommand, remaining) = split_first_operand(rest)?;
+            let (subcommand, remaining) = split_first_operand(&program, rest)?;
             match subcommand.as_str() {
-                "exec" | "dlx" | "x" => split_first_operand(remaining),
+                "exec" | "dlx" | "x" => split_first_operand(&program, remaining),
                 _ => None,
             }
         }
@@ -295,23 +293,39 @@ fn flag_takes_value(flag: &str) -> bool {
             | "-c"
             | "--filter"
             | "--workspace"
-            | "-w"
             | "--package"
             | "--dir"
             | "-C"
             | "--cwd"
             | "--prefix"
             | "--call"
+            | "--script-shell"
     )
 }
 
-fn split_first_operand(arguments: &[OsString]) -> Option<(String, &[OsString])> {
-    let index = next_operand_index(arguments)?;
+fn runner_flag_takes_value(program: &str, flag: &str) -> bool {
+    match program {
+        "pnpm" => matches!(
+            flag,
+            "--dir" | "-C" | "--filter" | "--prefix" | "--package" | "-p" | "--call"
+        ),
+        "npm" | "npx" => flag_takes_value(flag) || flag == "-w",
+        "yarn" => matches!(flag, "--cwd" | "--package" | "-p" | "--call"),
+        "bun" | "bunx" => matches!(flag, "--cwd" | "--filter" | "--package" | "-p"),
+        _ => flag_takes_value(flag),
+    }
+}
+
+fn split_first_operand<'a>(
+    program: &str,
+    arguments: &'a [OsString],
+) -> Option<(String, &'a [OsString])> {
+    let index = next_operand_index(program, arguments)?;
     let name = executable_name(&arguments[index])?;
     Some((name, &arguments[index + 1..]))
 }
 
-fn next_operand_index(arguments: &[OsString]) -> Option<usize> {
+fn next_operand_index(program: &str, arguments: &[OsString]) -> Option<usize> {
     let mut skip_value = false;
     let mut after_separator = false;
     for (index, argument) in arguments.iter().enumerate() {
@@ -337,7 +351,7 @@ fn next_operand_index(arguments: &[OsString]) -> Option<usize> {
                 continue;
             }
             if value.starts_with('-') {
-                if flag_takes_value(value) {
+                if runner_flag_takes_value(program, value) {
                     skip_value = true;
                 }
                 continue;
@@ -355,14 +369,13 @@ fn framework_executable_index(argv: &[OsString]) -> Option<usize> {
     }
     let rest = argv.get(1..)?;
     match program.as_str() {
-        "npx" | "bunx" | "pnpx" => next_operand_index(rest).map(|index| index + 1),
+        "npx" | "bunx" | "pnpx" => next_operand_index(&program, rest).map(|index| index + 1),
         "npm" | "pnpm" | "yarn" | "bun" => {
-            let exec_index = next_operand_index(rest)? + 1;
+            let exec_index = next_operand_index(&program, rest)? + 1;
             let subcommand = executable_name(&argv[exec_index])?;
             match subcommand.as_str() {
-                "exec" | "dlx" | "x" => {
-                    next_operand_index(&argv[exec_index + 1..]).map(|index| index + exec_index + 1)
-                }
+                "exec" | "dlx" | "x" => next_operand_index(&program, &argv[exec_index + 1..])
+                    .map(|index| index + exec_index + 1),
                 _ => None,
             }
         }
@@ -374,6 +387,27 @@ fn framework_args_end(argv: &[OsString], start: usize) -> usize {
     argv.get(start..)
         .and_then(|arguments| arguments.iter().position(|argument| argument == "--"))
         .map_or(argv.len(), |offset| start + offset)
+}
+
+fn flag_insertion_index(argv: &[OsString]) -> usize {
+    if is_npm_run(argv) {
+        return argv
+            .iter()
+            .position(|argument| argument == "--")
+            .map_or(argv.len(), |index| index + 1);
+    }
+    framework_executable_index(argv)
+        .map(|index| framework_args_end(argv, index + 1))
+        .unwrap_or(argv.len())
+}
+
+fn is_npm_run(argv: &[OsString]) -> bool {
+    matches!(
+        argv.first()
+            .and_then(|argument| executable_name(argument))
+            .as_deref(),
+        Some("npm")
+    ) && package_script_name(argv).is_some()
 }
 
 fn insert_npm_separators(argv: &mut Vec<OsString>) {
@@ -389,12 +423,12 @@ fn npm_exec_separator_index(argv: &[OsString]) -> Option<usize> {
     if program != "npm" || has_exact(argv, "--") {
         return None;
     }
-    let exec_index = next_operand_index(&argv[1..])? + 1;
+    let exec_index = next_operand_index("npm", &argv[1..])? + 1;
     let subcommand = executable_name(&argv[exec_index])?;
     if !matches!(subcommand.as_str(), "exec" | "x") {
         return None;
     }
-    next_operand_index(&argv[exec_index + 1..]).map(|index| index + exec_index + 1)
+    next_operand_index("npm", &argv[exec_index + 1..]).map(|index| index + exec_index + 1)
 }
 
 fn detect_from_package_script(argv: &[OsString], directory: &Path) -> Option<Framework> {
@@ -407,14 +441,32 @@ fn detect_from_package_script(argv: &[OsString], directory: &Path) -> Option<Fra
 }
 
 fn package_directory(argv: &[OsString], directory: &Path) -> Option<PathBuf> {
-    if let Some(path) = option_value(argv, &["--dir", "-C", "--cwd", "--prefix"]) {
+    let program = executable_name(argv.first()?)?;
+    if let Some(path) = option_value(argv, directory_flags(&program)) {
         let resolved = resolve_against(directory, &path);
         return resolved.join("package.json").is_file().then_some(resolved);
     }
-    if let Some(workspace) = option_value(argv, &["--workspace", "-w", "--filter"]) {
+    if let Some(workspace) = option_value(argv, workspace_name_flags(&program)) {
         return find_workspace_package(directory, &workspace);
     }
     Some(directory.to_path_buf())
+}
+
+fn directory_flags(program: &str) -> &'static [&'static str] {
+    match program {
+        "pnpm" => &["--dir", "-C"],
+        "npm" => &["--prefix"],
+        "yarn" | "bun" => &["--cwd"],
+        _ => &["--dir", "-C", "--cwd", "--prefix"],
+    }
+}
+
+fn workspace_name_flags(program: &str) -> &'static [&'static str] {
+    match program {
+        "npm" => &["--workspace", "-w"],
+        "pnpm" => &["--filter"],
+        _ => &[],
+    }
 }
 
 fn option_value(argv: &[OsString], names: &[&str]) -> Option<String> {
@@ -526,7 +578,7 @@ fn package_script_name(argv: &[OsString]) -> Option<String> {
             continue;
         }
         if value.starts_with('-') {
-            if !value.contains('=') && flag_takes_value(value) {
+            if !value.contains('=') && runner_flag_takes_value(&program, value) {
                 skip_value = true;
             }
             continue;
@@ -775,6 +827,17 @@ mod tests {
             detect(&argv(&["npm", "run", "dev"]), &directory),
             Some(Framework::Next)
         );
+        assert_eq!(
+            detect(&argv(&["pnpm", "-w", "run", "dev"]), &directory),
+            Some(Framework::Next)
+        );
+        assert_eq!(
+            detect(
+                &argv(&["npm", "run", "--script-shell", "bash", "dev"]),
+                &directory
+            ),
+            Some(Framework::Next)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -967,6 +1030,27 @@ mod tests {
                 "127.0.0.1",
                 "--port",
                 "3000"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npm", "run", "dev", "--", "--mode", "test"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npm",
+                "run",
+                "dev",
+                "--",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173",
+                "--mode",
+                "test"
             ])
         );
     }
