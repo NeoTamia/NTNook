@@ -84,18 +84,29 @@ impl Framework {
         strict_port: bool,
     ) -> Vec<OsString> {
         let flags = self.flags(port, bind_address, hostname, strict_port);
+        let start = framework_executable_index(&argv)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let end = framework_args_end(&argv, start);
         let missing: Vec<_> = flags
             .into_iter()
             .filter(|(names, arguments)| {
                 if is_port_option(names) {
-                    return !overwrite_option(&mut argv, names, arguments.last());
+                    return !overwrite_option(&mut argv[start..end], names, arguments.last());
                 }
-                !has_option(&argv, names)
+                !has_option(&argv[start..end], names)
             })
             .collect();
         insert_npm_separators(&mut argv);
+        let insert_at = framework_executable_index(&argv)
+            .map(|index| framework_args_end(&argv, index + 1))
+            .unwrap_or(argv.len());
+        let mut inserted = 0;
         for (_, arguments) in missing {
-            argv.extend(arguments);
+            for argument in arguments {
+                argv.insert(insert_at + inserted, argument);
+                inserted += 1;
+            }
         }
         argv
     }
@@ -241,7 +252,8 @@ fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
     match first_subcommand(arguments).as_deref() {
         None => matches!(framework, Framework::Vite),
         Some("dev" | "start" | "preview" | "serve") => true,
-        _ => false,
+        Some("build" | "optimize" | "check" | "lint" | "generate") => false,
+        Some(_) => matches!(framework, Framework::Vite),
     }
 }
 
@@ -326,6 +338,34 @@ fn next_operand_index(arguments: &[OsString]) -> Option<usize> {
         return Some(index);
     }
     None
+}
+
+fn framework_executable_index(argv: &[OsString]) -> Option<usize> {
+    let program = executable_name(argv.first()?)?;
+    if Framework::from_program(&program).is_some() {
+        return Some(0);
+    }
+    let rest = argv.get(1..)?;
+    match program.as_str() {
+        "npx" | "bunx" | "pnpx" => next_operand_index(rest).map(|index| index + 1),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            let exec_index = next_operand_index(rest)? + 1;
+            let subcommand = executable_name(&argv[exec_index])?;
+            match subcommand.as_str() {
+                "exec" | "dlx" | "x" => {
+                    next_operand_index(&argv[exec_index + 1..]).map(|index| index + exec_index + 1)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn framework_args_end(argv: &[OsString], start: usize) -> usize {
+    argv.get(start..)
+        .and_then(|arguments| arguments.iter().position(|argument| argument == "--"))
+        .map_or(argv.len(), |offset| start + offset)
 }
 
 fn insert_npm_separators(argv: &mut Vec<OsString>) {
@@ -547,6 +587,10 @@ mod tests {
         );
         assert_eq!(detect(&argv(&["next", "build"]), nowhere()), None);
         assert_eq!(detect(&argv(&["vite", "build"]), nowhere()), None);
+        assert_eq!(
+            detect(&argv(&["vite", "./frontend"]), nowhere()),
+            Some(Framework::Vite)
+        );
     }
 
     #[test]
@@ -698,6 +742,29 @@ mod tests {
         let injected = Framework::Vite.inject_argv(command, 5173, bind(), "app.localhost", false);
         assert_eq!(injected[4], "--");
         assert_eq!(injected[5], "--host");
+    }
+
+    #[test]
+    fn npx_package_flag_is_not_rewritten_as_a_port() {
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npx", "-p", "vite", "vite"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npx",
+                "-p",
+                "vite",
+                "vite",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
+        );
     }
 
     #[test]
