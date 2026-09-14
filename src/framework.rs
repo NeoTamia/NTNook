@@ -420,7 +420,7 @@ fn insert_npm_separators(argv: &mut Vec<OsString>) {
 
 fn npm_exec_separator_index(argv: &[OsString]) -> Option<usize> {
     let program = executable_name(argv.first()?)?;
-    if program != "npm" || has_exact(argv, "--") {
+    if program != "npm" {
         return None;
     }
     let exec_index = next_operand_index("npm", &argv[1..])? + 1;
@@ -428,7 +428,14 @@ fn npm_exec_separator_index(argv: &[OsString]) -> Option<usize> {
     if !matches!(subcommand.as_str(), "exec" | "x") {
         return None;
     }
-    next_operand_index("npm", &argv[exec_index + 1..]).map(|index| index + exec_index + 1)
+    let package_index = next_operand_index("npm", &argv[exec_index + 1..])? + exec_index + 1;
+    if argv[..package_index]
+        .iter()
+        .any(|argument| argument == "--")
+    {
+        return None;
+    }
+    Some(package_index)
 }
 
 fn detect_from_package_script(argv: &[OsString], directory: &Path) -> Option<Framework> {
@@ -517,7 +524,70 @@ fn find_workspace_package(directory: &Path, workspace: &str) -> Option<PathBuf> 
             return Some(candidate);
         }
     }
+    find_workspace_by_package_name(directory, workspace)
+}
+
+fn find_workspace_by_package_name(root: &Path, name: &str) -> Option<PathBuf> {
+    for pattern in workspace_patterns(root) {
+        for candidate in expand_workspace_pattern(root, &pattern) {
+            if package_name(&candidate).as_deref() == Some(name) {
+                return Some(candidate);
+            }
+        }
+    }
     None
+}
+
+fn workspace_patterns(root: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(root.join("package.json")) else {
+        return Vec::new();
+    };
+    let Ok(package) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(workspaces) = package.get("workspaces") else {
+        return Vec::new();
+    };
+    workspaces
+        .as_array()
+        .or_else(|| {
+            workspaces
+                .get("packages")
+                .and_then(|value| value.as_array())
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn expand_workspace_pattern(root: &Path, pattern: &str) -> Vec<PathBuf> {
+    let pattern = pattern.trim_end_matches('/');
+    if let Some(parent) = pattern.strip_suffix("/*") {
+        let Ok(entries) = fs::read_dir(root.join(parent)) else {
+            return Vec::new();
+        };
+        return entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.join("package.json").is_file())
+            .collect();
+    }
+    if pattern.contains('*') {
+        return Vec::new();
+    }
+    let path = root.join(pattern);
+    path.join("package.json")
+        .is_file()
+        .then_some(path)
+        .into_iter()
+        .collect()
+}
+
+fn package_name(directory: &Path) -> Option<String> {
+    let contents = fs::read_to_string(directory.join("package.json")).ok()?;
+    let package: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    package.get("name")?.as_str().map(str::to_owned)
 }
 
 fn detect_from_script(command: &str) -> Option<Framework> {
@@ -838,6 +908,25 @@ mod tests {
             ),
             Some(Framework::Next)
         );
+        let frontend = directory.join("services").join("frontend");
+        fs::create_dir_all(&frontend).unwrap();
+        fs::write(
+            frontend.join("package.json"),
+            r#"{"name":"web","scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("package.json"),
+            r#"{"scripts":{"dev":"next dev"},"workspaces":["services/*"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect(
+                &argv(&["npm", "run", "dev", "--workspace", "web"]),
+                &directory
+            ),
+            Some(Framework::Vite)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1006,6 +1095,28 @@ mod tests {
             ),
             argv(&[
                 "npm", "exec", "--", "vite", "--host", "0.0.0.0", "--port", "5173"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npm", "exec", "vite", "--", "--mode", "test"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npm",
+                "exec",
+                "--",
+                "vite",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173",
+                "--",
+                "--mode",
+                "test"
             ])
         );
     }
