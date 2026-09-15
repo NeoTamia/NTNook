@@ -210,7 +210,11 @@ fn wait_for_state(path: &Path, hostname: &str, child: &mut Child) {
             return;
         }
         if let Some(status) = child.try_wait().unwrap() {
-            panic!("nook run exited before writing its lease: {status}");
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("nook run exited before writing its lease: {status}; stderr: {stderr}");
         }
         thread::sleep(Duration::from_millis(50));
     }
