@@ -84,10 +84,7 @@ impl Framework {
         strict_port: bool,
     ) -> Vec<OsString> {
         let flags = self.flags(port, bind_address, hostname, strict_port);
-        let start = framework_executable_index(&argv)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        let end = framework_args_end(&argv, start);
+        let (start, end) = flag_scan_range(&argv);
         let missing: Vec<_> = flags
             .into_iter()
             .filter(|(names, arguments)| {
@@ -389,6 +386,22 @@ fn framework_args_end(argv: &[OsString], start: usize) -> usize {
         .map_or(argv.len(), |offset| start + offset)
 }
 
+fn flag_scan_range(argv: &[OsString]) -> (usize, usize) {
+    if let Some(index) = framework_executable_index(argv) {
+        let start = index + 1;
+        return (start, framework_args_end(argv, start));
+    }
+    if package_script_name(argv).is_some() {
+        if let Some(separator) = argv.iter().position(|argument| argument == "--") {
+            return (separator + 1, argv.len());
+        }
+        if let Some(script) = package_script_index(argv) {
+            return (script + 1, argv.len());
+        }
+    }
+    (0, argv.len())
+}
+
 fn flag_insertion_index(argv: &[OsString]) -> usize {
     if is_npm_run(argv) {
         return argv
@@ -623,13 +636,18 @@ fn is_env_assignment(token: &str) -> bool {
 }
 
 fn package_script_name(argv: &[OsString]) -> Option<String> {
+    let index = package_script_index(argv)?;
+    argv[index].to_str().map(str::to_owned)
+}
+
+fn package_script_index(argv: &[OsString]) -> Option<usize> {
     let program = executable_name(argv.first()?)?;
     if !matches!(program.as_str(), "npm" | "pnpm" | "yarn" | "bun") {
         return None;
     }
     let mut saw_run = false;
     let mut skip_value = false;
-    for argument in argv.iter().skip(1) {
+    for (index, argument) in argv.iter().enumerate().skip(1) {
         let Some(value) = argument.to_str() else {
             continue;
         };
@@ -653,7 +671,7 @@ fn package_script_name(argv: &[OsString]) -> Option<String> {
             }
             continue;
         }
-        return Some(value.to_owned());
+        return Some(index);
     }
     None
 }
@@ -1164,6 +1182,25 @@ mod tests {
                 "test"
             ])
         );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npm", "run", "dev", "--", "--port", "4000"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npm",
+                "run",
+                "dev",
+                "--",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
+        );
     }
 
     #[test]
@@ -1213,6 +1250,25 @@ mod tests {
                 false
             ),
             argv(&["bun", "run", "dev", "--host", "127.0.0.1", "--port", "3000"])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["bun", "--port=4000", "run", "dev"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "bun",
+                "--port=4000",
+                "run",
+                "dev",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
         );
     }
 
