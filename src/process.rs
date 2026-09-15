@@ -371,7 +371,7 @@ fn start_run_with_hook(
     })?;
 
     let argv = substitute_port(&config.command, port);
-    let framework = config.framework.resolve(&argv, &config.working_directory);
+    let framework = config.framework.resolve(&argv);
     let argv = match framework {
         Some(framework) => framework.inject_argv(
             argv,
@@ -1431,7 +1431,6 @@ mod tests {
     use std::ffi::OsString;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, TcpListener};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    use std::path::PathBuf;
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1663,10 +1662,14 @@ mod tests {
         let _ = running.wait_for_readiness(&store, |_| {});
         running.finish(&store, &mut routes).unwrap();
         let dumped = std::fs::read_to_string(&marker).unwrap();
-        assert!(dumped.contains("--host"));
-        assert!(dumped.contains("127.0.0.1"));
-        assert!(dumped.contains("--port"));
-        assert!(dumped.contains("api.localhost"));
+        assert!(
+            dumped.contains("api.localhost"),
+            "forced Vite still injects allowed-hosts env: {dumped}"
+        );
+        assert!(
+            !dumped.contains("--host"),
+            "argv flags are not added unless the CLI is vite/nuxt/astro: {dumped}"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -2010,7 +2013,6 @@ mod tests {
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ignored_local_config: None,
             framework: crate::framework::FrameworkChoice::Disabled,
-            working_directory: PathBuf::from("/nook-framework-no-package"),
         }
     }
 

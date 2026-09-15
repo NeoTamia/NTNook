@@ -209,7 +209,6 @@ pub(crate) struct ResolvedRunConfig {
     pub(crate) bind_address: IpAddr,
     pub(crate) ignored_local_config: Option<PathBuf>,
     pub(crate) framework: FrameworkChoice,
-    pub(crate) working_directory: PathBuf,
 }
 
 pub(crate) fn load_global() -> Result<GlobalConfig, Error> {
@@ -480,7 +479,6 @@ fn merge_run(
             .unwrap_or(default_bind_address),
         ignored_local_config: None,
         framework: resolve_framework(arguments, project.framework.as_deref())?,
-        working_directory: current_directory.to_path_buf(),
     })
 }
 
