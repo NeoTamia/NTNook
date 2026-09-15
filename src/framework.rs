@@ -392,6 +392,12 @@ fn flag_scan_range(argv: &[OsString]) -> (usize, usize) {
         return (start, framework_args_end(argv, start));
     }
     if package_script_name(argv).is_some() {
+        if passes_separator_through(argv) {
+            let start = package_script_index(argv)
+                .map(|index| index + 1)
+                .unwrap_or(argv.len());
+            return (start, framework_args_end(argv, start));
+        }
         if let Some(separator) = argv.iter().position(|argument| argument == "--") {
             return (separator + 1, argv.len());
         }
@@ -409,9 +415,24 @@ fn flag_insertion_index(argv: &[OsString]) -> usize {
             .position(|argument| argument == "--")
             .map_or(argv.len(), |index| index + 1);
     }
+    if passes_separator_through(argv) {
+        return argv
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(argv.len());
+    }
     framework_executable_index(argv)
         .map(|index| framework_args_end(argv, index + 1))
         .unwrap_or(argv.len())
+}
+
+fn passes_separator_through(argv: &[OsString]) -> bool {
+    matches!(
+        argv.first()
+            .and_then(|argument| executable_name(argument))
+            .as_deref(),
+        Some("pnpm" | "yarn")
+    ) && package_script_name(argv).is_some()
 }
 
 fn is_npm_run(argv: &[OsString]) -> bool {
@@ -553,15 +574,15 @@ fn find_workspace_by_package_name(root: &Path, name: &str) -> Option<PathBuf> {
 
 fn workspace_patterns(root: &Path) -> Vec<String> {
     let Ok(contents) = fs::read_to_string(root.join("package.json")) else {
-        return Vec::new();
+        return pnpm_workspace_patterns(root);
     };
     let Ok(package) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return Vec::new();
+        return pnpm_workspace_patterns(root);
     };
     let Some(workspaces) = package.get("workspaces") else {
-        return Vec::new();
+        return pnpm_workspace_patterns(root);
     };
-    workspaces
+    let mut patterns = workspaces
         .as_array()
         .or_else(|| {
             workspaces
@@ -571,7 +592,43 @@ fn workspace_patterns(root: &Path) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str().map(str::to_owned))
-        .collect()
+        .collect::<Vec<_>>();
+    patterns.extend(pnpm_workspace_patterns(root));
+    patterns
+}
+
+fn pnpm_workspace_patterns(root: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(root.join("pnpm-workspace.yaml")) else {
+        return Vec::new();
+    };
+    let mut in_packages = false;
+    let mut patterns = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed == "packages:" || trimmed.starts_with("packages:") {
+            in_packages = true;
+            continue;
+        }
+        if !in_packages {
+            continue;
+        }
+        let Some(item) = trimmed.strip_prefix('-') else {
+            break;
+        };
+        let item = item
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .trim()
+            .to_owned();
+        if !item.is_empty() {
+            patterns.push(item);
+        }
+    }
+    patterns
 }
 
 fn expand_workspace_pattern(root: &Path, pattern: &str) -> Vec<PathBuf> {
@@ -658,7 +715,7 @@ fn package_script_index(argv: &[OsString]) -> Option<usize> {
         if value == "--" {
             break;
         }
-        if value == "run" || value == "run-script" {
+        if !saw_run && (value == "run" || value == "run-script") {
             saw_run = true;
             continue;
         }
@@ -886,6 +943,15 @@ mod tests {
             Some(Framework::Vite)
         );
         assert_eq!(detect(&argv(&["pnpm", "dev"]), &directory), None);
+        fs::write(
+            directory.join("package.json"),
+            r#"{"scripts":{"run":"vite","dev":"nuxt dev"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect(&argv(&["npm", "run", "run"]), &directory),
+            Some(Framework::Vite)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -941,6 +1007,23 @@ mod tests {
         assert_eq!(
             detect(
                 &argv(&["npm", "run", "dev", "--workspace", "web"]),
+                &directory
+            ),
+            Some(Framework::Vite)
+        );
+        fs::write(
+            directory.join("package.json"),
+            r#"{"scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'services/*'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect(
+                &argv(&["pnpm", "--filter", "web", "run", "dev"]),
                 &directory
             ),
             Some(Framework::Vite)
@@ -1268,6 +1351,46 @@ mod tests {
                 "127.0.0.1",
                 "--port",
                 "5173"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["pnpm", "run", "dev", "--"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "pnpm",
+                "run",
+                "dev",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173",
+                "--"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["yarn", "run", "dev", "--", "--mode", "test"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "yarn",
+                "run",
+                "dev",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173",
+                "--",
+                "--mode",
+                "test"
             ])
         );
     }
