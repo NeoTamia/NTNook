@@ -99,7 +99,7 @@ impl Framework {
         let missing: Vec<_> = flags
             .into_iter()
             .filter(|(names, arguments)| {
-                if is_port_option(names) {
+                if is_port_option(names) || is_host_option(names) {
                     return !overwrite_option(&mut argv[start..end], names, arguments.last());
                 }
                 !has_option(&argv[start..end], names)
@@ -412,6 +412,12 @@ fn is_port_option(names: &[&str]) -> bool {
     names.iter().any(|name| *name == "--port" || *name == "-p")
 }
 
+fn is_host_option(names: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|name| *name == "--host" || *name == "--hostname" || *name == "-H")
+}
+
 fn overwrite_option(argv: &mut [OsString], names: &[&str], value: Option<&OsString>) -> bool {
     let Some(value) = value else {
         return false;
@@ -422,10 +428,15 @@ fn overwrite_option(argv: &mut [OsString], names: &[&str], value: Option<&OsStri
         };
         for name in names {
             if current == *name {
-                if index + 1 < argv.len() {
+                if index + 1 < argv.len()
+                    && !argv[index + 1]
+                        .to_str()
+                        .is_some_and(|next| next.starts_with('-'))
+                {
                     argv[index + 1] = value.clone();
+                    return true;
                 }
-                return true;
+                return false;
             }
             let prefix = format!("{name}=");
             if current.starts_with(&prefix) {
@@ -525,6 +536,16 @@ mod tests {
                 false
             ),
             argv(&["bun", "run", "dev"])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["vite", "--host", "192.168.1.20", "--port", "4000"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&["vite", "--host", "127.0.0.1", "--port", "5173"])
         );
         assert_eq!(
             Framework::Vite.inject_argv(
