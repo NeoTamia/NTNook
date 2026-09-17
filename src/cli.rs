@@ -462,7 +462,7 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
         None => contents.push_str("# run_bind_address = \"127.0.0.1\"\n"),
     }
     contents.push_str(
-        "\n# Align Vite/Nuxt/Astro when the command is that CLI. Use \"none\" to disable.\n",
+        "\n# Align Vite/Nuxt/Next/Nitro/Astro when the command is that CLI. Use \"none\" to disable.\n",
     );
     match arguments.framework.as_deref() {
         Some(framework) => contents.push_str(&format!("framework = {}\n", toml_string(framework))),

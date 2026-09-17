@@ -1,4 +1,4 @@
-//! Align Vite, Nuxt, and Astro when the child argv *is* the framework CLI.
+//! Align Vite, Nuxt, Next, Nitro, and Astro when the child argv *is* that CLI.
 //!
 //! `bun run` / `npm run` only inherit `PORT` / `HOST` / `NOOK_URL`. Put the
 //! raw CLI in the script (`nook-run -- vite`, `nook-run -- nuxt dev`).
@@ -89,6 +89,9 @@ impl Framework {
         let Some(index) = framework_executable_index(&argv) else {
             return argv;
         };
+        if !matches_framework(self, &argv[index]) {
+            return argv;
+        }
         if !serving_invocation(self, &argv[index + 1..]) {
             return argv;
         }
@@ -239,6 +242,10 @@ fn vite_hosts_override(existing: Option<&OsStr>, hostname: &str) -> Option<OsStr
         Some(value) if !value.is_empty() => None,
         _ => Some(OsString::from(hostname)),
     }
+}
+
+fn matches_framework(framework: Framework, argument: &OsStr) -> bool {
+    executable_name(argument).and_then(|name| Framework::from_program(&name)) == Some(framework)
 }
 
 fn detect(argv: &[OsString]) -> Option<Framework> {
@@ -561,6 +568,26 @@ mod tests {
                 false
             ),
             argv(&["bun", "run", "dev"])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npx", "eslint", "."]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&["npx", "eslint", "."])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["bunx", "tsc"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&["bunx", "tsc"])
         );
         assert_eq!(
             Framework::Vite.inject_argv(

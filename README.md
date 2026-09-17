@@ -250,7 +250,7 @@ nook run --name legacy --no-tls -- ./server
 - `--no-framework` disables detection and flag injection;
 - arguments after `--` are passed through directly, without an implicit shell.
 
-Nook replaces `{port}` literally in each argument and injects `PORT`, `HOST` (the value of `run_bind_address`, `127.0.0.1` by default), and `NOOK_URL`. When the child argv *is* Vite, Nuxt, or Astro (including `bunx` / `npx`), Nook also appends that CLI's host/port flags. `bun run` and Elysia (`bun --watch`) only get the environment variables. The process receives the terminal's stdin/stdout/stderr, and its exit code is preserved even if Caddy cleanup must be retried later.
+Nook replaces `{port}` literally in each argument and injects `PORT`, `HOST` (the value of `run_bind_address`, `127.0.0.1` by default), and `NOOK_URL`. When the child argv *is* Vite, Nuxt, Next, Nitro, or Astro (including `bunx` / `npx`), Nook also appends that CLI's host/port flags. `bun run` and Elysia (`bun --watch`) only get the environment variables. The process receives the terminal's stdin/stdout/stderr, and its exit code is preserved even if Caddy cleanup must be retried later.
 
 After reserving the route and starting the process, Nook always prints the selected domain, public URL, and effective application port, including when the name and port are inferred:
 
@@ -365,7 +365,7 @@ Without a command after `--`, `command` is required. Name precedence is: `--name
 
 ### Framework alignment
 
-Nook appends `--host` / `--port` only when the **child argv is the framework CLI** (Vite, Nuxt/`nuxi`, Astro, plus `bunx` / `bun x` / `npx`). It does not parse `package.json` scripts, workspaces, or `bun run` / `npm run`.
+Nook appends `--host` / `--port` only when the **child argv is the framework CLI** (Vite, Nuxt/`nuxi`, Next, Nitro, Astro, plus `bunx` / `bun x` / `npx`). It does not parse `package.json` scripts, workspaces, or `bun run` / `npm run`.
 
 Use that in scripts:
 
