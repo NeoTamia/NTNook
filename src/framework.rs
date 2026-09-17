@@ -91,6 +91,14 @@ impl Framework {
         };
         if let Some(separator) = npm_exec_separator_index(&argv) {
             argv.insert(separator, OsString::from("--"));
+            let package = separator + 1;
+            if let Some(offset) = argv
+                .iter()
+                .skip(package + 1)
+                .position(|argument| argument == "--")
+            {
+                argv.remove(package + 1 + offset);
+            }
         }
         let index = framework_executable_index(&argv).unwrap_or(index);
         let start = index + 1;
@@ -566,6 +574,27 @@ mod tests {
                 false
             ),
             argv(&["nuxt", "dev", "--host", "127.0.0.1", "--port", "3000"])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["npm", "exec", "vite", "--", "--mode", "test"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "npm",
+                "exec",
+                "--",
+                "vite",
+                "--mode",
+                "test",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5173"
+            ])
         );
         assert_eq!(
             Framework::Astro.inject_argv(
