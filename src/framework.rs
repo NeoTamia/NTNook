@@ -256,36 +256,40 @@ fn detect(argv: &[OsString]) -> Option<Framework> {
 }
 
 fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
-    match first_subcommand(arguments).as_deref() {
-        None => matches!(framework, Framework::Vite),
-        Some("dev" | "start" | "preview" | "serve") => true,
-        Some("build" | "optimize" | "check" | "lint" | "generate") => false,
-        Some(_) => matches!(framework, Framework::Vite),
-    }
-}
-
-fn first_subcommand(arguments: &[OsString]) -> Option<String> {
-    let mut skip_value = false;
+    let mut saw_server = false;
     for argument in arguments {
         let Some(value) = argument.to_str() else {
             continue;
         };
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
         if value == "--" {
             break;
         }
-        if value.starts_with('-') {
-            if !value.contains('=') && flag_takes_value(value) {
-                skip_value = true;
-            }
+        if value.starts_with('-') || !is_command_word(value) {
             continue;
         }
-        return Some(value.to_owned());
+        if is_non_server_subcommand(value) {
+            return false;
+        }
+        if is_server_subcommand(value) {
+            saw_server = true;
+        }
     }
-    None
+    saw_server || matches!(framework, Framework::Vite)
+}
+
+fn is_command_word(token: &str) -> bool {
+    !token.is_empty() && !token.contains('/') && !token.contains('.')
+}
+
+fn is_server_subcommand(token: &str) -> bool {
+    matches!(token, "dev" | "start" | "preview" | "serve")
+}
+
+fn is_non_server_subcommand(token: &str) -> bool {
+    matches!(
+        token,
+        "build" | "optimize" | "check" | "lint" | "generate" | "sync" | "test"
+    )
 }
 
 fn flag_takes_value(flag: &str) -> bool {
@@ -517,6 +521,17 @@ mod tests {
         assert_eq!(detect(&argv(&["astro", "dev"])), Some(Framework::Astro));
         assert_eq!(detect(&argv(&["vite", "build"])), None);
         assert_eq!(detect(&argv(&["nuxt", "build"])), None);
+        assert_eq!(detect(&argv(&["vite", "--base", "/docs/", "build"])), None);
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["vite", "--base", "/docs/", "build"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&["vite", "--base", "/docs/", "build"])
+        );
         assert_eq!(
             FrameworkChoice::Forced(Framework::Next).resolve(&argv(&["next", "build"])),
             Some(Framework::Next)

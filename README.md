@@ -378,7 +378,7 @@ Use that in scripts:
 }
 ```
 
-`bun run dev`, `bun --watch src/server.ts` (Elysia), and `vite build` are not flag-aligned. They still receive `PORT`, `HOST`, and `NOOK_URL`. Nuxt also gets `NUXT_HOST` / `NUXT_PORT` when the CLI is `nuxt`/`nuxi`.
+`bun run dev`, `bun --watch src/server.ts` (Elysia), and builds (`vite build`, `vite --base /docs/ build`) are not flag-aligned. They still receive `PORT`, `HOST`, and `NOOK_URL`. Nuxt also gets `NUXT_HOST` / `NUXT_PORT` when the CLI is `nuxt`/`nuxi`.
 
 ```sh
 nook run -- nuxt dev
