@@ -89,6 +89,9 @@ impl Framework {
         let Some(index) = framework_executable_index(&argv) else {
             return argv;
         };
+        if !serving_invocation(self, &argv[index + 1..]) {
+            return argv;
+        }
         if let Some(separator) = npm_exec_separator_index(&argv) {
             argv.insert(separator, OsString::from("--"));
             let package = separator + 1;
@@ -507,6 +510,20 @@ mod tests {
         assert_eq!(detect(&argv(&["astro", "dev"])), Some(Framework::Astro));
         assert_eq!(detect(&argv(&["vite", "build"])), None);
         assert_eq!(detect(&argv(&["nuxt", "build"])), None);
+        assert_eq!(
+            FrameworkChoice::Forced(Framework::Next).resolve(&argv(&["next", "build"])),
+            Some(Framework::Next)
+        );
+        assert_eq!(
+            Framework::Next.inject_argv(
+                argv(&["next", "build"]),
+                3000,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&["next", "build"])
+        );
     }
 
     #[test]
