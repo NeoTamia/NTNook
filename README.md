@@ -365,26 +365,27 @@ Without a command after `--`, `command` is required. Name precedence is: `--name
 
 ### Framework alignment
 
-Nook appends `--host` / `--port` only when the **child argv is the framework CLI** (Vite, Nuxt/`nuxi`, Next, Nitro, Astro, plus `bunx` / `bun x` / `npx`). It does not parse `package.json` scripts, workspaces, or `bun run` / `npm run`.
+`nook run` is enough. `@neotamia/nook-run` is only a convenience wrapper for package scripts.
 
-Use that in scripts:
+```sh
+nook run -- nuxt dev
+nook run -- vite
+nook run -- bunx vite
+```
+
+Or in `nook.toml`: `command = ["nuxt", "dev"]` then `nook run`. Nook appends `--host` / `--port` when that argv **is** Vite, Nuxt/`nuxi`, Next, Nitro, or Astro (including `bunx` / `npx`). It does not read `package.json`.
+
+Optional wrapper for `bun run` / `npm run`:
 
 ```json
 {
   "scripts": {
-    "dev": "nook-run -- nuxt dev",
-    "dev:app": "nook-run -- vite"
+    "dev": "nook-run -- nuxt dev"
   }
 }
 ```
 
-`bun run dev`, `bun --watch src/server.ts` (Elysia), and builds (`vite build`, `vite --base /docs/ build`) are not flag-aligned. They still receive `PORT`, `HOST`, and `NOOK_URL`. Nuxt also gets `NUXT_HOST` / `NUXT_PORT` when the CLI is `nuxt`/`nuxi`.
-
-```sh
-nook run -- nuxt dev
-nook run -- bunx vite
-nook run --no-framework -- python app.py
-```
+`bun run` without that wrapper, `bun --watch src/server.ts` (Elysia), and builds (`vite build`) only get `PORT` / `HOST` / `NOOK_URL`. Nuxt also gets `NUXT_HOST` / `NUXT_PORT` when the CLI is `nuxt`. Next already allows `**.localhost`; there is no official `allowedDevOrigins` CLI/env (config file only).
 
 Each developer can add a `nook.local.toml` in the same directory. Its fields override those in
 `nook.toml` without changing the shared configuration:

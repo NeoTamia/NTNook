@@ -1,8 +1,7 @@
 //! Align Vite, Nuxt, Next, Nitro, and Astro when the child argv *is* that CLI.
 //!
-//! `bun run` / `npm run` only inherit `PORT` / `HOST` / `NOOK_URL`. Put the
-//! raw CLI in the script (`nook-run -- vite`, `nook-run -- nuxt dev`).
-//! Elysia (`bun --watch src/server.ts`) is not a frontend framework.
+//! `nook run -- nuxt dev` is enough; `@neotamia/nook-run` is optional.
+//! `bun run` / Elysia only inherit `PORT` / `HOST` / `NOOK_URL`.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
