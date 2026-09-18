@@ -95,18 +95,6 @@ impl Framework {
         if !serving_invocation(self, &argv[index + 1..]) {
             return argv;
         }
-        if let Some(separator) = npm_exec_separator_index(&argv) {
-            argv.insert(separator, OsString::from("--"));
-            let package = separator + 1;
-            if let Some(offset) = argv
-                .iter()
-                .skip(package + 1)
-                .position(|argument| argument == "--")
-            {
-                argv.remove(package + 1 + offset);
-            }
-        }
-        let index = framework_executable_index(&argv).unwrap_or(index);
         let start = index + 1;
         let end = args_end(&argv, start);
         let flags = self.flags(port, bind_address, hostname, strict_port);
@@ -383,26 +371,6 @@ fn next_operand_index(program: &str, arguments: &[OsString]) -> Option<usize> {
     None
 }
 
-fn npm_exec_separator_index(argv: &[OsString]) -> Option<usize> {
-    let program = executable_name(argv.first()?)?;
-    if program != "npm" {
-        return None;
-    }
-    let exec_index = next_operand_index("npm", &argv[1..])? + 1;
-    let subcommand = executable_name(&argv[exec_index])?;
-    if !matches!(subcommand.as_str(), "exec" | "x") {
-        return None;
-    }
-    let package_index = next_operand_index("npm", &argv[exec_index + 1..])? + exec_index + 1;
-    if argv[..package_index]
-        .iter()
-        .any(|argument| argument == "--")
-    {
-        return None;
-    }
-    Some(package_index)
-}
-
 fn args_end(argv: &[OsString], start: usize) -> usize {
     argv.get(start..)
         .and_then(|arguments| arguments.iter().position(|argument| argument == "--"))
@@ -633,27 +601,6 @@ mod tests {
                 false
             ),
             argv(&["nuxt", "dev", "--host", "127.0.0.1", "--port", "3000"])
-        );
-        assert_eq!(
-            Framework::Vite.inject_argv(
-                argv(&["npm", "exec", "vite", "--", "--mode", "test"]),
-                5173,
-                bind(),
-                "app.localhost",
-                false
-            ),
-            argv(&[
-                "npm",
-                "exec",
-                "--",
-                "vite",
-                "--mode",
-                "test",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "5173"
-            ])
         );
         assert_eq!(
             Framework::Astro.inject_argv(
