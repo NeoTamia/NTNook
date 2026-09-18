@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/NeoTamia/NTNook/compare/nook-run-v1.0.1...nook-run-v1.0.2) (2026-09-10)
+
+
+### 🔧 Build System
+
+* **deps:** Update pnpm to v11.25.0 ([#34](https://github.com/NeoTamia/NTNook/issues/34)) ([373a874](https://github.com/NeoTamia/NTNook/commit/373a87436b0a3cbcdb2bdf4a583a55a2b226ffeb))
+
 ## [1.0.1](https://github.com/NeoTamia/NTNook/compare/nook-run-v1.0.0...nook-run-v1.0.1) (2026-09-09)
 
 
