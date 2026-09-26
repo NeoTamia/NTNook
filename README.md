@@ -526,6 +526,8 @@ public exposure.
 
 ## Development
 
+Implementers and reviewers follow [CODING_STANDARDS.md](CODING_STANDARDS.md).
+
 ```sh
 cargo fmt --check
 cargo check
