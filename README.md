@@ -485,6 +485,77 @@ overrides `caddy_admin`. To save the socket in the configuration, use
 `caddy_client_ip_ranges` controls the `remote_ip` matcher added to every Nook route. The defaults
 preserve native loopback behavior.
 
+## Tailscale
+
+Nook can additionally publish a run or an alias to the devices of your tailnet with private
+[Tailscale Serve](https://tailscale.com/kb/1312/serve). The local `.localhost` route stays
+unchanged; Serve is an opt-in second entry point.
+
+```sh
+nook run --tailscale --name api -- bun run dev
+nook alias set docs 5173 --tailscale
+nook tailscale status
+```
+
+Requirements: Tailscale 1.52 or newer installed and connected, HTTPS certificates enabled for the
+tailnet, and a user allowed to change Serve (on Linux, root or the Tailscale operator). Nook runs
+`tailscale` from `PATH` (`tailscale.exe` on Windows, falling back to
+`%ProgramFiles%\Tailscale\tailscale.exe`); set `NOOK_TAILSCALE` to use another executable.
+
+All prerequisites are checked before Nook changes anything or spawns the child. A missing client,
+an unreachable `tailscaled`, a disconnected device (with the login URL Tailscale reports), a
+version without background Serve, or disabled HTTPS certificates (with the admin page where they
+are enabled) is reported as an error and the command exits with status `1`.
+
+Each exposed run or alias takes the root of one tailnet HTTPS port: the first gets `443`
+(`https://<device>.<tailnet>.ts.net`), then `8443`, `8444`, and so on. Ports used by any Serve
+configuration Nook does not own are skipped, a name gets its previous port back when it is still
+free, and allocation is recorded in the registry under the operations lock, so concurrent Nook
+commands never receive the same port. The child additionally receives `NOOK_TAILSCALE_URL`, and the
+run information line gains the tailnet URL:
+
+```text
+nook: domain=api.localhost url=https://api.localhost port=5173 tailscale_url=https://laptop.example.ts.net
+```
+
+`alias set --tailscale` prints a second `<tailnet URL> -> <target>` line, and `nook list` appends
+the local and tailnet URLs to exposed entries:
+
+```text
+alias	persistent	docs.localhost	http://127.0.0.1:5173/	https://docs.localhost	https://laptop.example.ts.net:8443
+```
+
+Lifecycle:
+
+- the Serve registration is created after the local Caddy route and before the child starts;
+- a run removes it when it ends; an alias keeps it until `nook alias remove`, or until it is
+  replaced without `--tailscale`;
+- after a crash, the next Nook command (or `nook prune`) removes registrations whose run is gone;
+- while Tailscale is stopped or unreachable, registrations are kept and reported as pending;
+  after `tailscale up` (or a manual Serve reset) the next command restores them on the same port.
+
+Safeguards:
+
+- Serve proxies straight to the loopback application (`127.0.0.1` or `localhost`), so the
+  `Tailscale-User-*` identity headers set by Tailscale reach it unchanged. Aliases with any other
+  upstream are refused with `--tailscale`;
+- only private Serve is used. Nook never runs `tailscale funnel`, and refuses to keep a
+  registration on a port that Funnel exposes;
+- Nook only runs `tailscale version`, `status --json`, `serve status --json`,
+  `serve --bg --https=<port> <target>`, and `serve --https=<port> off`. It never runs
+  `serve reset`, `up`, `login`, `set`, or `cert`, never changes ACLs or tailnet settings, and never
+  elevates. The tailnet policy remains the only authorization source;
+- a port is removed only when its root still proxies to the upstream Nook recorded. A
+  registration replaced by someone else is reported and left untouched.
+
+`nook tailscale status` checks the client, `tailscaled`, the login state, HTTPS, and the device
+name, then lists each Nook registration as `active`, `missing`, `foreign`, or `pending`. It
+reconciles Tailscale registrations first but does not need Caddy, and exits with status `1` when
+Serve cannot be used.
+
+Registry format version 2 stores these registrations. Nook migrates a version 1 registry on its
+next write; older Nook versions then report `unsupported state format_version 2`.
+
 ## Export the local CA
 
 When Caddy is not installed on the host, export its public certificate through the Admin API:
@@ -521,8 +592,8 @@ secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Serve/Funnel, and any
-public exposure.
+LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Funnel, and any
+public exposure. Private Tailscale Serve is opt-in, as described in “Tailscale.”
 
 ## Development
 
