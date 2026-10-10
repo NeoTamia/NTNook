@@ -497,6 +497,18 @@ nook alias set docs 5173 --tailscale
 nook tailscale status
 ```
 
+A project can expose every `nook run` by default from `nook.toml` or `nook.local.toml`:
+
+```toml
+tailscale = true
+```
+
+`--tailscale` enables the exposure for one run even when the project sets `tailscale = false`, and
+`--no-tailscale` keeps one run local even when it sets `tailscale = true`; the two flags cannot be
+combined. The usual precedence applies: `nook.toml`, then `nook.local.toml`, then the command line.
+Without any of them, runs stay local. Aliases are not read from project files and only use
+`--tailscale`.
+
 Requirements: Tailscale 1.52 or newer installed and connected, HTTPS certificates enabled for the
 tailnet, and a user allowed to change Serve (on Linux, root or the Tailscale operator). Nook runs
 `tailscale` from `PATH` (`tailscale.exe` on Windows, falling back to

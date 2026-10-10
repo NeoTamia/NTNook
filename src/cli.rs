@@ -196,6 +196,9 @@ pub(crate) struct RunArgs {
     /// Also expose the run privately to the tailnet with Tailscale Serve.
     #[arg(long)]
     pub(crate) tailscale: bool,
+    /// Keep the run local even when the project sets `tailscale = true`.
+    #[arg(long, conflicts_with = "tailscale")]
+    pub(crate) no_tailscale: bool,
     /// Application bind IP address, also injected as HOST.
     #[arg(long, value_name = "IP")]
     pub(crate) run_bind_address: Option<IpAddr>,
@@ -450,6 +453,9 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
     } else {
         contents.push_str("# Expose the application over HTTPS.\n# tls = true\n\n");
     }
+    contents.push_str(
+        "# Also expose `nook run` privately to the tailnet with Tailscale Serve.\n# tailscale = false\n\n",
+    );
     match arguments.app_port {
         Some(port) => contents.push_str(&format!(
             "# Preferred application port.\napp_port = {port}\n\n"
@@ -1222,7 +1228,7 @@ fn run_command(
         )?;
     }
     let store = state_store()?;
-    let tailscale = arguments
+    let tailscale = config
         .tailscale
         .then(crate::tailscale::Client::from_environment);
     if let Some(client) = &tailscale {

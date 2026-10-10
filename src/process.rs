@@ -2127,6 +2127,7 @@ mod tests {
             hostname: "api.localhost".into(),
             command: command.into_iter().map(OsString::from).collect(),
             tls: true,
+            tailscale: false,
             app_port: None,
             strict_port: false,
             force: false,
