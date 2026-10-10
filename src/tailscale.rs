@@ -16,6 +16,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -35,6 +36,7 @@ const MINIMUM_VERSION: (u64, u64) = (1, 52);
 const FIRST_PORT: u16 = 443;
 const FALLBACK_PORTS: std::ops::RangeInclusive<u16> = 8443..=9442;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const HTTPS_SETTINGS_URL: &str = "https://login.tailscale.com/admin/dns";
 const DOWNLOAD_URL: &str = "https://tailscale.com/download";
 
@@ -228,10 +230,55 @@ fn candidate_ports() -> impl Iterator<Item = u16> {
     std::iter::once(FIRST_PORT).chain(FALLBACK_PORTS)
 }
 
-fn allocate_port(preferred: Option<u16>, taken: &BTreeSet<u16>) -> Option<u16> {
-    preferred
-        .filter(|port| !taken.contains(port))
-        .or_else(|| candidate_ports().find(|port| !taken.contains(port)))
+/// A port skipped because a local listener would answer tailnet connections
+/// made from this machine before Tailscale Serve does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shadowed {
+    port: u16,
+    listener: SocketAddr,
+}
+
+/// Picks the preferred port, then 443, then 8443 upward, skipping ports
+/// Tailscale or Nook already use and ports `shadowed` reports a local
+/// listener on.
+fn allocate_port(
+    preferred: Option<u16>,
+    taken: &BTreeSet<u16>,
+    mut shadowed: impl FnMut(u16) -> Option<SocketAddr>,
+) -> (Option<u16>, Vec<Shadowed>) {
+    let mut skipped: Vec<Shadowed> = Vec::new();
+    for port in preferred.into_iter().chain(candidate_ports()) {
+        if taken.contains(&port) || skipped.iter().any(|skip| skip.port == port) {
+            continue;
+        }
+        match shadowed(port) {
+            Some(listener) => skipped.push(Shadowed { port, listener }),
+            None => return (Some(port), skipped),
+        }
+    }
+    (None, skipped)
+}
+
+/// Returns the tailnet address on which something on this machine already
+/// accepts TCP connections for `port`.
+///
+/// The device's own tailnet addresses are local, so a connection from this
+/// machine reaches any listener bound to them or to the wildcard address
+/// instead of tailscaled. Loopback-only listeners never match.
+fn local_listener(tailnet_ips: &[IpAddr], port: u16) -> Option<SocketAddr> {
+    tailnet_ips
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, port))
+        .find(|address| TcpStream::connect_timeout(address, PROBE_TIMEOUT).is_ok())
+}
+
+fn shadowed_warning(dns_name: &str, skipped: Shadowed) -> String {
+    format!(
+        "skipped Tailscale Serve port {port}: a local server already accepts connections on {listener} (for example a web server listening on *:{port}), so {url} would reach it instead of Tailscale Serve from this machine",
+        port = skipped.port,
+        listener = skipped.listener,
+        url = serve_url(dns_name, skipped.port),
+    )
 }
 
 fn parse_version(output: &str) -> Option<(u64, u64)> {
@@ -258,6 +305,8 @@ struct StatusJson {
 struct DeviceJson {
     #[serde(rename = "DNSName", default)]
     dns_name: String,
+    #[serde(rename = "TailscaleIPs", default)]
+    tailscale_ips: Option<Vec<String>>,
 }
 
 /// Diagnosis of the local Tailscale installation, filled as far as the checks
@@ -268,6 +317,7 @@ pub(crate) struct Diagnosis {
     pub(crate) backend_state: Option<String>,
     pub(crate) https_enabled: Option<bool>,
     pub(crate) dns_name: Option<String>,
+    tailnet_ips: Vec<IpAddr>,
     pub(crate) result: Result<(), Error>,
 }
 
@@ -493,6 +543,7 @@ impl Client {
             backend_state: None,
             https_enabled: None,
             dns_name: None,
+            tailnet_ips: Vec::new(),
             result: Ok(()),
         };
         diagnosis.result = self.diagnose_into(&mut diagnosis);
@@ -516,12 +567,17 @@ impl Client {
                 }
             })?;
         diagnosis.backend_state = Some(status.backend_state.clone());
-        if let Some(dns_name) = status
-            .this_device
-            .map(|device| device.dns_name.trim_end_matches('.').to_owned())
-            .filter(|name| !name.is_empty())
-        {
-            diagnosis.dns_name = Some(dns_name);
+        if let Some(device) = status.this_device {
+            let dns_name = device.dns_name.trim_end_matches('.');
+            if !dns_name.is_empty() {
+                diagnosis.dns_name = Some(dns_name.to_owned());
+            }
+            diagnosis.tailnet_ips = device
+                .tailscale_ips
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|ip| ip.parse().ok())
+                .collect();
         }
         if status.backend_state != "Running" {
             return Err(Error::NotRunning {
@@ -591,13 +647,16 @@ impl Client {
         mut liveness: impl FnMut(&Lease) -> Liveness,
     ) -> Result<Registration, Error> {
         let target = serve_target(target)?;
-        let dns_name = self.diagnose().ready_dns_name()?;
+        let diagnosis = self.diagnose();
+        let tailnet_ips = diagnosis.tailnet_ips.clone();
+        let dns_name = diagnosis.ready_dns_name()?;
         let mut config = self.serve_config()?;
         let report = self.converge(operations, store, &dns_name, &config, &mut liveness)?;
         if report.removed > 0 {
             config = self.serve_config()?;
         }
         let occupied = config.occupied_ports();
+        let mut skipped = Vec::new();
         let port = store.mutate(|registry| {
             let taken: BTreeSet<u16> = occupied
                 .iter()
@@ -605,7 +664,10 @@ impl Client {
                 .copied()
                 .collect();
             let preferred = registry.tailscale.preferred_ports.get(hostname).copied();
-            let Some(port) = allocate_port(preferred, &taken) else {
+            let (port, shadowed) =
+                allocate_port(preferred, &taken, |port| local_listener(&tailnet_ips, port));
+            skipped = shadowed;
+            let Some(port) = port else {
                 return Ok(None);
             };
             registry.tailscale.registrations.insert(
@@ -638,10 +700,16 @@ impl Client {
             let _ = self.release(store, &dns_name, port, owner_id);
             return Err(error);
         }
+        let mut warnings = report.warnings;
+        warnings.extend(
+            skipped
+                .into_iter()
+                .map(|skipped| shadowed_warning(&dns_name, skipped)),
+        );
         Ok(Registration {
             port,
             url: serve_url(&dns_name, port),
-            warnings: report.warnings,
+            warnings,
         })
     }
 
@@ -981,39 +1049,99 @@ fn command_line(arguments: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        Action, Observation, Owner, ServeConfig, allocate_port, owner_state, parse_version, plan,
-        recorded_url, serve_target, serve_url,
+        Action, Observation, Owner, ServeConfig, Shadowed, allocate_port, local_listener,
+        owner_state, parse_version, plan, recorded_url, serve_target, serve_url, shadowed_warning,
     };
     use crate::process::Liveness;
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme, ServeRegistration};
 
+    fn allocate(preferred: Option<u16>, taken: &[u16]) -> Option<u16> {
+        allocate_port(
+            preferred,
+            &BTreeSet::from_iter(taken.iter().copied()),
+            |_| None,
+        )
+        .0
+    }
+
     #[test]
     fn first_port_is_443_then_8443_upward_skipping_every_taken_port() {
-        assert_eq!(allocate_port(None, &BTreeSet::new()), Some(443));
-        assert_eq!(allocate_port(None, &BTreeSet::from([443])), Some(8443));
-        assert_eq!(
-            allocate_port(None, &BTreeSet::from([443, 8443, 8445])),
-            Some(8444)
-        );
-        let exhausted: BTreeSet<u16> = std::iter::once(443).chain(8443..=9442).collect();
-        assert_eq!(allocate_port(None, &exhausted), None);
+        assert_eq!(allocate(None, &[]), Some(443));
+        assert_eq!(allocate(None, &[443]), Some(8443));
+        assert_eq!(allocate(None, &[443, 8443, 8445]), Some(8444));
+        let exhausted: Vec<u16> = std::iter::once(443).chain(8443..=9442).collect();
+        assert_eq!(allocate(None, &exhausted), None);
     }
 
     #[test]
     fn a_hostname_gets_its_previous_port_back_when_it_is_still_free() {
+        assert_eq!(allocate(Some(8444), &[443]), Some(8444));
+        assert_eq!(allocate(Some(8444), &[8444]), Some(443));
+    }
+
+    #[test]
+    fn locally_shadowed_ports_are_skipped_once_and_reported_in_order() {
+        let caddy: SocketAddr = "100.64.0.1:443".parse().unwrap();
+        let other: SocketAddr = "100.64.0.1:8444".parse().unwrap();
+        let mut probed = Vec::new();
+        let (port, skipped) = allocate_port(Some(443), &BTreeSet::from([8443]), |port| {
+            probed.push(port);
+            [caddy, other]
+                .into_iter()
+                .find(|listener| listener.port() == port)
+        });
+        assert_eq!(port, Some(8445));
         assert_eq!(
-            allocate_port(Some(8444), &BTreeSet::from([443])),
-            Some(8444)
+            skipped,
+            [
+                Shadowed {
+                    port: 443,
+                    listener: caddy
+                },
+                Shadowed {
+                    port: 8444,
+                    listener: other
+                },
+            ]
+        );
+        assert_eq!(probed, [443, 8444, 8445], "taken ports are never probed");
+    }
+
+    #[test]
+    fn only_listeners_reachable_on_a_tailnet_address_shadow_a_port() {
+        let wildcard = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let loopback_only = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tailnet_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let wildcard_port = wildcard.local_addr().unwrap().port();
+        assert_eq!(
+            local_listener(&[tailnet_ip], wildcard_port),
+            Some(SocketAddr::new(tailnet_ip, wildcard_port))
         );
         assert_eq!(
-            allocate_port(Some(8444), &BTreeSet::from([8444])),
-            Some(443)
+            local_listener(&[tailnet_ip], loopback_only.local_addr().unwrap().port()),
+            None
         );
+        assert_eq!(local_listener(&[], wildcard_port), None);
+    }
+
+    #[test]
+    fn skipped_ports_are_explained_with_the_listener_and_the_affected_url() {
+        let warning = shadowed_warning(
+            "host.ts.net",
+            Shadowed {
+                port: 443,
+                listener: "100.64.0.1:443".parse().unwrap(),
+            },
+        );
+        assert!(warning.contains("port 443"), "{warning}");
+        assert!(warning.contains("100.64.0.1:443"), "{warning}");
+        assert!(warning.contains("https://host.ts.net "), "{warning}");
     }
 
     #[test]

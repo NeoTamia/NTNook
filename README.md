@@ -518,6 +518,18 @@ run information line gains the tailnet URL:
 nook: domain=api.localhost url=https://api.localhost port=5173 tailscale_url=https://laptop.example.ts.net
 ```
 
+Nook also skips a port when a local server already accepts connections on it through one of the
+device's tailnet addresses, that is a server listening on the wildcard address (`*:443`,
+`0.0.0.0:443`, `[::]:443`) or directly on the tailnet IP. From this machine, such a server would
+receive `https://<device>.<tailnet>.ts.net` instead of Tailscale Serve and fail the TLS handshake.
+A Caddy that listens on `*:443` for the `.localhost` routes is the usual case. Servers listening only
+on loopback do not count. Nook probes each candidate with a short TCP connection to the tailnet
+addresses that `tailscale status` reports, then takes the next port and explains why on stderr:
+
+```text
+warning: skipped Tailscale Serve port 443: a local server already accepts connections on 100.101.102.103:443 (for example a web server listening on *:443), so https://laptop.example.ts.net would reach it instead of Tailscale Serve from this machine
+```
+
 `alias set --tailscale` prints a second `<tailnet URL> -> <target>` line, and `nook list` appends
 the local and tailnet URLs to exposed entries:
 
