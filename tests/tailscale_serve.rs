@@ -38,7 +38,7 @@ fn main() {
         .skip(1)
         .find(|argument| !argument.starts_with('-'))
         .cloned();
-    let scenarios: [(&str, fn()); 8] = [
+    let scenarios: [(&str, fn()); 9] = [
         (
             "missing_client_fails_before_spawn_without_changes",
             missing_client_fails_before_spawn_without_changes,
@@ -50,6 +50,10 @@ fn main() {
         (
             "run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code",
             run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code,
+        ),
+        (
+            "locally_shadowed_ports_are_skipped_and_explained",
+            locally_shadowed_ports_are_skipped_and_explained,
         ),
         (
             "foreign_registrations_and_funnel_are_skipped_and_never_modified",
@@ -235,6 +239,56 @@ fn run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code() {
         .unwrap();
     assert!(local.status.success(), "{}", describe(&local));
     assert_eq!(read_json(&marker)["url"], Value::Null);
+}
+
+fn locally_shadowed_ports_are_skipped_and_explained() {
+    let world = World::new("shadowed");
+    let foreign = json!({
+        "TCP": {"443": {"HTTPS": true}},
+        "Web": {format!("{DNS_NAME}:443"): {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}}}
+    });
+    world.update_tailscale(|state| {
+        state["serve"] = foreign.clone();
+        state["tailscale_ips"] = json!(["127.0.0.1"]);
+    });
+    // Bind failure means another program already holds the port, which Nook
+    // must skip just the same.
+    let _listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 8443));
+    let marker = world.root.join("child.json");
+    let run = world
+        .nook_command(&["run", "--tailscale", "--name", "web", "--"])
+        .args(world.child_arguments(&marker, 0, None))
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", describe(&run));
+    assert_eq!(
+        read_json(&marker)["url"],
+        format!("https://{DNS_NAME}:8444")
+    );
+    let explanation = stderr(&run)
+        .lines()
+        .find(|line| line.contains("skipped Tailscale Serve port 8443"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no skip explanation: {}", describe(&run)));
+    assert!(
+        explanation.contains("127.0.0.1:8443"),
+        "the explanation names the listener: {explanation}"
+    );
+
+    world.update_tailscale(|state| state["tailscale_ips"] = json!(["127.0.0.2"]));
+    let run = world
+        .nook_command(&["run", "--tailscale", "--name", "docs", "--"])
+        .args(world.child_arguments(&marker, 0, None))
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", describe(&run));
+    assert_eq!(
+        read_json(&marker)["url"],
+        format!("https://{DNS_NAME}:8443"),
+        "a listener on another local address does not receive tailnet connections"
+    );
+    assert!(!stderr(&run).contains("skipped Tailscale Serve port"));
+    assert_eq!(world.serve_config(), foreign);
 }
 
 fn foreign_registrations_and_funnel_are_skipped_and_never_modified() {
@@ -727,7 +781,11 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
                     "Version": state["version"],
                     "BackendState": state["backend_state"],
                     "AuthURL": state["auth_url"],
-                    "Self": {"DNSName": state["dns_name"], "Online": running},
+                    "Self": {
+                        "DNSName": state["dns_name"],
+                        "TailscaleIPs": state["tailscale_ips"],
+                        "Online": running
+                    },
                     "CertDomains": cert_domains,
                     "Health": []
                 })
