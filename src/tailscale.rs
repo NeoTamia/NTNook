@@ -397,7 +397,10 @@ fn owner_state(
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Report {
+    /// Registrations of live owners published again.
     pub(crate) restored: usize,
+    /// Registrations of gone owners dropped, whether Nook turned them off or
+    /// Tailscale no longer served them.
     pub(crate) removed: usize,
     pub(crate) warnings: Vec<String>,
 }
@@ -763,8 +766,12 @@ impl Client {
                         registration.hostname
                     )),
                 },
-                Action::Forget => forgotten.push((port, registration.owner_id)),
+                Action::Forget => {
+                    report.removed += 1;
+                    forgotten.push((port, registration.owner_id));
+                }
                 Action::ForgetForeign => {
+                    report.removed += 1;
                     forgotten.push((port, registration.owner_id));
                     report.warnings.push(format!(
                         "Tailscale Serve port {port} of {} was replaced by a configuration Nook does not own; Nook left it untouched",

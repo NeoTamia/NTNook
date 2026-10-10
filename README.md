@@ -530,7 +530,14 @@ Lifecycle:
 - the Serve registration is created after the local Caddy route and before the child starts;
 - a run removes it when it ends; an alias keeps it until `nook alias remove`, or until it is
   replaced without `--tailscale`;
-- after a crash, the next Nook command (or `nook prune`) removes registrations whose run is gone;
+- after a crash, the next Nook command (or `nook prune`) removes registrations whose run is gone.
+  `nook prune` reports them in `tailscale_restored=<n> tailscale_removed=<n>` at the end of its
+  summary line, next to `removed_dead` for the run itself:
+
+  ```text
+  restored=0 removed_dead=1 removed_orphans=0 completed_operations=0 tailscale_restored=0 tailscale_removed=1
+  ```
+
 - while Tailscale is stopped or unreachable, registrations are kept and reported as pending;
   after `tailscale up` (or a manual Serve reset) the next command restores them on the same port.
 

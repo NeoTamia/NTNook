@@ -1631,23 +1631,20 @@ fn prune_command(
     for warning in &report.warnings {
         writeln!(errors, "warning: {warning}")?;
     }
-    let tracked_tailscale = !registry.tailscale.registrations.is_empty();
     let tailscale = converge_tailscale(&operations, &store);
     for warning in &tailscale.warnings {
         writeln!(errors, "warning: {warning}")?;
     }
     writeln!(
         output,
-        "restored={} removed_dead={} removed_orphans={} completed_operations={}",
-        report.restored, report.removed_dead_leases, removed_orphans, report.completed_operations
+        "restored={} removed_dead={} removed_orphans={} completed_operations={} tailscale_restored={} tailscale_removed={}",
+        report.restored,
+        report.removed_dead_leases,
+        removed_orphans,
+        report.completed_operations,
+        tailscale.restored,
+        tailscale.removed
     )?;
-    if tracked_tailscale {
-        writeln!(
-            output,
-            "tailscale\tserve_restored={}\tserve_removed={}",
-            tailscale.restored, tailscale.removed
-        )?;
-    }
     Ok(())
 }
 
