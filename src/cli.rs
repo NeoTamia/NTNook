@@ -1800,9 +1800,24 @@ mod tests {
         assert_eq!(run.framework.as_deref(), Some("astro"));
         assert!(!run.no_framework);
         assert!(try_parse(&["run", "--framework", "angular", "--", "ng", "serve"]).is_err());
-        assert!(
-            try_parse(&["run", "--framework", "vite", "--no-framework", "--", "vite"]).is_err()
-        );
+        for arguments in [
+            ["run", "--framework", "vite", "--no-framework", "--", "vite"].as_slice(),
+            [
+                "run",
+                "--no-framework",
+                "--framework",
+                "nuxt",
+                "--",
+                "nuxt",
+                "dev",
+            ]
+            .as_slice(),
+        ] {
+            assert_eq!(
+                try_parse(arguments).unwrap_err().kind(),
+                ErrorKind::ArgumentConflict
+            );
+        }
     }
 
     #[test]

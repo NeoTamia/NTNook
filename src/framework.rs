@@ -517,10 +517,19 @@ mod tests {
 
     #[test]
     fn ignores_bun_run_and_elysia() {
-        assert_eq!(detect(&argv(&["bun", "run", "dev"])), None);
-        assert_eq!(detect(&argv(&["bun", "--watch", "src/server.ts"])), None);
-        assert_eq!(detect(&argv(&["python3", "app.py", "next"])), None);
-        assert_eq!(detect(&argv(&["npm", "run", "dev"])), None);
+        for command in [
+            argv(&["bun", "run", "dev"]),
+            argv(&["bun", "--watch", "src/server.ts"]),
+            argv(&["python3", "app.py", "next"]),
+            argv(&["npm", "run", "dev"]),
+        ] {
+            assert_eq!(detect(&command), None);
+            assert_eq!(FrameworkChoice::Auto.resolve(&command), None);
+            assert_eq!(
+                Framework::Vite.inject_argv(command.clone(), 3000, bind(), "api.localhost", true),
+                command
+            );
+        }
     }
 
     #[test]
@@ -646,18 +655,53 @@ mod tests {
     }
 
     #[test]
-    fn environment_covers_vite_and_nuxt() {
-        let vite = Framework::Vite.environment(5173, bind(), "app.localhost");
-        assert!(vite.iter().any(|(key, value)| {
-            key == "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS" && value == "app.localhost"
-        }));
-        let nuxt = Framework::Nuxt.environment(3000, bind(), "app.localhost");
-        assert!(
-            nuxt.iter()
-                .any(|(key, value)| key == "NUXT_PORT" && value == "3000")
+    fn environment_matches_the_framework_contract() {
+        let hosts = (
+            OsString::from("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"),
+            OsString::from("app.localhost"),
+        );
+        assert_eq!(
+            Framework::Vite.environment(5173, bind(), "app.localhost"),
+            vec![hosts.clone()]
+        );
+        assert_eq!(
+            Framework::Nuxt.environment(3000, bind(), "app.localhost"),
+            vec![
+                hosts.clone(),
+                (OsString::from("NUXT_HOST"), OsString::from("127.0.0.1")),
+                (OsString::from("NUXT_PORT"), OsString::from("3000")),
+            ]
+        );
+        assert_eq!(
+            Framework::Astro.environment(4321, bind(), "docs.localhost"),
+            vec![(
+                OsString::from("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"),
+                OsString::from("docs.localhost"),
+            )]
+        );
+        assert_eq!(
+            Framework::Nitro.environment(3000, bind(), "api.localhost"),
+            vec![
+                (OsString::from("NITRO_HOST"), OsString::from("127.0.0.1")),
+                (OsString::from("NITRO_PORT"), OsString::from("3000")),
+            ]
+        );
+        assert_eq!(
+            Framework::Nuxt.inject_argv(
+                argv(&["nuxi", "dev"]),
+                3000,
+                bind(),
+                "app.localhost",
+                true
+            ),
+            argv(&["nuxi", "dev", "--host", "127.0.0.1", "--port", "3000"])
         );
         assert!(
             vite_hosts_override(Some(OsStr::new("staging.example.com")), "app.localhost").is_none()
+        );
+        assert_eq!(
+            vite_hosts_override(None, "app.localhost"),
+            Some(OsString::from("app.localhost"))
         );
     }
 
