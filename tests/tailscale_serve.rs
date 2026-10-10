@@ -369,23 +369,32 @@ fn alias_registration_persists_until_alias_remove() {
 
 fn crashed_supervisor_registration_is_removed_by_prune() {
     let world = World::new("crash");
-    let marker = world.root.join("child.json");
-    let release = world.root.join("never-released");
-    let mut supervisor = world
-        .nook_command(&["run", "--tailscale", "--name", "crashed", "--"])
-        .args(world.child_arguments(&marker, 0, Some(&release)))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_for(Duration::from_secs(30), || marker.exists());
-    let port = read_json(&marker)["port"].as_u64().unwrap();
-    wait_for(Duration::from_secs(10), || {
-        TcpStream::connect((Ipv4Addr::LOCALHOST, port as u16)).is_ok()
-    });
-    supervisor.kill().unwrap();
-    supervisor.wait().unwrap();
-    assert_ne!(world.serve_config(), json!({}));
+    world.crash_exposed_run("crashed");
+
+    let prune = world.nook(&["prune"]);
+    assert!(prune.status.success(), "{}", describe(&prune));
+    assert!(
+        stdout(&prune).contains("removed_dead=1 "),
+        "{}",
+        describe(&prune)
+    );
+    assert!(
+        stdout(&prune).contains("tailscale_restored=0 tailscale_removed=1\n"),
+        "{}",
+        describe(&prune)
+    );
+    assert_eq!(world.serve_config(), json!({}));
+
+    world.crash_exposed_run("forgotten");
+    world.update_tailscale(|state| state["serve"] = json!({}));
+    let prune = world.nook(&["prune"]);
+    assert!(
+        stdout(&prune).contains("tailscale_restored=0 tailscale_removed=1\n"),
+        "a registration Tailscale already dropped is still counted: {}",
+        describe(&prune)
+    );
+
+    world.crash_exposed_run("crashed-again");
 
     // `tailscale status` skips the Caddy reconciliation, so the crashed lease
     // is still recorded and only its process liveness proves the owner gone.
@@ -400,7 +409,12 @@ fn crashed_supervisor_registration_is_removed_by_prune() {
     let prune = world.nook(&["prune"]);
     assert!(prune.status.success(), "{}", describe(&prune));
     assert!(
-        stdout(&prune).contains("removed_dead=1"),
+        stdout(&prune).contains("removed_dead=1 "),
+        "{}",
+        describe(&prune)
+    );
+    assert!(
+        stdout(&prune).contains("tailscale_removed=0\n"),
         "{}",
         describe(&prune)
     );
@@ -425,7 +439,7 @@ fn tailscale_down_up_defers_then_restores_without_taking_foreign_ports() {
     world.update_tailscale(|state| state["serve"] = json!({}));
     let prune = world.nook(&["prune"]);
     assert!(
-        stdout(&prune).contains("tailscale\tserve_restored=1\tserve_removed=0"),
+        stdout(&prune).contains("tailscale_restored=1 tailscale_removed=0\n"),
         "{}",
         describe(&prune)
     );
@@ -583,6 +597,31 @@ impl World {
             code.to_string(),
             release.map_or_else(|| "-".into(), |path| path.display().to_string()),
         ]
+    }
+
+    /// Starts an exposed run and kills its supervisor once the application
+    /// accepts connections, leaving the lease and Serve registration behind.
+    fn crash_exposed_run(&self, name: &str) {
+        let marker = self.root.join(format!("{name}.json"));
+        let release = self.root.join("never-released");
+        let mut supervisor = self
+            .nook_command(&["run", "--tailscale", "--name", name, "--"])
+            .args(self.child_arguments(&marker, 0, Some(&release)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for(Duration::from_secs(30), || marker.exists());
+        let port = read_json(&marker)["port"].as_u64().unwrap();
+        wait_for(Duration::from_secs(10), || {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port as u16)).is_ok()
+        });
+        supervisor.kill().unwrap();
+        supervisor.wait().unwrap();
+        wait_for(Duration::from_secs(10), || {
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port as u16)).is_err()
+        });
+        assert_ne!(self.serve_config(), json!({}));
     }
 
     fn update_tailscale(&self, change: impl FnOnce(&mut Value)) {
