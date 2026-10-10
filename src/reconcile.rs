@@ -7,7 +7,9 @@ use std::fmt;
 use uuid::Uuid;
 
 use crate::process::Liveness;
-use crate::state::{Alias, Lease, PendingOperation, PendingOperationKind, Registry, Scheme, Store};
+use crate::state::{
+    Alias, Lease, OperationGuard, PendingOperation, PendingOperationKind, Registry, Scheme, Store,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteSpec {
@@ -99,27 +101,47 @@ pub(crate) fn set_alias(
     routes: &mut impl RouteBackend,
     request: AliasRequest,
 ) -> Result<AliasOutcome, AliasError> {
-    let _operations = store
+    set_alias_with(store, routes, request, |_, _| Ok::<_, AliasError>(()))
+        .map(|(outcome, ())| outcome)
+}
+
+/// Creates or replaces an alias and runs `publish` under the same operations
+/// lock, after the new route exists and before the replaced owners are
+/// dropped from the registry.
+///
+/// When `publish` fails, the previous routes are restored and the registry
+/// keeps the replaced aliases or leases, so the command changes nothing.
+pub(crate) fn set_alias_with<T, E: From<AliasError>>(
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    request: AliasRequest,
+    publish: impl FnOnce(&OperationGuard, &Alias) -> Result<T, E>,
+) -> Result<(AliasOutcome, T), E> {
+    let operations = store
         .lock_operations()
         .map_err(|error| AliasError::State(error.to_string()))?;
-    let conflicts = store
+    let replaced = store
         .mutate(|registry| {
             let aliases = registry
                 .aliases
                 .values()
                 .filter(|alias| alias.hostname == request.hostname)
-                .map(|alias| (alias.id, alias.tls));
+                .map(route_for_alias);
             let leases = registry
                 .leases
                 .values()
                 .filter(|lease| lease.hostname == request.hostname)
-                .map(|lease| (lease.id, lease.tls));
+                .map(route_for_lease);
             Ok(aliases.chain(leases).collect::<Vec<_>>())
         })
         .map_err(|error| AliasError::State(error.to_string()))?;
-    if !conflicts.is_empty() && !request.force {
-        return Err(AliasError::Conflict(request.hostname));
+    if !replaced.is_empty() && !request.force {
+        return Err(AliasError::Conflict(request.hostname).into());
     }
+    let conflicts: Vec<_> = replaced
+        .iter()
+        .map(|route| (route.owner_id, route.tls))
+        .collect();
 
     let alias = Alias {
         id: Uuid::new_v4(),
@@ -156,6 +178,32 @@ pub(crate) fn set_alias(
             preserve_host: request.preserve_host,
         })
         .map_err(AliasError::Route)?;
+    let published = match publish(&operations, &alias) {
+        Ok(published) => published,
+        Err(error) => {
+            let removed = routes.remove_if_owned(&alias.hostname, alias.id, alias.tls);
+            for route in &replaced {
+                // A route that cannot be restored now is restored by the next
+                // reconciliation, because the registry still records its owner.
+                let _ = routes.ensure(&RouteSpec {
+                    replace_existing: true,
+                    ..route.clone()
+                });
+            }
+            store
+                .mutate(|registry| {
+                    registry
+                        .pending_operations
+                        .retain(|operation| operation.id != operation_id);
+                    if removed.is_err() {
+                        queue_remove(registry, &alias.hostname, alias.id, alias.tls);
+                    }
+                    Ok(())
+                })
+                .map_err(|error| AliasError::State(error.to_string()))?;
+            return Err(error);
+        }
+    };
     let cleanup: Vec<_> = conflicts
         .iter()
         .map(|(owner, tls)| {
@@ -204,7 +252,7 @@ pub(crate) fn set_alias(
             Ok(())
         })
         .map_err(|error| AliasError::State(error.to_string()))?;
-    Ok(AliasOutcome { alias, warnings })
+    Ok((AliasOutcome { alias, warnings }, published))
 }
 
 pub(crate) fn remove_alias(
@@ -491,10 +539,14 @@ fn deduplicate_pending(registry: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     use super::{
         AliasError, AliasRequest, RouteBackend, RouteError, RouteSpec, list_aliases, reconcile,
-        reconcile_store, remove_alias, set_alias,
+        reconcile_store, remove_alias, set_alias, set_alias_with,
     };
     use crate::process::Liveness;
     use crate::state::{
@@ -727,6 +779,73 @@ mod tests {
         assert_eq!(routes.owners["alias.localhost"], replacement.alias.id);
         assert_eq!(list_aliases(&store).unwrap(), [replacement.alias]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_publication_restores_the_replaced_alias_and_its_route() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let previous = set_alias(&store, &mut routes, alias_request(false)).unwrap();
+        let mut replacement = alias_request(true);
+        replacement.target = "http://127.0.0.1:10".into();
+        let mut published_owner = None;
+        let result = set_alias_with(&store, &mut routes, replacement, |_, alias| {
+            published_owner = Some(alias.id);
+            assert_eq!(
+                recorded_aliases(&store),
+                std::slice::from_ref(&previous.alias),
+                "replaced owners stay recorded while publishing"
+            );
+            Err::<(), _>(AliasError::State("publication refused".into()))
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            AliasError::State("publication refused".into())
+        );
+        assert_ne!(published_owner, Some(previous.alias.id));
+        assert_eq!(routes.owners["alias.localhost"], previous.alias.id);
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            registry.aliases.into_values().collect::<Vec<_>>(),
+            [previous.alias]
+        );
+        assert!(registry.pending_operations.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn concurrent_alias_removal_waits_until_publication_finishes() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let removal_finished = Arc::new(AtomicBool::new(false));
+        let mut remover = None;
+        set_alias_with(&store, &mut routes, alias_request(false), |_, _| {
+            let finished = Arc::clone(&removal_finished);
+            let store = Store::new(path.clone());
+            remover = Some(thread::spawn(move || {
+                let warnings =
+                    remove_alias(&store, &mut Routes::default(), "alias.localhost").unwrap();
+                finished.store(true, Ordering::SeqCst);
+                warnings
+            }));
+            thread::sleep(Duration::from_millis(300));
+            assert!(
+                !removal_finished.load(Ordering::SeqCst),
+                "alias remove ran while the alias was being published"
+            );
+            Ok::<_, AliasError>(())
+        })
+        .unwrap();
+        assert!(remover.unwrap().join().unwrap().is_empty());
+        assert!(
+            list_aliases(&store).unwrap().is_empty(),
+            "the removal applies to the published alias, after publication"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn recorded_aliases(store: &Store) -> Vec<Alias> {
+        store.load().unwrap().aliases.into_values().collect()
     }
 
     #[test]

@@ -1325,47 +1325,30 @@ fn set_alias_command(
         client.require_ready()?;
     }
     with_caddy_routes(global, request.tls, !request.tls, |routes| {
-        let outcome = crate::reconcile::set_alias(&store, routes, request)?;
+        let (outcome, registration) =
+            crate::reconcile::set_alias_with(&store, routes, request, |operations, alias| {
+                tailscale
+                    .as_ref()
+                    .map(|client| {
+                        client.register(
+                            operations,
+                            &store,
+                            alias.id,
+                            &alias.hostname,
+                            &alias.target,
+                            crate::process::lease_liveness,
+                        )
+                    })
+                    .transpose()
+                    .map_err(crate::Error::from)
+            })?;
         for warning in outcome.warnings {
             writeln!(errors, "warning: {warning}")?;
         }
+        for warning in converge_tailscale_now(&store) {
+            writeln!(errors, "warning: {warning}")?;
+        }
         let alias = outcome.alias;
-        let registration = match &tailscale {
-            Some(client) => {
-                let registered = store
-                    .lock_operations()
-                    .map_err(crate::Error::from)
-                    .and_then(|operations| {
-                        client
-                            .register(
-                                &operations,
-                                &store,
-                                alias.id,
-                                &alias.hostname,
-                                &alias.target,
-                                crate::process::lease_liveness,
-                            )
-                            .map_err(crate::Error::from)
-                    });
-                match registered {
-                    Ok(registration) => Some(registration),
-                    Err(error) => {
-                        for warning in
-                            crate::reconcile::remove_alias(&store, routes, &alias.hostname)?
-                        {
-                            writeln!(errors, "warning: {warning}")?;
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            None => {
-                for warning in converge_tailscale_now(&store) {
-                    writeln!(errors, "warning: {warning}")?;
-                }
-                None
-            }
-        };
         writeln!(output, "{} -> {}", alias.hostname, alias.target)?;
         if let Some(registration) = registration {
             for warning in &registration.warnings {

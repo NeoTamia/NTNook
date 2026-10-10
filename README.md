@@ -554,6 +554,10 @@ Lifecycle:
 - the Serve registration is created after the local Caddy route and before the child starts;
 - a run removes it when it ends; an alias keeps it until `nook alias remove`, or until it is
   replaced without `--tailscale`;
+- `alias set --tailscale` publishes the alias under the same lock that records it. If Serve
+  refuses, the previous alias, its route, and its tailnet URL stay in place. A forced replacement
+  of an exposed alias therefore gets the next free port while the previous one is still served, and
+  the previous port is released once the replacement is recorded;
 - after a crash, the next Nook command (or `nook prune`) removes registrations whose run is gone.
   `nook prune` reports them in `tailscale_restored=<n> tailscale_removed=<n>` at the end of its
   summary line, next to `removed_dead` for the run itself:
