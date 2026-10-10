@@ -244,14 +244,25 @@ fn detect(argv: &[OsString]) -> Option<Framework> {
 
 fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
     let mut saw_server = false;
+    let mut skip_value = false;
     for argument in arguments {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
         let Some(value) = argument.to_str() else {
             continue;
         };
         if value == "--" {
             break;
         }
-        if value.starts_with('-') || !is_command_word(value) {
+        if value.starts_with('-') {
+            if !value.contains('=') && framework_flag_takes_value(value) {
+                skip_value = true;
+            }
+            continue;
+        }
+        if !is_command_word(value) {
             continue;
         }
         if is_non_server_subcommand(value) {
@@ -277,6 +288,10 @@ fn is_non_server_subcommand(token: &str) -> bool {
         token,
         "build" | "optimize" | "check" | "lint" | "generate" | "sync" | "test"
     )
+}
+
+fn framework_flag_takes_value(flag: &str) -> bool {
+    flag_takes_value(flag) || matches!(flag, "--root" | "--base")
 }
 
 fn flag_takes_value(flag: &str) -> bool {
@@ -489,6 +504,45 @@ mod tests {
         assert_eq!(detect(&argv(&["vite", "build"])), None);
         assert_eq!(detect(&argv(&["nuxt", "build"])), None);
         assert_eq!(detect(&argv(&["vite", "--base", "/docs/", "build"])), None);
+        assert_eq!(
+            detect(&argv(&["astro", "--root", "build", "dev"])),
+            Some(Framework::Astro)
+        );
+        assert_eq!(
+            Framework::Astro.inject_argv(
+                argv(&["astro", "--root", "build", "dev"]),
+                4321,
+                bind(),
+                "docs.localhost",
+                false
+            ),
+            argv(&[
+                "astro",
+                "--root",
+                "build",
+                "dev",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "4321",
+                "--allowed-hosts",
+                "docs.localhost"
+            ])
+        );
+        assert_eq!(
+            Framework::Astro.inject_argv(
+                argv(&["astro", "--root", "build", "build"]),
+                4321,
+                bind(),
+                "docs.localhost",
+                false
+            ),
+            argv(&["astro", "--root", "build", "build"])
+        );
+        assert_eq!(
+            detect(&argv(&["vite", "--base", "build"])),
+            Some(Framework::Vite)
+        );
         assert_eq!(
             Framework::Vite.inject_argv(
                 argv(&["vite", "--base", "/docs/", "build"]),
