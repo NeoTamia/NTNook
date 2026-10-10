@@ -728,6 +728,16 @@ impl World {
         wait_for(Duration::from_secs(10), || {
             TcpStream::connect((Ipv4Addr::LOCALHOST, port as u16)).is_ok()
         });
+        let hostname = format!("{name}.localhost");
+        wait_for(Duration::from_secs(10), || {
+            self.registry_value()["leases"]
+                .as_object()
+                .is_some_and(|leases| {
+                    leases
+                        .values()
+                        .any(|lease| lease["hostname"] == hostname.as_str())
+                })
+        });
         supervisor.kill().unwrap();
         supervisor.wait().unwrap();
         wait_for(Duration::from_secs(10), || {
