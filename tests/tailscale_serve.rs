@@ -453,6 +453,25 @@ fn alias_registration_persists_until_alias_remove() {
     );
     let exposed = world.nook(&["alias", "set", "api", "3002", "--force", "--tailscale"]);
     assert!(exposed.status.success(), "{}", describe(&exposed));
+    let exposed_serve = world.serve_config();
+
+    world.update_tailscale(|state| {
+        state["serve_error"] = json!("Access denied: serve config denied")
+    });
+    let refused = world.nook(&["alias", "set", "api", "3003", "--force", "--tailscale"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", describe(&refused));
+    assert!(stderr(&refused).contains("--operator=$USER"));
+    assert_eq!(
+        stdout(&world.nook(&["alias", "list"])),
+        "api.localhost -> http://127.0.0.1:3002/\n",
+        "a failed forced replacement keeps the previous alias"
+    );
+    let routes = serde_json::to_string(&world.caddy_routes()).unwrap();
+    assert!(routes.contains("127.0.0.1:3002"), "{routes}");
+    assert!(!routes.contains("127.0.0.1:3003"), "{routes}");
+    assert_eq!(world.serve_config(), exposed_serve);
+    world.update_tailscale(|state| state["serve_error"] = Value::Null);
+
     let remove = world.nook(&["alias", "remove", "api"]);
     assert!(remove.status.success(), "{}", describe(&remove));
     assert_eq!(world.serve_config(), json!({}));
@@ -836,6 +855,10 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
             0
         }
         ["serve", "--bg", https, target] if https.starts_with("--https=") => {
+            if let Some(message) = state["serve_error"].as_str() {
+                eprintln!("{message}");
+                return 1;
+            }
             if !running {
                 eprintln!("error: Tailscale is not running");
                 return 1;
