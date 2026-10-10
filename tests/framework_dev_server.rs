@@ -1,9 +1,10 @@
 //! Loopback smoke for the hostname a real Vite dev server will accept.
 //!
-//! Skips when `node` is not on PATH, matching the other optional-tool tests.
-//! The dev server is `node` running Vite's CLI directly, so the test can stop
-//! that process group. Nook's detector is not involved and nothing reads
-//! `package.json`.
+//! Skips when `node` is not on PATH, or when `vite@6` is not already in the
+//! npm cache. The lookup is `npm exec --offline`, so the suite never installs
+//! Vite. The dev server is `node` running Vite's CLI directly, so the test
+//! can stop that process group. Nook's detector is not involved and nothing
+//! reads `package.json`.
 
 #![cfg(unix)]
 
@@ -31,7 +32,9 @@ fn vite_accepts_the_nook_hostname_on_loopback() {
         "<!doctype html><p>nook-smoke-ok</p>\n",
     )
     .unwrap();
-    let vite_js = locate_vite_cli();
+    let Some(vite_js) = locate_vite_cli() else {
+        return;
+    };
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -82,10 +85,11 @@ fn vite_accepts_the_nook_hostname_on_loopback() {
     );
 }
 
-fn locate_vite_cli() -> PathBuf {
+fn locate_vite_cli() -> Option<PathBuf> {
     let output = Command::new("npm")
         .args([
             "exec",
+            "--offline",
             "--yes",
             "--package=vite@6",
             "--",
@@ -95,13 +99,15 @@ fn locate_vite_cli() -> PathBuf {
         ])
         .stdin(Stdio::null())
         .output()
-        .expect("npm exec vite");
-    assert!(
-        output.status.success(),
-        "vite package was not located: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    PathBuf::from(String::from_utf8(output.stdout).unwrap())
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
 }
 
 struct ViteSession {

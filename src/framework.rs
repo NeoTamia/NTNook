@@ -317,7 +317,13 @@ fn flag_takes_value(flag: &str) -> bool {
 
 fn wrapper_flag_takes_value(program: &str, flag: &str) -> bool {
     match program {
-        "npx" | "npm" => flag_takes_value(flag) || matches!(flag, "-w" | "--workspace" | "--call"),
+        "npx" | "npm" => {
+            flag_takes_value(flag)
+                || matches!(
+                    flag,
+                    "-w" | "--workspace" | "--call" | "--registry" | "--cache" | "--userconfig"
+                )
+        }
         "pnpm" | "pnpx" => {
             flag_takes_value(flag) || matches!(flag, "--dir" | "-C" | "--filter" | "--package")
         }
@@ -426,8 +432,9 @@ fn overwrite_option(argv: &mut [OsString], names: &[&str], value: Option<&OsStri
     let Some(value) = value else {
         return false;
     };
+    let mut changed = false;
     for index in 0..argv.len() {
-        let Some(current) = argv[index].to_str() else {
+        let Some(current) = argv[index].to_str().map(str::to_owned) else {
             continue;
         };
         for name in names {
@@ -438,18 +445,19 @@ fn overwrite_option(argv: &mut [OsString], names: &[&str], value: Option<&OsStri
                         .is_some_and(|next| next.starts_with('-'))
                 {
                     argv[index + 1] = value.clone();
-                    return true;
+                    changed = true;
                 }
-                return false;
+                break;
             }
             let prefix = format!("{name}=");
             if current.starts_with(&prefix) {
                 argv[index] = OsString::from(format!("{name}={}", value.to_string_lossy()));
-                return true;
+                changed = true;
+                break;
             }
         }
     }
-    false
+    changed
 }
 
 fn has_option(argv: &[OsString], names: &[&str]) -> bool {
@@ -681,6 +689,92 @@ mod tests {
                 "4321",
                 "--allowed-hosts",
                 "docs.localhost"
+            ])
+        );
+    }
+
+    #[test]
+    fn npm_global_option_values_are_not_subcommands() {
+        for command in [
+            argv(&[
+                "npm",
+                "--registry",
+                "https://registry.example",
+                "exec",
+                "vite",
+            ]),
+            argv(&["npm", "--cache", "/tmp/npm-cache", "exec", "vite"]),
+            argv(&["npm", "--userconfig", "/tmp/npmrc", "exec", "vite"]),
+            argv(&["npx", "--userconfig", "/tmp/npmrc", "vite"]),
+        ] {
+            assert_eq!(detect(&command), Some(Framework::Vite));
+            let mut expected = command.clone();
+            expected.extend(["--host", "127.0.0.1", "--port", "5173"].map(OsString::from));
+            assert_eq!(
+                Framework::Vite.inject_argv(command, 5173, bind(), "app.localhost", false),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_every_repeated_host_and_port() {
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["vite", "--port", "4000", "--port", "5000"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "vite",
+                "--port",
+                "5173",
+                "--port",
+                "5173",
+                "--host",
+                "127.0.0.1"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&[
+                    "vite",
+                    "--port=4000",
+                    "--host",
+                    "0.0.0.0",
+                    "--host=192.168.1.20"
+                ]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "vite",
+                "--port=5173",
+                "--host",
+                "127.0.0.1",
+                "--host=127.0.0.1"
+            ])
+        );
+        assert_eq!(
+            Framework::Vite.inject_argv(
+                argv(&["vite", "-p", "4000", "--port", "5000"]),
+                5173,
+                bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&[
+                "vite",
+                "-p",
+                "5173",
+                "--port",
+                "5173",
+                "--host",
+                "127.0.0.1"
             ])
         );
     }
