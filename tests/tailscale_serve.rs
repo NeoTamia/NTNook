@@ -38,7 +38,7 @@ fn main() {
         .skip(1)
         .find(|argument| !argument.starts_with('-'))
         .cloned();
-    let scenarios: [(&str, fn()); 9] = [
+    let scenarios: [(&str, fn()); 10] = [
         (
             "missing_client_fails_before_spawn_without_changes",
             missing_client_fails_before_spawn_without_changes,
@@ -50,6 +50,10 @@ fn main() {
         (
             "run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code",
             run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code,
+        ),
+        (
+            "project_configuration_opts_in_and_no_tailscale_opts_out",
+            project_configuration_opts_in_and_no_tailscale_opts_out,
         ),
         (
             "locally_shadowed_ports_are_skipped_and_explained",
@@ -239,6 +243,41 @@ fn run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code() {
         .unwrap();
     assert!(local.status.success(), "{}", describe(&local));
     assert_eq!(read_json(&marker)["url"], Value::Null);
+}
+
+fn project_configuration_opts_in_and_no_tailscale_opts_out() {
+    let world = World::new("project");
+    let config = world.root.join("nook.toml");
+    fs::write(
+        &config,
+        "format_version = 1\nname = \"site\"\ntailscale = true\n",
+    )
+    .unwrap();
+    let marker = world.root.join("child.json");
+    let run = |flags: &[&str]| {
+        let config = config.display().to_string();
+        let mut arguments = vec!["run", "--config", &config];
+        arguments.extend_from_slice(flags);
+        arguments.push("--");
+        let output = world
+            .nook_command(&arguments)
+            .args(world.child_arguments(&marker, 0, None))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", describe(&output));
+        read_json(&marker)["url"].clone()
+    };
+    assert_eq!(run(&[]), format!("https://{DNS_NAME}"));
+    assert_eq!(run(&["--no-tailscale"]), Value::Null);
+
+    fs::write(
+        &config,
+        "format_version = 1\nname = \"site\"\ntailscale = false\n",
+    )
+    .unwrap();
+    assert_eq!(run(&[]), Value::Null);
+    assert_eq!(run(&["--tailscale"]), format!("https://{DNS_NAME}"));
+    assert_eq!(world.serve_config(), json!({}));
 }
 
 fn locally_shadowed_ports_are_skipped_and_explained() {
