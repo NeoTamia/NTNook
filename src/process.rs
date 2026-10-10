@@ -29,7 +29,9 @@ use signal_hook::iterator::Signals;
 use crate::config::ResolvedRunConfig;
 use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
 use crate::state::Lease;
-use crate::state::{LeaseState, PendingOperation, PendingOperationKind, Scheme, Store};
+use crate::state::{
+    LeaseState, OperationGuard, PendingOperation, PendingOperationKind, Scheme, Store,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +210,7 @@ pub(crate) enum RunError {
     State(crate::state::Error),
     Route(RouteError),
     Process(Error),
+    Exposure(Box<dyn std::error::Error + Send + Sync>),
     Conflict(String),
 }
 
@@ -217,6 +220,7 @@ impl fmt::Display for RunError {
             Self::State(error) => error.fmt(formatter),
             Self::Route(error) => error.fmt(formatter),
             Self::Process(error) => error.fmt(formatter),
+            Self::Exposure(error) => error.fmt(formatter),
             Self::Conflict(hostname) => write!(
                 formatter,
                 "hostname `{hostname}` is already managed by Nook; use --force to replace it"
@@ -231,6 +235,7 @@ impl std::error::Error for RunError {
             Self::State(error) => Some(error),
             Self::Route(error) => Some(error),
             Self::Process(error) => Some(error),
+            Self::Exposure(error) => Some(error.as_ref()),
             Self::Conflict(_) => None,
         }
     }
@@ -264,22 +269,66 @@ pub(crate) struct RunningChild {
     signals: ForwardedSignals,
 }
 
+/// Additional exposure of a run beyond its local Caddy route.
+///
+/// `expose` runs with the operations lock held, after the route exists and
+/// before the child is spawned; the returned variables are added to the child
+/// environment. `withdraw` undoes it when the child cannot be spawned.
+pub(crate) trait RunExposure {
+    fn expose(
+        &mut self,
+        operations: &OperationGuard,
+        store: &Store,
+        owner_id: Uuid,
+        hostname: &str,
+        target: &str,
+    ) -> Result<Vec<(OsString, OsString)>, RunError>;
+    fn withdraw(&mut self, operations: &OperationGuard, store: &Store, owner_id: Uuid);
+}
+
+struct LocalOnly;
+
+impl RunExposure for LocalOnly {
+    fn expose(
+        &mut self,
+        _operations: &OperationGuard,
+        _store: &Store,
+        _owner_id: Uuid,
+        _hostname: &str,
+        _target: &str,
+    ) -> Result<Vec<(OsString, OsString)>, RunError> {
+        Ok(Vec::new())
+    }
+
+    fn withdraw(&mut self, _operations: &OperationGuard, _store: &Store, _owner_id: Uuid) {}
+}
+
 pub(crate) fn start_run(
     config: &ResolvedRunConfig,
     store: &Store,
     routes: &mut impl RouteBackend,
 ) -> Result<RunningChild, RunError> {
-    start_run_with_hook(config, store, routes, |_| {})
+    start_run_with_hook(config, store, routes, &mut LocalOnly, |_| {})
+}
+
+pub(crate) fn start_exposed_run(
+    config: &ResolvedRunConfig,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    exposure: &mut impl RunExposure,
+) -> Result<RunningChild, RunError> {
+    start_run_with_hook(config, store, routes, exposure, |_| {})
 }
 
 fn start_run_with_hook(
     config: &ResolvedRunConfig,
     store: &Store,
     routes: &mut impl RouteBackend,
+    exposure: &mut impl RunExposure,
     after_release: impl FnOnce(u16),
 ) -> Result<RunningChild, RunError> {
     let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
-    let _operations = store.lock_operations()?;
+    let operations = store.lock_operations()?;
     let conflicts = store.mutate(|registry| {
         let aliases = registry
             .aliases
@@ -387,7 +436,16 @@ fn start_run_with_hook(
     let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     reservation.release();
     after_release(port);
-    let child = match spawn_managed_child(&argv, &environment, owner_id) {
+    let spawned = exposure
+        .expose(&operations, store, owner_id, &config.hostname, &target)
+        .and_then(|exposed| {
+            let environment: Vec<_> = environment.iter().cloned().chain(exposed).collect();
+            spawn_managed_child(&argv, &environment, owner_id).map_err(|error| {
+                exposure.withdraw(&operations, store, owner_id);
+                RunError::from(error)
+            })
+        });
+    let child = match spawned {
         Ok(child) => child,
         Err(error) => {
             let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
@@ -407,7 +465,7 @@ fn start_run_with_hook(
                 }
                 Ok(())
             })?;
-            return Err(error.into());
+            return Err(error);
         }
     };
     store.mutate(|registry| {
@@ -1421,15 +1479,118 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Error, Liveness, ProcIdentity, ProcessSignal, StopError, StopSystem, child_environment,
-        cleanup_unidentified_child, configure_child, identity_liveness, parse_stat,
-        read_process_identity, readiness_probe_address, reserve_port, spawn_child, start_run,
-        start_run_with_hook, stop_managed, substitute_port,
+        Error, Liveness, LocalOnly, ProcIdentity, ProcessSignal, RunError, RunExposure, StopError,
+        StopSystem, child_environment, cleanup_unidentified_child, configure_child,
+        identity_liveness, parse_stat, read_process_identity, readiness_probe_address,
+        reserve_port, spawn_child, start_exposed_run, start_run, start_run_with_hook, stop_managed,
+        substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
-    use crate::state::{LeaseState, Store, decode};
+    use crate::state::{LeaseState, OperationGuard, PendingOperationKind, Store, decode};
     use uuid::Uuid;
+
+    #[derive(Default)]
+    struct RecordingExposure {
+        fail: bool,
+        exposed_after_route_before_lease: Vec<Uuid>,
+        withdrawn: Vec<Uuid>,
+    }
+
+    impl RunExposure for RecordingExposure {
+        fn expose(
+            &mut self,
+            _operations: &OperationGuard,
+            store: &Store,
+            owner_id: Uuid,
+            _hostname: &str,
+            _target: &str,
+        ) -> Result<Vec<(OsString, OsString)>, RunError> {
+            let registry = store.load().unwrap();
+            let route_journaled = registry.pending_operations.iter().any(|operation| {
+                matches!(operation.kind, PendingOperationKind::StartProcess { owner_id: id, .. } if id == owner_id)
+            });
+            if route_journaled && !registry.leases.contains_key(&owner_id) {
+                self.exposed_after_route_before_lease.push(owner_id);
+            }
+            if self.fail {
+                return Err(RunError::Exposure("tailnet unavailable".into()));
+            }
+            Ok(vec![(
+                OsString::from("NOOK_TAILSCALE_URL"),
+                OsString::from("https://host.example.ts.net:8443"),
+            )])
+        }
+
+        fn withdraw(&mut self, _operations: &OperationGuard, _store: &Store, owner_id: Uuid) {
+            self.withdrawn.push(owner_id);
+        }
+    }
+
+    #[test]
+    fn exposure_runs_between_route_and_spawn_and_its_variables_reach_the_child() {
+        let (store, path) = temporary_store();
+        let marker = path.parent().unwrap().join("tailscale-url");
+        let script = format!("printf %s \"$NOOK_TAILSCALE_URL\" > '{}'", marker.display());
+        let config = run_config(vec!["/bin/sh", "-c", &script], 30);
+        let mut routes = Routes::default();
+        let mut exposure = RecordingExposure::default();
+        let mut running = start_exposed_run(&config, &store, &mut routes, &mut exposure).unwrap();
+        assert_eq!(
+            exposure.exposed_after_route_before_lease,
+            [running.lease_id]
+        );
+        assert_eq!(running.finish(&store, &mut routes).unwrap().exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "https://host.example.ts.net:8443"
+        );
+        assert!(exposure.withdrawn.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_exposure_never_spawns_and_removes_the_route() {
+        let (store, path) = temporary_store();
+        let marker = path.parent().unwrap().join("child-started");
+        let script = format!("touch '{}'", marker.display());
+        let config = run_config(vec!["/bin/sh", "-c", &script], 30);
+        let mut routes = Routes::default();
+        let mut exposure = RecordingExposure {
+            fail: true,
+            ..RecordingExposure::default()
+        };
+        assert!(matches!(
+            start_exposed_run(&config, &store, &mut routes, &mut exposure),
+            Err(RunError::Exposure(_))
+        ));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists());
+        assert!(routes.owners.is_empty());
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(registry.leases.is_empty());
+        assert!(registry.pending_operations.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_spawn_withdraws_the_exposure_it_created() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/nonexistent/nook-test-command"], 30);
+        let mut routes = Routes::default();
+        let mut exposure = RecordingExposure::default();
+        assert!(matches!(
+            start_exposed_run(&config, &store, &mut routes, &mut exposure),
+            Err(RunError::Process(Error::Spawn(_)))
+        ));
+        assert_eq!(
+            exposure.withdrawn,
+            exposure.exposed_after_route_before_lease
+        );
+        assert_eq!(exposure.withdrawn.len(), 1);
+        assert!(routes.owners.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     #[derive(Default)]
     struct Routes {
@@ -1839,10 +2000,12 @@ mod tests {
         let config = run_config(vec!["/usr/bin/python3", "-c", code], 30);
         let stolen = RefCell::new(None);
         let mut routes = Routes::default();
-        let mut running = start_run_with_hook(&config, &store, &mut routes, |port| {
-            *stolen.borrow_mut() = Some(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap());
-        })
-        .unwrap();
+        let mut running =
+            start_run_with_hook(&config, &store, &mut routes, &mut LocalOnly, |port| {
+                *stolen.borrow_mut() =
+                    Some(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap());
+            })
+            .unwrap();
         let outcome = running.finish(&store, &mut routes).unwrap();
         assert_ne!(outcome.exit_code, 0);
         assert!(
@@ -1964,6 +2127,7 @@ mod tests {
             hostname: "api.localhost".into(),
             command: command.into_iter().map(OsString::from).collect(),
             tls: true,
+            tailscale: false,
             app_port: None,
             strict_port: false,
             force: false,

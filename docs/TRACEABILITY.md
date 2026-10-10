@@ -38,6 +38,7 @@ This matrix links product requirements to implementation tickets and checks trac
 | Bash/Zsh completion plus native PowerShell completion | NOOK-52, NOOK-54 | `tests/cli_completions.rs`; Windows CI generates and parses the PowerShell script |
 | `nook update` replaces a GitHub binary after SHA-256 verification; a cached check warns when a newer version exists | post-MVP | `update::tests::*`, `cli_update` tests |
 | Package-manager-neutral JavaScript wrapper reports a missing Nook and preserves arguments, exit codes, and signals | post-MVP | `packages/nook-run/test`; Node 22/24 and npm/pnpm/Yarn/Bun CI jobs |
+| Opt-in private Tailscale Serve: prerequisites before spawn, 443-then-8443 concurrent-safe ports, `NOOK_TAILSCALE_URL`, run/alias lifecycle, crash and down/up recovery, no Funnel, reset, ACL change, or foreign-registration change | NOOK-6, NOOK-37, NOOK-39, NOOK-40, NOOK-42, NOOK-63 | `tailscale::tests::*`, `state::tests::v1_registry_*`, `process::tests::*exposure*`, `cli::tests::*tailscale*`; `tests/tailscale_serve.rs` (fake CLI, Linux and Windows) |
 | Documentation for requirements, safeguards, troubleshooting, and out-of-scope items | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
 | Linux and Windows gates compile, format, lint, run native Caddy integrations, and produce verifiable binaries | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43, NOOK-58 | `.github/workflows/ci-crate.yml`; both archives, SHA-256 files, installers and attestations through `.github/workflows/publish.yml` |
 

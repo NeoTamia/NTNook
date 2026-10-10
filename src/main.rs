@@ -7,6 +7,7 @@ mod platform;
 mod process;
 mod reconcile;
 mod state;
+mod tailscale;
 mod update;
 
 use std::fmt;
@@ -28,6 +29,7 @@ pub(crate) enum Error {
     Alias(reconcile::AliasError),
     Run(process::RunError),
     Stop(process::StopError),
+    Tailscale(tailscale::Error),
     Update(update::Error),
     Io(io::Error),
 }
@@ -42,6 +44,7 @@ impl fmt::Display for Error {
             Self::Alias(error) => error.fmt(formatter),
             Self::Run(error) => error.fmt(formatter),
             Self::Stop(error) => error.fmt(formatter),
+            Self::Tailscale(error) => error.fmt(formatter),
             Self::Update(error) => error.fmt(formatter),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
         }
@@ -58,6 +61,7 @@ impl std::error::Error for Error {
             Self::Alias(error) => Some(error),
             Self::Run(error) => Some(error),
             Self::Stop(error) => Some(error),
+            Self::Tailscale(error) => Some(error),
             Self::Update(error) => Some(error),
             Self::Io(error) => Some(error),
         }
@@ -70,7 +74,12 @@ impl Error {
             Self::Caddy(_) => 1,
             Self::Cli(error) => error.exit_code(),
             Self::Config(_) => 1,
-            Self::State(_) | Self::Alias(_) | Self::Run(_) | Self::Stop(_) | Self::Update(_) => 1,
+            Self::State(_)
+            | Self::Alias(_)
+            | Self::Run(_)
+            | Self::Stop(_)
+            | Self::Tailscale(_)
+            | Self::Update(_) => 1,
             Self::Io(_) => 1,
         }
     }
@@ -121,6 +130,12 @@ impl From<process::RunError> for Error {
 impl From<process::StopError> for Error {
     fn from(error: process::StopError) -> Self {
         Self::Stop(error)
+    }
+}
+
+impl From<tailscale::Error> for Error {
+    fn from(error: tailscale::Error) -> Self {
+        Self::Tailscale(error)
     }
 }
 
