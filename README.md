@@ -246,9 +246,11 @@ nook run --name legacy --no-tls -- ./server
 - `--config <path>` explicitly selects the project file;
 - `--local` applies the `nook.local.toml` next to a file selected with `--config`;
 - `--readiness-warn-after <seconds>` sets the readiness warning delay;
+- `--framework <name>` forces Vite, Nuxt, Next, Nitro, or Astro env alignment (`none` disables it);
+- `--no-framework` disables detection and flag injection;
 - arguments after `--` are passed through directly, without an implicit shell.
 
-Nook replaces `{port}` literally in each argument and injects `PORT`, `HOST` (the value of `run_bind_address`, `127.0.0.1` by default), and `NOOK_URL`. The process receives the terminal's stdin/stdout/stderr, and its exit code is preserved even if Caddy cleanup must be retried later.
+Nook replaces `{port}` literally in each argument and injects `PORT`, `HOST` (the value of `run_bind_address`, `127.0.0.1` by default), and `NOOK_URL`. When the child argv is Vite, Nuxt, Nitro, Astro, or Next (including `bunx` / `npx`), Nook also appends that CLI's flags and extra variables listed under [Framework alignment](#framework-alignment). `bun run` and Elysia (`bun --watch`) keep that base environment. The process receives the terminal's stdin/stdout/stderr, and its exit code is preserved even if Caddy cleanup must be retried later.
 
 After reserving the route and starting the process, Nook always prints the selected domain, public URL, and effective application port, including when the name and port are inferred:
 
@@ -356,9 +358,51 @@ app_port = 5173
 strict_port = false
 readiness_warn_after_seconds = 30
 run_bind_address = "127.0.0.1"
+# framework = "vite"
 ```
 
 Without a command after `--`, `command` is required. Name precedence is: `--name`, project file, Git root basename, then current-directory basename. CLI values override file values.
+
+### Framework alignment
+
+`nook run` is enough. `@neotamia/nook-run` is only a convenience wrapper for package scripts.
+
+```sh
+nook run -- nuxt dev
+nook run -- vite
+nook run -- astro dev
+nook run -- bunx vite
+```
+
+Or in `nook.toml`: `command = ["nuxt", "dev"]` then `nook run`. Detection reads the child argv, including `bunx`, `npx`, `pnpx`, `npm exec`, `pnpm dlx`, and `bun x`. It leaves `package.json` unread.
+
+Every child receives `PORT`, `HOST`, and `NOOK_URL`. `<bind>` below is the run bind address (`127.0.0.1` by default). `<port>` is the reserved application port. `<hostname>` is the Nook domain, such as `app.localhost`. An existing `--host`, `--hostname`, or `--port` on that framework CLI is overwritten with `<bind>` and `<port>`. `--strict-port` adds Vite's `--strictPort`.
+
+| Framework | Argv Nook aligns | Flags Nook appends | Extra environment |
+| --- | --- | --- | --- |
+| Vite | `vite` (a version suffix such as `vite@latest` counts) | `--host <bind>`, `--port <port>`, and `--strictPort` when `--strict-port` is set | `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<hostname>` when that variable is unset or empty |
+| Nuxt | `nuxt` or `nuxi` with `dev`, `start`, `preview`, or `serve` | `--host <bind>`, `--port <port>` | `NUXT_HOST=<bind>`, `NUXT_PORT=<port>`, and `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<hostname>` when that variable is unset or empty |
+| Astro | `astro` with `dev`, `start`, `preview`, or `serve` | `--host <bind>`, `--port <port>`, `--allowed-hosts <hostname>` | `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<hostname>` when that variable is unset or empty |
+| Nitro | `nitro` or `nitropack` with `dev`, `start`, `preview`, or `serve` | `--host <bind>`, `--port <port>` | `NITRO_HOST=<bind>`, `NITRO_PORT=<port>` |
+| Next | `next` with `dev`, `start`, `preview`, or `serve` | `--hostname <bind>`, `--port <port>` | `HOSTNAME=<bind>` |
+| Bun, Elysia | `bun run`, `bun --watch src/server.ts`, and any other argv that is not a CLI above | none | none beyond `PORT`, `HOST`, and `NOOK_URL` |
+| Angular | `ng serve` is left as written; `framework = "angular"` is rejected | none | none beyond `PORT`, `HOST`, and `NOOK_URL` |
+
+Vite already accepts `localhost` and names under `.localhost`. Nook still sets `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` so the Nook hostname is explicit. Nuxt and Astro share that Vite check. Astro also receives `--allowed-hosts`.
+
+Elysia has no host flag. A `bun --watch` server keeps the argv you wrote and sees `HOST` and `PORT`; pass those into `listen` in application code. Angular's origin allow-list stays in `ng serve --allowed-hosts` or `angular.json`. This release does not inject it.
+
+`--framework <vite|nuxt|next|nitro|astro|none>` forces that choice. `--no-framework` disables detection and injection. The two flags cannot be combined. `framework = "none"` in `nook.toml` is the same opt-out. A forced name still adds that framework's environment variables, and appends flags only when the argv contains that framework's executable. Automatic detection leaves `vite build`, `nuxt build`, `astro build`, and `next build` on the base `PORT`, `HOST`, and `NOOK_URL` environment, with their argv unchanged.
+
+Optional wrapper for `bun run` / `npm run`:
+
+```json
+{
+  "scripts": {
+    "dev": "nook-run -- nuxt dev"
+  }
+}
+```
 
 Each developer can add a `nook.local.toml` in the same directory. Its fields override those in
 `nook.toml` without changing the shared configuration:
@@ -521,8 +565,8 @@ secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Serve/Funnel, and any
-public exposure.
+LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Serve/Funnel, rewriting
+framework config files, Angular-specific origin allow-lists, and any public exposure.
 
 ## Development
 
