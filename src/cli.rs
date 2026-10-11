@@ -1276,6 +1276,13 @@ fn run_command(
         {
             writeln!(errors, "warning: {warning}")?;
         }
+        // An exposed run already converged while registering; a local run
+        // must still withdraw the Serve registration of the owner it replaced.
+        if registration.is_none() && config.force {
+            for warning in converge_tailscale_now(&store) {
+                writeln!(errors, "warning: {warning}")?;
+            }
+        }
         let _ready = running.wait_for_readiness(&store, |warning| {
             let _ = writeln!(errors, "warning: {warning}");
         })?;
@@ -1283,7 +1290,7 @@ fn run_command(
         for warning in outcome.warnings {
             writeln!(errors, "warning: {warning}")?;
         }
-        if registration.is_some() || config.force {
+        if registration.is_some() {
             for warning in converge_tailscale_now(&store) {
                 writeln!(errors, "warning: {warning}")?;
             }

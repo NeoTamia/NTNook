@@ -451,6 +451,32 @@ fn alias_registration_persists_until_alias_remove() {
         json!({}),
         "a replacement without --tailscale withdraws the old registration"
     );
+
+    assert!(
+        world
+            .nook(&["alias", "set", "api", "3001", "--force", "--tailscale"])
+            .status
+            .success()
+    );
+    let marker = world.root.join("local-run.json");
+    let release = world.root.join("release-local-run");
+    let local_run = world
+        .nook_command(&["run", "--force", "--name", "api", "--"])
+        .args(world.child_arguments(&marker, 0, Some(&release)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(Duration::from_secs(30), || marker.exists());
+    assert_eq!(read_json(&marker)["url"], Value::Null);
+    // Without the fix the URL is only withdrawn once the run exits, which the
+    // unreleased child never does here.
+    wait_for(Duration::from_secs(10), || {
+        world.serve_config() == json!({})
+    });
+    File::create(&release).unwrap();
+    let local_run = wait_with_timeout(local_run, Duration::from_secs(30));
+    assert!(local_run.status.success(), "{}", describe(&local_run));
     let exposed = world.nook(&["alias", "set", "api", "3002", "--force", "--tailscale"]);
     assert!(exposed.status.success(), "{}", describe(&exposed));
     let exposed_serve = world.serve_config();
