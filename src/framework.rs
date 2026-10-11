@@ -244,6 +244,7 @@ fn detect(argv: &[OsString]) -> Option<Framework> {
 
 fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
     let mut saw_server = false;
+    let mut saw_command = false;
     let mut skip_value = false;
     for argument in arguments {
         if skip_value {
@@ -265,6 +266,7 @@ fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
         if !is_command_word(value) {
             continue;
         }
+        saw_command = true;
         if is_non_server_subcommand(value) {
             return false;
         }
@@ -272,7 +274,11 @@ fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
             saw_server = true;
         }
     }
-    saw_server || matches!(framework, Framework::Vite)
+    if saw_server || matches!(framework, Framework::Vite) {
+        return true;
+    }
+    // `next` with no subcommand is the documented alias for `next dev`.
+    matches!(framework, Framework::Next) && !saw_command
 }
 
 fn is_command_word(token: &str) -> bool {
@@ -475,7 +481,7 @@ fn has_option(argv: &[OsString], names: &[&str]) -> bool {
 mod tests {
     use super::{Framework, FrameworkChoice, detect, executable_name, vite_hosts_override};
     use std::ffi::{OsStr, OsString};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn argv(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -570,6 +576,37 @@ mod tests {
                 argv(&["next", "build"]),
                 3000,
                 bind(),
+                "app.localhost",
+                false
+            ),
+            argv(&["next", "build"])
+        );
+    }
+
+    #[test]
+    fn bare_next_is_served_like_vite() {
+        let command = argv(&["next"]);
+        let bind_v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(detect(&command), Some(Framework::Next));
+        assert_eq!(
+            FrameworkChoice::Auto.resolve(&command),
+            Some(Framework::Next)
+        );
+        assert_eq!(
+            Framework::Next.inject_argv(command, 3000, bind_v6, "app.localhost", false),
+            argv(&["next", "--hostname", "::1", "--port", "3000"])
+        );
+        assert_eq!(
+            Framework::Next.environment(3000, bind_v6, "app.localhost"),
+            vec![(OsString::from("HOSTNAME"), OsString::from("::1"))]
+        );
+        assert_eq!(detect(&argv(&["next", "build"])), None);
+        assert_eq!(detect(&argv(&["next", "info"])), None);
+        assert_eq!(
+            Framework::Next.inject_argv(
+                argv(&["next", "build"]),
+                3000,
+                bind_v6,
                 "app.localhost",
                 false
             ),

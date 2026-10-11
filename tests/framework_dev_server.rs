@@ -2,7 +2,8 @@
 //!
 //! Skips when `node` is not on PATH, or when `vite@6` is not already in the
 //! npm cache. The lookup is `npm exec --offline`, so the suite never installs
-//! Vite. The dev server is `node` running Vite's CLI directly, so the test
+//! Vite. The fixture directory is created only after that lookup succeeds.
+//! The dev server is `node` running Vite's CLI directly, so the test
 //! can stop that process group. Nook's detector is not involved and nothing
 //! reads `package.json`.
 
@@ -25,16 +26,10 @@ fn vite_accepts_the_nook_hostname_on_loopback() {
         return;
     }
 
-    let directory = std::env::temp_dir().join(format!("nook-vite-smoke-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(
-        directory.join("index.html"),
-        "<!doctype html><p>nook-smoke-ok</p>\n",
-    )
-    .unwrap();
-    let Some(vite_js) = locate_vite_cli() else {
+    let Some(fixture) = smoke_fixture(locate_vite_cli) else {
         return;
     };
+    let SmokeFixture { directory, vite_js } = fixture;
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -83,6 +78,48 @@ fn vite_accepts_the_nook_hostname_on_loopback() {
         blocked.status,
         blocked.body
     );
+}
+
+struct SmokeFixture {
+    directory: PathBuf,
+    vite_js: PathBuf,
+}
+
+fn smoke_fixture(locate: impl FnOnce() -> Option<PathBuf>) -> Option<SmokeFixture> {
+    let vite_js = locate()?;
+    let directory = std::env::temp_dir().join(format!("nook-vite-smoke-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("index.html"),
+        "<!doctype html><p>nook-smoke-ok</p>\n",
+    )
+    .unwrap();
+    Some(SmokeFixture { directory, vite_js })
+}
+
+fn smoke_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return directories;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with("nook-vite-smoke-") {
+            directories.push(entry.path());
+        }
+    }
+    directories.sort();
+    directories
+}
+
+#[test]
+fn skipped_vite_lookup_creates_no_directory() {
+    let before = smoke_directories();
+    assert!(smoke_fixture(|| None).is_none());
+    assert_eq!(smoke_directories(), before);
 }
 
 fn locate_vite_cli() -> Option<PathBuf> {

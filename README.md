@@ -384,7 +384,7 @@ Every child receives `PORT`, `HOST`, and `NOOK_URL`. `<bind>` below is the run b
 | Nuxt | `nuxt` or `nuxi` with `dev`, `start`, `preview`, or `serve` | `--host <bind>`, `--port <port>` | `NUXT_HOST=<bind>`, `NUXT_PORT=<port>`, and `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<hostname>` when that variable is unset or empty |
 | Astro | `astro` with `dev`, `start`, `preview`, or `serve` | `--host <bind>`, `--port <port>`, `--allowed-hosts <hostname>` | `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=<hostname>` when that variable is unset or empty |
 | Nitro | `nitro` or `nitropack` with `dev`, `start`, `preview`, or `serve` | `--host <bind>`, `--port <port>` | `NITRO_HOST=<bind>`, `NITRO_PORT=<port>` |
-| Next | `next` with `dev`, `start`, `preview`, or `serve` | `--hostname <bind>`, `--port <port>` | `HOSTNAME=<bind>` |
+| Next | bare `next` (the `next dev` alias), or `next` with `dev`, `start`, `preview`, or `serve` | `--hostname <bind>`, `--port <port>` | `HOSTNAME=<bind>` |
 | Bun, Elysia | `bun run`, `bun --watch src/server.ts`, and any other argv that is not a CLI above | none | none beyond `PORT`, `HOST`, and `NOOK_URL` |
 | Angular | `ng serve` is left as written; `framework = "angular"` is rejected | none | none beyond `PORT`, `HOST`, and `NOOK_URL` |
 
