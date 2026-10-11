@@ -1248,6 +1248,7 @@ fn run_command(
         .tailscale
         .then(crate::tailscale::Client::from_environment);
     if let Some(client) = &tailscale {
+        crate::tailscale::reachable_bind_address(config.bind_address)?;
         client.require_ready()?;
     }
     with_caddy_routes(global, config.tls, !config.tls, |routes| {

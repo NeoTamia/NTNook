@@ -16,7 +16,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -66,6 +66,7 @@ pub(crate) enum Error {
         reason: String,
     },
     NonLoopbackTarget(String),
+    UnreachableBindAddress(IpAddr),
     NoFreePort,
     Unconfirmed(u16),
     FunnelEnabled(u16),
@@ -148,6 +149,10 @@ impl fmt::Display for Error {
                 formatter,
                 "Tailscale Serve exposure requires a loopback upstream (127.0.0.1 or localhost); `{target}` is not one"
             ),
+            Self::UnreachableBindAddress(address) => write!(
+                formatter,
+                "Tailscale Serve reaches the application through 127.0.0.1, which an application bound to {address} does not accept; use run_bind_address 127.0.0.1 or 0.0.0.0 with Tailscale exposure"
+            ),
             Self::NoFreePort => write!(
                 formatter,
                 "no free Tailscale Serve HTTPS port is left among {FIRST_PORT} and {}-{}",
@@ -201,6 +206,16 @@ pub(crate) fn serve_target(target: &str) -> Result<String, Error> {
     }
     let port = url.port_or_known_default().ok_or_else(rejected)?;
     Ok(format!("{}://{host}:{port}", url.scheme()))
+}
+
+/// Refuses run bind addresses that Serve's `127.0.0.1` upstream cannot
+/// reach. An IPv6 wildcard is refused too, because whether it also accepts
+/// IPv4 depends on the platform.
+pub(crate) fn reachable_bind_address(address: IpAddr) -> Result<(), Error> {
+    match address {
+        IpAddr::V4(address) if address.is_unspecified() || address == Ipv4Addr::LOCALHOST => Ok(()),
+        address => Err(Error::UnreachableBindAddress(address)),
+    }
 }
 
 fn same_target(left: &str, right: &str) -> bool {
@@ -1056,7 +1071,8 @@ mod tests {
 
     use super::{
         Action, Observation, Owner, ServeConfig, Shadowed, allocate_port, local_listener,
-        owner_state, parse_version, plan, recorded_url, serve_target, serve_url, shadowed_warning,
+        owner_state, parse_version, plan, reachable_bind_address, recorded_url, serve_target,
+        serve_url, shadowed_warning,
     };
     use crate::process::Liveness;
     use crate::state::{Alias, Lease, LeaseState, Registry, Scheme, ServeRegistration};
@@ -1164,6 +1180,17 @@ mod tests {
             "not a url",
         ] {
             assert!(serve_target(rejected).is_err(), "{rejected} was accepted");
+        }
+    }
+
+    #[test]
+    fn only_bind_addresses_reachable_through_ipv4_loopback_can_be_exposed() {
+        for accepted in ["127.0.0.1", "0.0.0.0"] {
+            assert!(reachable_bind_address(accepted.parse().unwrap()).is_ok());
+        }
+        for rejected in ["127.0.0.2", "::1", "::", "192.168.1.10"] {
+            let error = reachable_bind_address(rejected.parse().unwrap()).unwrap_err();
+            assert!(error.to_string().contains(rejected), "{rejected}: {error}");
         }
     }
 

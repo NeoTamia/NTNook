@@ -572,6 +572,8 @@ Requirements: Tailscale 1.52 or newer installed and connected, HTTPS certificate
 tailnet, and a user allowed to change Serve (on Linux, root or the Tailscale operator). Nook runs
 `tailscale` from `PATH` (`tailscale.exe` on Windows, falling back to
 `%ProgramFiles%\Tailscale\tailscale.exe`); set `NOOK_TAILSCALE` to use another executable.
+Serve reaches an exposed run through `127.0.0.1`, so its `run_bind_address` must be `127.0.0.1` or
+`0.0.0.0`. Other addresses, including `::1` and `::`, are refused before anything changes.
 
 All prerequisites are checked before Nook changes anything or spawns the child. A missing client,
 an unreachable `tailscaled`, a disconnected device (with the login URL Tailscale reports), a

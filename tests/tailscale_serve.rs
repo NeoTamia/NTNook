@@ -190,6 +190,33 @@ fn unready_tailnet_is_diagnosed_before_any_change() {
     assert_eq!(external.status.code(), Some(1));
     assert!(stderr(&external).contains("loopback upstream"));
 
+    for address in ["127.0.0.2", "::1"] {
+        let unreachable = world
+            .nook_command(&[
+                "run",
+                "--tailscale",
+                "--name",
+                "web",
+                "--run-bind-address",
+                address,
+                "--",
+            ])
+            .args(world.child_arguments(&marker, 0, None))
+            .output()
+            .unwrap();
+        assert_eq!(
+            unreachable.status.code(),
+            Some(1),
+            "{}",
+            describe(&unreachable)
+        );
+        assert!(
+            stderr(&unreachable).contains(&format!("bound to {address} does not accept")),
+            "{}",
+            describe(&unreachable)
+        );
+    }
+
     thread::sleep(Duration::from_millis(200));
     assert!(!marker.exists(), "the child must never start");
     assert!(world.caddy_routes().is_empty());
