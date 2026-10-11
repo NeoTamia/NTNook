@@ -266,10 +266,24 @@ fn run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code() {
     let local = world
         .nook_command(&["run", "--name", "plain", "--"])
         .args(world.child_arguments(&marker, 0, None))
+        .env("NOOK_TAILSCALE_URL", "https://inherited.example.ts.net")
         .output()
         .unwrap();
     assert!(local.status.success(), "{}", describe(&local));
-    assert_eq!(read_json(&marker)["url"], Value::Null);
+    assert_eq!(
+        read_json(&marker)["url"],
+        Value::Null,
+        "a local run never inherits a tailnet URL"
+    );
+
+    let exposed = world
+        .nook_command(&["run", "--tailscale", "--name", "web", "--"])
+        .args(world.child_arguments(&marker, 0, None))
+        .env("NOOK_TAILSCALE_URL", "https://inherited.example.ts.net")
+        .output()
+        .unwrap();
+    assert!(exposed.status.success(), "{}", describe(&exposed));
+    assert_eq!(read_json(&marker)["url"], format!("https://{DNS_NAME}"));
 }
 
 fn project_configuration_opts_in_and_no_tailscale_opts_out() {

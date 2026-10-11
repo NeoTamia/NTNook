@@ -773,7 +773,12 @@ fn spawn_managed_child(
         internal_environment,
     } = prepare_windows_command(program, arguments, environment, lease_id)?;
     let mut command = Command::new(program);
-    command.args(arguments).envs(environment.iter().cloned());
+    // A run started from an exposed run must not inherit its tailnet URL;
+    // an exposed child gets its own value back from `environment`.
+    command
+        .env_remove(crate::tailscale::URL_VARIABLE)
+        .args(arguments)
+        .envs(environment.iter().cloned());
     #[cfg(windows)]
     if let Some((key, value)) = internal_environment {
         command.env(key, value);

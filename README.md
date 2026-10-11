@@ -591,6 +591,9 @@ run information line gains the tailnet URL:
 nook: domain=api.localhost url=https://api.localhost port=5173 tailscale_url=https://laptop.example.ts.net
 ```
 
+Nook removes an inherited `NOOK_TAILSCALE_URL` from every child it starts without exposure, for
+example a local run started from an exposed one.
+
 Nook also skips a port when a local server already accepts connections on it through one of the
 device's tailnet addresses, that is a server listening on the wildcard address (`*:443`,
 `0.0.0.0:443`, `[::]:443`) or directly on the tailnet IP. From this machine, such a server would
