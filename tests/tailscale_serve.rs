@@ -523,6 +523,29 @@ fn alias_registration_persists_until_alias_remove() {
     assert!(routes.contains("127.0.0.1:3002"), "{routes}");
     assert!(!routes.contains("127.0.0.1:3003"), "{routes}");
     assert_eq!(world.serve_config(), exposed_serve);
+
+    let refused_marker = world.root.join("refused-run.json");
+    let refused_run = world
+        .nook_command(&["run", "--force", "--tailscale", "--name", "api", "--"])
+        .args(world.child_arguments(&refused_marker, 0, None))
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused_run.status.code(),
+        Some(1),
+        "{}",
+        describe(&refused_run)
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert!(!refused_marker.exists(), "the child must never start");
+    assert_eq!(
+        stdout(&world.nook(&["alias", "list"])),
+        "api.localhost -> http://127.0.0.1:3002/\n",
+        "a failed forced run keeps the alias it would have displaced"
+    );
+    let routes = serde_json::to_string(&world.caddy_routes()).unwrap();
+    assert!(routes.contains("127.0.0.1:3002"), "{routes}");
+    assert_eq!(world.serve_config(), exposed_serve);
     world.update_tailscale(|state| state["serve_error"] = Value::Null);
 
     let remove = world.nook(&["alias", "remove", "api"]);

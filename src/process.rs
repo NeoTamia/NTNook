@@ -27,7 +27,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::config::ResolvedRunConfig;
-use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
+use crate::reconcile::{RouteBackend, RouteError, RouteSpec, route_for_alias, route_for_lease};
 use crate::state::Lease;
 use crate::state::{
     LeaseState, OperationGuard, PendingOperation, PendingOperationKind, Scheme, Store,
@@ -329,22 +329,26 @@ fn start_run_with_hook(
 ) -> Result<RunningChild, RunError> {
     let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
     let operations = store.lock_operations()?;
-    let conflicts = store.mutate(|registry| {
+    let displaced = store.mutate(|registry| {
         let aliases = registry
             .aliases
             .values()
             .filter(|alias| alias.hostname == config.hostname)
-            .map(|alias| (alias.id, alias.tls));
+            .map(route_for_alias);
         let leases = registry
             .leases
             .values()
             .filter(|lease| lease.hostname == config.hostname)
-            .map(|lease| (lease.id, lease.tls));
+            .map(route_for_lease);
         Ok(aliases.chain(leases).collect::<Vec<_>>())
     })?;
-    if !conflicts.is_empty() && !config.force {
+    if !displaced.is_empty() && !config.force {
         return Err(RunError::Conflict(config.hostname.clone()));
     }
+    let conflicts: Vec<_> = displaced
+        .iter()
+        .map(|route| (route.owner_id, route.tls))
+        .collect();
     let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
     let port = reservation.port;
     let owner_id = Uuid::new_v4();
@@ -373,6 +377,21 @@ fn start_run_with_hook(
         Ok(())
     })?;
     routes.ensure(&route)?;
+    let exposed = match exposure.expose(&operations, store, owner_id, &config.hostname, &target) {
+        Ok(exposed) => exposed,
+        Err(error) => {
+            for displaced in &displaced {
+                // The registry still records these owners, so a route that
+                // cannot be restored now is restored by the next reconciliation.
+                let _ = routes.ensure(&RouteSpec {
+                    replace_existing: true,
+                    ..displaced.clone()
+                });
+            }
+            abandon_route(store, routes, config, owner_id, operation_id)?;
+            return Err(error);
+        }
+    };
     let cleanup_results: Vec<_> = conflicts
         .iter()
         .map(|(id, tls)| {
@@ -451,36 +470,13 @@ fn start_run_with_hook(
     let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     reservation.release();
     after_release(port);
-    let spawned = exposure
-        .expose(&operations, store, owner_id, &config.hostname, &target)
-        .and_then(|exposed| {
-            let environment: Vec<_> = environment.iter().cloned().chain(exposed).collect();
-            spawn_managed_child(&argv, &environment, owner_id).map_err(|error| {
-                exposure.withdraw(&operations, store, owner_id);
-                RunError::from(error)
-            })
-        });
-    let child = match spawned {
+    let environment: Vec<_> = environment.into_iter().chain(exposed).collect();
+    let child = match spawn_managed_child(&argv, &environment, owner_id) {
         Ok(child) => child,
         Err(error) => {
-            let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
-            store.mutate(|registry| {
-                registry
-                    .pending_operations
-                    .retain(|operation| operation.id != operation_id);
-                if cleanup.is_err() {
-                    registry.pending_operations.push(PendingOperation {
-                        id: Uuid::new_v4(),
-                        kind: PendingOperationKind::RemoveRoute {
-                            hostname: config.hostname.clone(),
-                            owner_id,
-                            tls: config.tls,
-                        },
-                    });
-                }
-                Ok(())
-            })?;
-            return Err(error);
+            exposure.withdraw(&operations, store, owner_id);
+            abandon_route(store, routes, config, owner_id, operation_id)?;
+            return Err(error.into());
         }
     };
     store.mutate(|registry| {
@@ -514,6 +510,35 @@ fn start_run_with_hook(
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
         signals,
     })
+}
+
+/// Removes the route of a run that will not start and drops its journal entry,
+/// queueing the removal when Caddy cannot be reached.
+fn abandon_route(
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    config: &ResolvedRunConfig,
+    owner_id: Uuid,
+    operation_id: Uuid,
+) -> Result<(), RunError> {
+    let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
+    store.mutate(|registry| {
+        registry
+            .pending_operations
+            .retain(|operation| operation.id != operation_id);
+        if cleanup.is_err() {
+            registry.pending_operations.push(PendingOperation {
+                id: Uuid::new_v4(),
+                kind: PendingOperationKind::RemoveRoute {
+                    hostname: config.hostname.clone(),
+                    owner_id,
+                    tls: config.tls,
+                },
+            });
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn pending_owner(kind: &PendingOperationKind) -> Option<Uuid> {
@@ -1502,7 +1527,9 @@ mod tests {
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
-    use crate::state::{LeaseState, OperationGuard, PendingOperationKind, Store, decode};
+    use crate::state::{
+        Alias, LeaseState, OperationGuard, PendingOperationKind, Scheme, Store, decode,
+    };
     use uuid::Uuid;
 
     #[derive(Default)]
@@ -1523,7 +1550,11 @@ mod tests {
         ) -> Result<Vec<(OsString, OsString)>, RunError> {
             let registry = store.load().unwrap();
             let route_journaled = registry.pending_operations.iter().any(|operation| {
-                matches!(operation.kind, PendingOperationKind::StartProcess { owner_id: id, .. } if id == owner_id)
+                matches!(
+                    operation.kind,
+                    PendingOperationKind::InstallRoute { owner_id: id, .. }
+                        | PendingOperationKind::StartProcess { owner_id: id, .. } if id == owner_id
+                )
             });
             if route_journaled && !registry.leases.contains_key(&owner_id) {
                 self.exposed_after_route_before_lease.push(owner_id);
@@ -1583,6 +1614,51 @@ mod tests {
         assert!(!marker.exists());
         assert!(routes.owners.is_empty());
         let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(registry.leases.is_empty());
+        assert!(registry.pending_operations.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_exposure_of_a_forced_run_restores_the_displaced_alias() {
+        let (store, path) = temporary_store();
+        let mut config = run_config(vec!["/bin/true"], 30);
+        config.force = true;
+        let displaced = Alias {
+            id: Uuid::new_v4(),
+            hostname: config.hostname.clone(),
+            target: "http://127.0.0.1:3000/".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            preserve_host: true,
+        };
+        store
+            .mutate(|registry| {
+                registry
+                    .aliases
+                    .insert(displaced.hostname.clone(), displaced.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut routes = Routes {
+            owners: BTreeMap::from([(displaced.hostname.clone(), displaced.id)]),
+            ..Routes::default()
+        };
+        let mut exposure = RecordingExposure {
+            fail: true,
+            ..RecordingExposure::default()
+        };
+        assert!(matches!(
+            start_exposed_run(&config, &store, &mut routes, &mut exposure),
+            Err(RunError::Exposure(_))
+        ));
+        assert_eq!(exposure.exposed_after_route_before_lease.len(), 1);
+        assert_eq!(routes.owners[&displaced.hostname], displaced.id);
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            registry.aliases.into_values().collect::<Vec<_>>(),
+            [displaced]
+        );
         assert!(registry.leases.is_empty());
         assert!(registry.pending_operations.is_empty());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();

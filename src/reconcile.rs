@@ -453,7 +453,7 @@ fn current_route(registry: &Registry, hostname: &str, owner_id: Uuid) -> Option<
         })
 }
 
-fn route_for_lease(lease: &Lease) -> RouteSpec {
+pub(crate) fn route_for_lease(lease: &Lease) -> RouteSpec {
     RouteSpec {
         owner_id: lease.id,
         hostname: lease.hostname.clone(),
@@ -465,7 +465,7 @@ fn route_for_lease(lease: &Lease) -> RouteSpec {
     }
 }
 
-fn route_for_alias(alias: &Alias) -> RouteSpec {
+pub(crate) fn route_for_alias(alias: &Alias) -> RouteSpec {
     RouteSpec {
         owner_id: alias.id,
         hostname: alias.hostname.clone(),
