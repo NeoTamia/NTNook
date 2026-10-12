@@ -1,4 +1,4 @@
-//! Align Vite, Nuxt, Next, Nitro, and Astro when the child argv *is* that CLI.
+//! Align Vite, Nuxt, and Astro when the child argv *is* that CLI.
 //!
 //! `nook run -- nuxt dev` is enough; `@neotamia/nook-run` is optional.
 //! `bun run` / Elysia only inherit `PORT` / `HOST` / `NOOK_URL`.
@@ -13,8 +13,6 @@ use std::path::Path;
 pub(crate) enum Framework {
     Vite,
     Nuxt,
-    Next,
-    Nitro,
     Astro,
 }
 
@@ -31,8 +29,6 @@ impl Framework {
         match strip_package_version(name) {
             "vite" => Some(Self::Vite),
             "nuxt" | "nuxi" => Some(Self::Nuxt),
-            "next" => Some(Self::Next),
-            "nitro" | "nitropack" => Some(Self::Nitro),
             "astro" => Some(Self::Astro),
             _ => None,
         }
@@ -48,30 +44,15 @@ impl Framework {
         let port = port.to_string();
         let host = bind_address.to_string();
         let mut variables = Vec::new();
-        match self {
-            Self::Vite | Self::Nuxt | Self::Astro => {
-                if let Some(value) = additional_vite_hosts(hostname) {
-                    variables.push((
-                        OsString::from("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"),
-                        value,
-                    ));
-                }
-            }
-            Self::Next | Self::Nitro => {}
+        if let Some(value) = additional_vite_hosts(hostname) {
+            variables.push((
+                OsString::from("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS"),
+                value,
+            ));
         }
-        match self {
-            Self::Nuxt => {
-                variables.push((OsString::from("NUXT_HOST"), OsString::from(&host)));
-                variables.push((OsString::from("NUXT_PORT"), OsString::from(&port)));
-            }
-            Self::Nitro => {
-                variables.push((OsString::from("NITRO_HOST"), OsString::from(&host)));
-                variables.push((OsString::from("NITRO_PORT"), OsString::from(&port)));
-            }
-            Self::Next => {
-                variables.push((OsString::from("HOSTNAME"), OsString::from(&host)));
-            }
-            Self::Vite | Self::Astro => {}
+        if self == Self::Nuxt {
+            variables.push((OsString::from("NUXT_HOST"), OsString::from(&host)));
+            variables.push((OsString::from("NUXT_PORT"), OsString::from(&port)));
         }
         variables
     }
@@ -126,68 +107,27 @@ impl Framework {
     ) -> Vec<(&'static [&'static str], Vec<OsString>)> {
         let host = bind_address.to_string();
         let port = port.to_string();
-        let mut flags = Vec::new();
-        match self {
-            Self::Vite => {
-                flags.push((
-                    &["--host"][..],
-                    vec![OsString::from("--host"), OsString::from(&host)],
-                ));
-                flags.push((
-                    &["--port", "-p"][..],
-                    vec![OsString::from("--port"), OsString::from(&port)],
-                ));
-                if strict_port {
-                    flags.push((
-                        &["--strictPort", "--strict-port"][..],
-                        vec![OsString::from("--strictPort")],
-                    ));
-                }
-            }
-            Self::Nuxt => {
-                flags.push((
-                    &["--host"][..],
-                    vec![OsString::from("--host"), OsString::from(&host)],
-                ));
-                flags.push((
-                    &["--port", "-p"][..],
-                    vec![OsString::from("--port"), OsString::from(&port)],
-                ));
-            }
-            Self::Next => {
-                flags.push((
-                    &["--hostname", "-H"][..],
-                    vec![OsString::from("--hostname"), OsString::from(&host)],
-                ));
-                flags.push((
-                    &["--port", "-p"][..],
-                    vec![OsString::from("--port"), OsString::from(&port)],
-                ));
-            }
-            Self::Nitro => {
-                flags.push((
-                    &["--host"][..],
-                    vec![OsString::from("--host"), OsString::from(&host)],
-                ));
-                flags.push((
-                    &["--port", "-p"][..],
-                    vec![OsString::from("--port"), OsString::from(&port)],
-                ));
-            }
-            Self::Astro => {
-                flags.push((
-                    &["--host"][..],
-                    vec![OsString::from("--host"), OsString::from(&host)],
-                ));
-                flags.push((
-                    &["--port", "-p"][..],
-                    vec![OsString::from("--port"), OsString::from(&port)],
-                ));
-                flags.push((
-                    &["--allowed-hosts"][..],
-                    vec![OsString::from("--allowed-hosts"), OsString::from(hostname)],
-                ));
-            }
+        let mut flags = vec![
+            (
+                &["--host"][..],
+                vec![OsString::from("--host"), OsString::from(&host)],
+            ),
+            (
+                &["--port", "-p"][..],
+                vec![OsString::from("--port"), OsString::from(&port)],
+            ),
+        ];
+        if self == Self::Vite && strict_port {
+            flags.push((
+                &["--strictPort", "--strict-port"][..],
+                vec![OsString::from("--strictPort")],
+            ));
+        }
+        if self == Self::Astro {
+            flags.push((
+                &["--allowed-hosts"][..],
+                vec![OsString::from("--allowed-hosts"), OsString::from(hostname)],
+            ));
         }
         flags
     }
@@ -198,12 +138,10 @@ impl FrameworkChoice {
         match value {
             "vite" => Ok(Self::Forced(Framework::Vite)),
             "nuxt" => Ok(Self::Forced(Framework::Nuxt)),
-            "next" => Ok(Self::Forced(Framework::Next)),
-            "nitro" => Ok(Self::Forced(Framework::Nitro)),
             "astro" => Ok(Self::Forced(Framework::Astro)),
             "none" => Ok(Self::Disabled),
             _ => Err(format!(
-                "unknown framework `{value}`; expected vite, nuxt, next, nitro, astro, or none"
+                "unknown framework `{value}`; expected vite, nuxt, astro, or none"
             )),
         }
     }
@@ -244,7 +182,6 @@ fn detect(argv: &[OsString]) -> Option<Framework> {
 
 fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
     let mut saw_server = false;
-    let mut saw_command = false;
     let mut skip_value = false;
     for argument in arguments {
         if skip_value {
@@ -266,7 +203,6 @@ fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
         if !is_command_word(value) {
             continue;
         }
-        saw_command = true;
         if is_non_server_subcommand(value) {
             return false;
         }
@@ -274,11 +210,7 @@ fn serving_invocation(framework: Framework, arguments: &[OsString]) -> bool {
             saw_server = true;
         }
     }
-    if saw_server || matches!(framework, Framework::Vite) {
-        return true;
-    }
-    // `next` with no subcommand is the documented alias for `next dev`.
-    matches!(framework, Framework::Next) && !saw_command
+    saw_server || matches!(framework, Framework::Vite)
 }
 
 fn is_command_word(token: &str) -> bool {
@@ -429,9 +361,7 @@ fn is_port_option(names: &[&str]) -> bool {
 }
 
 fn is_host_option(names: &[&str]) -> bool {
-    names
-        .iter()
-        .any(|name| *name == "--host" || *name == "--hostname" || *name == "-H")
+    names.contains(&"--host")
 }
 
 fn overwrite_option(argv: &mut [OsString], names: &[&str], value: Option<&OsString>) -> bool {
@@ -451,6 +381,9 @@ fn overwrite_option(argv: &mut [OsString], names: &[&str], value: Option<&OsStri
                         .is_some_and(|next| next.starts_with('-'))
                 {
                     argv[index + 1] = value.clone();
+                    changed = true;
+                } else if is_host_option(names) {
+                    argv[index] = OsString::from(format!("{name}={}", value.to_string_lossy()));
                     changed = true;
                 }
                 break;
@@ -481,7 +414,7 @@ fn has_option(argv: &[OsString], names: &[&str]) -> bool {
 mod tests {
     use super::{Framework, FrameworkChoice, detect, executable_name, vite_hosts_override};
     use std::ffi::{OsStr, OsString};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn argv(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -568,49 +501,18 @@ mod tests {
             argv(&["vite", "--base", "/docs/", "build"])
         );
         assert_eq!(
-            FrameworkChoice::Forced(Framework::Next).resolve(&argv(&["next", "build"])),
-            Some(Framework::Next)
+            FrameworkChoice::Forced(Framework::Nuxt).resolve(&argv(&["nuxt", "build"])),
+            Some(Framework::Nuxt)
         );
         assert_eq!(
-            Framework::Next.inject_argv(
-                argv(&["next", "build"]),
+            Framework::Nuxt.inject_argv(
+                argv(&["nuxt", "build"]),
                 3000,
                 bind(),
                 "app.localhost",
                 false
             ),
-            argv(&["next", "build"])
-        );
-    }
-
-    #[test]
-    fn bare_next_is_served_like_vite() {
-        let command = argv(&["next"]);
-        let bind_v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        assert_eq!(detect(&command), Some(Framework::Next));
-        assert_eq!(
-            FrameworkChoice::Auto.resolve(&command),
-            Some(Framework::Next)
-        );
-        assert_eq!(
-            Framework::Next.inject_argv(command, 3000, bind_v6, "app.localhost", false),
-            argv(&["next", "--hostname", "::1", "--port", "3000"])
-        );
-        assert_eq!(
-            Framework::Next.environment(3000, bind_v6, "app.localhost"),
-            vec![(OsString::from("HOSTNAME"), OsString::from("::1"))]
-        );
-        assert_eq!(detect(&argv(&["next", "build"])), None);
-        assert_eq!(detect(&argv(&["next", "info"])), None);
-        assert_eq!(
-            Framework::Next.inject_argv(
-                argv(&["next", "build"]),
-                3000,
-                bind_v6,
-                "app.localhost",
-                false
-            ),
-            argv(&["next", "build"])
+            argv(&["nuxt", "build"])
         );
     }
 
@@ -817,6 +719,27 @@ mod tests {
     }
 
     #[test]
+    fn astro_replaces_a_valueless_host_without_duplicating_it() {
+        for command in [
+            argv(&["astro", "dev", "--host"]),
+            argv(&["astro", "dev", "--host", "--port", "4000"]),
+        ] {
+            assert_eq!(
+                Framework::Astro.inject_argv(command, 4321, bind(), "docs.localhost", false),
+                argv(&[
+                    "astro",
+                    "dev",
+                    "--host=127.0.0.1",
+                    "--port",
+                    "4321",
+                    "--allowed-hosts",
+                    "docs.localhost"
+                ])
+            );
+        }
+    }
+
+    #[test]
     fn npx_package_flag_is_not_rewritten_as_a_port() {
         assert_eq!(
             Framework::Vite.inject_argv(
@@ -865,13 +788,6 @@ mod tests {
             )]
         );
         assert_eq!(
-            Framework::Nitro.environment(3000, bind(), "api.localhost"),
-            vec![
-                (OsString::from("NITRO_HOST"), OsString::from("127.0.0.1")),
-                (OsString::from("NITRO_PORT"), OsString::from("3000")),
-            ]
-        );
-        assert_eq!(
             Framework::Nuxt.inject_argv(
                 argv(&["nuxi", "dev"]),
                 3000,
@@ -901,6 +817,8 @@ mod tests {
             FrameworkChoice::Disabled
         );
         assert!(FrameworkChoice::parse("angular").is_err());
+        assert!(FrameworkChoice::parse("next").is_err());
+        assert!(FrameworkChoice::parse("nitro").is_err());
     }
 
     #[test]
@@ -910,8 +828,8 @@ mod tests {
             Some("vite")
         );
         assert_eq!(
-            executable_name(OsStr::new("next.exe")).as_deref(),
-            Some("next")
+            executable_name(OsStr::new("astro.exe")).as_deref(),
+            Some("astro")
         );
     }
 }
