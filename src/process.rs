@@ -371,7 +371,22 @@ fn start_run_with_hook(
     })?;
 
     let argv = substitute_port(&config.command, port);
-    let environment = child_environment(port, config.bind_address, &config.hostname, config.tls);
+    let framework = config.framework.resolve(&argv);
+    let argv = match framework {
+        Some(framework) => framework.inject_argv(
+            argv,
+            port,
+            config.bind_address,
+            &config.hostname,
+            config.strict_port,
+        ),
+        None => argv,
+    };
+    let mut environment =
+        child_environment(port, config.bind_address, &config.hostname, config.tls).to_vec();
+    if let Some(framework) = framework {
+        environment.extend(framework.environment(port, config.bind_address, &config.hostname));
+    }
     let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
     if !conflicts.is_empty() {
         warnings.push(format!(
@@ -1632,6 +1647,80 @@ mod tests {
     }
 
     #[test]
+    fn framework_alignment_appends_flags_and_environment() {
+        let (store, path) = temporary_store();
+        let marker = path.parent().unwrap().join("argv.env");
+        let code = format!(
+            "import os,sys; open(r'{}','w').write('\\n'.join(sys.argv)+'\\n'+os.environ.get('__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS',''))",
+            marker.display()
+        );
+        let mut config = run_config(vec!["/usr/bin/python3", "-c", &code], 1);
+        config.framework =
+            crate::framework::FrameworkChoice::Forced(crate::framework::Framework::Vite);
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let _ = running.wait_for_readiness(&store, |_| {});
+        running.finish(&store, &mut routes).unwrap();
+        let dumped = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            dumped.contains("api.localhost"),
+            "forced Vite still injects allowed-hosts env: {dumped}"
+        );
+        assert!(
+            !dumped.contains("--host"),
+            "argv flags are not added unless the CLI is vite/nuxt/astro: {dumped}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn undetected_command_keeps_argv_and_base_environment() {
+        let (store, path) = temporary_store();
+        let marker = path.parent().unwrap().join("plain.env");
+        let code = format!(
+            "import os; keys=['PORT','HOST','NOOK_URL','NUXT_HOST','NUXT_PORT','NITRO_HOST','NITRO_PORT','HOSTNAME','__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS']; argv=[part.decode() for part in open('/proc/self/cmdline','rb').read().split(b'\\0') if part]; open(r'{}','w').write('\\n'.join(argv)+'\\n---\\n'+'\\n'.join(k+'='+os.environ.get(k,'') for k in keys))",
+            marker.display()
+        );
+        let mut config = run_config(vec!["/usr/bin/python3", "-c", &code, "--bind", "{port}"], 1);
+        config.framework = crate::framework::FrameworkChoice::Auto;
+        let mut routes = Routes::default();
+        let mut running = start_run(&config, &store, &mut routes).unwrap();
+        let port = running.port.to_string();
+        let _ = running.wait_for_readiness(&store, |_| {});
+        running.finish(&store, &mut routes).unwrap();
+        let dumped = std::fs::read_to_string(&marker).unwrap();
+        let (argv_dump, env_dump) = dumped.split_once("\n---\n").unwrap();
+        assert_eq!(
+            argv_dump.lines().collect::<Vec<_>>(),
+            vec![
+                "/usr/bin/python3",
+                "-c",
+                code.as_str(),
+                "--bind",
+                port.as_str()
+            ]
+        );
+        let values: std::collections::BTreeMap<_, _> = env_dump
+            .lines()
+            .map(|line| line.split_once('=').unwrap())
+            .collect();
+        assert_eq!(values["PORT"], port);
+        assert_eq!(values["HOST"], "127.0.0.1");
+        assert_eq!(values["NOOK_URL"], "https://api.localhost");
+        for key in [
+            "NUXT_HOST",
+            "NUXT_PORT",
+            "NITRO_HOST",
+            "NITRO_PORT",
+            "HOSTNAME",
+            "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS",
+        ] {
+            assert_eq!(values[key], std::env::var(key).unwrap_or_default());
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn child_runs_in_its_own_group_and_returns_its_exit_code() {
         let mut child = spawn_child(
             &[
@@ -1970,6 +2059,7 @@ mod tests {
             readiness_warn_after_seconds: readiness,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ignored_local_config: None,
+            framework: crate::framework::FrameworkChoice::Disabled,
         }
     }
 
