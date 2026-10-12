@@ -380,50 +380,11 @@ fn start_run_with_hook(
     let exposed = match exposure.expose(&operations, store, owner_id, &config.hostname, &target) {
         Ok(exposed) => exposed,
         Err(error) => {
-            for displaced in &displaced {
-                // The registry still records these owners, so a route that
-                // cannot be restored now is restored by the next reconciliation.
-                let _ = routes.ensure(&RouteSpec {
-                    replace_existing: true,
-                    ..displaced.clone()
-                });
-            }
-            abandon_route(store, routes, config, owner_id, operation_id)?;
+            abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
             return Err(error);
         }
     };
-    let cleanup_results: Vec<_> = conflicts
-        .iter()
-        .map(|(id, tls)| {
-            (
-                *id,
-                *tls,
-                routes.remove_if_owned(&config.hostname, *id, *tls),
-            )
-        })
-        .collect();
     store.mutate(|registry| {
-        let replaced_ids: std::collections::BTreeSet<_> =
-            conflicts.iter().map(|(id, _)| *id).collect();
-        registry
-            .aliases
-            .retain(|_, alias| !replaced_ids.contains(&alias.id));
-        registry.leases.retain(|id, _| !replaced_ids.contains(id));
-        registry.pending_operations.retain(|operation| {
-            pending_owner(&operation.kind).is_none_or(|id| !replaced_ids.contains(&id))
-        });
-        for (owner_id, tls, result) in &cleanup_results {
-            if result.is_err() {
-                registry.pending_operations.push(PendingOperation {
-                    id: Uuid::new_v4(),
-                    kind: PendingOperationKind::RemoveRoute {
-                        hostname: config.hostname.clone(),
-                        owner_id: *owner_id,
-                        tls: *tls,
-                    },
-                });
-            }
-        }
         replace_operation(
             registry,
             operation_id,
@@ -471,12 +432,6 @@ fn start_run_with_hook(
             config.hostname
         ));
     }
-    for (_, _, result) in &cleanup_results {
-        if let Err(error) = result {
-            warnings.push(format!("cleanup of the previous route is pending: {error}"));
-        }
-    }
-    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     reservation.release();
     after_release(port);
     let environment: Vec<_> = environment.into_iter().chain(exposed).collect();
@@ -484,11 +439,44 @@ fn start_run_with_hook(
         Ok(child) => child,
         Err(error) => {
             exposure.withdraw(&operations, store, owner_id);
-            abandon_route(store, routes, config, owner_id, operation_id)?;
+            abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
             return Err(error.into());
         }
     };
+    // Keep displaced owners recorded until spawn succeeds, so either startup
+    // failure can restore their routes without losing aliases or live leases.
+    let cleanup_results: Vec<_> = conflicts
+        .iter()
+        .map(|(id, tls)| {
+            (
+                *id,
+                *tls,
+                routes.remove_if_owned(&config.hostname, *id, *tls),
+            )
+        })
+        .collect();
     store.mutate(|registry| {
+        let replaced_ids: std::collections::BTreeSet<_> =
+            conflicts.iter().map(|(id, _)| *id).collect();
+        registry
+            .aliases
+            .retain(|_, alias| !replaced_ids.contains(&alias.id));
+        registry.leases.retain(|id, _| !replaced_ids.contains(id));
+        registry.pending_operations.retain(|operation| {
+            pending_owner(&operation.kind).is_none_or(|id| !replaced_ids.contains(&id))
+        });
+        for (owner_id, tls, result) in &cleanup_results {
+            if result.is_err() {
+                registry.pending_operations.push(PendingOperation {
+                    id: Uuid::new_v4(),
+                    kind: PendingOperationKind::RemoveRoute {
+                        hostname: config.hostname.clone(),
+                        owner_id: *owner_id,
+                        tls: *tls,
+                    },
+                });
+            }
+        }
         registry
             .pending_operations
             .retain(|operation| operation.id != operation_id);
@@ -508,6 +496,12 @@ fn start_run_with_hook(
         );
         Ok(())
     })?;
+    for (_, _, result) in &cleanup_results {
+        if let Err(error) = result {
+            warnings.push(format!("cleanup of the previous route is pending: {error}"));
+        }
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     Ok(RunningChild {
         child,
         lease_id: owner_id,
@@ -522,15 +516,24 @@ fn start_run_with_hook(
 }
 
 /// Removes the route of a run that will not start and drops its journal entry,
-/// queueing the removal when Caddy cannot be reached.
+/// queueing the removal when Caddy cannot be reached. Restores displaced routes.
 fn abandon_route(
     store: &Store,
     routes: &mut impl RouteBackend,
     config: &ResolvedRunConfig,
     owner_id: Uuid,
     operation_id: Uuid,
+    displaced: &[RouteSpec],
 ) -> Result<(), RunError> {
     let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
+    for route in displaced {
+        // The registry still records these owners, so failed restorations are
+        // retried by the next reconciliation.
+        let _ = routes.ensure(&RouteSpec {
+            replace_existing: true,
+            ..route.clone()
+        });
+    }
     store.mutate(|registry| {
         registry
             .pending_operations

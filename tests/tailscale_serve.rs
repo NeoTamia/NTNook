@@ -38,7 +38,7 @@ fn main() {
         .skip(1)
         .find(|argument| !argument.starts_with('-'))
         .cloned();
-    let scenarios: [(&str, fn()); 14] = [
+    let scenarios: [(&str, fn()); 15] = [
         (
             "missing_client_fails_before_spawn_without_changes",
             missing_client_fails_before_spawn_without_changes,
@@ -94,6 +94,10 @@ fn main() {
         (
             "exposed_frameworks_allow_the_tailnet_hostname",
             exposed_frameworks_allow_the_tailnet_hostname,
+        ),
+        (
+            "failed_forced_spawn_preserves_displaced_owners",
+            failed_forced_spawn_preserves_displaced_owners,
         ),
     ];
     let mut failed = Vec::new();
@@ -821,6 +825,74 @@ fn forced_exposed_run_withdraws_the_displaced_registration_before_exit() {
     assert!(during_run["TCP"].get("443").is_none(), "{during_run}");
     assert_eq!(during_run["TCP"]["8443"]["HTTPS"], true);
     assert_eq!(world.serve_config(), json!({}));
+}
+
+fn failed_forced_spawn_preserves_displaced_owners() {
+    for previous_is_run in [false, true] {
+        let world = World::new("failed-forced-spawn");
+        let marker = world.root.join("child.json");
+        let release = world.root.join("release");
+        let mut previous = if previous_is_run {
+            let child = world
+                .nook_command(&["run", "--tailscale", "--name", "api", "--"])
+                .args(world.child_arguments(&marker, 0, Some(&release)))
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            wait_for(Duration::from_secs(10), || {
+                world.registry_value()["leases"]
+                    .as_object()
+                    .is_some_and(|leases| leases.values().any(|lease| lease["state"] == "ready"))
+            });
+            Some(child)
+        } else {
+            let alias = world.nook(&["alias", "api", "3000", "--tailscale"]);
+            assert!(alias.status.success(), "{}", describe(&alias));
+            None
+        };
+        let before = world.registry_value();
+        let routes_before = world.caddy_routes();
+        let serve_before = world.serve_config();
+        let missing = world
+            .root
+            .join(format!("missing{}", env::consts::EXE_SUFFIX));
+        let failed = world
+            .nook_command(&["run", "--force", "--tailscale", "--name", "api", "--"])
+            .arg(missing)
+            .output()
+            .unwrap();
+        // Capture state before another command or the old run's exit can reconcile it.
+        let after = world.registry_value();
+        let routes_after = world.caddy_routes();
+        let serve_after = world.serve_config();
+        let previous_still_running = previous
+            .as_mut()
+            .is_none_or(|child| child.try_wait().unwrap().is_none());
+        if let Some(child) = previous {
+            File::create(&release).unwrap();
+            let output = wait_with_timeout(child, Duration::from_secs(10));
+            assert!(output.status.success(), "{}", describe(&output));
+        }
+        assert_eq!(failed.status.code(), Some(1), "{}", describe(&failed));
+        assert!(
+            world.serve_calls().iter().any(|call| {
+                call.get(1).map(String::as_str) == Some("--bg")
+                    && call.get(2).map(String::as_str) == Some("--https=8443")
+            }),
+            "the replacement must have been exposed before spawn failed"
+        );
+        assert!(previous_still_running);
+        assert_eq!(after["aliases"], before["aliases"]);
+        assert_eq!(after["leases"], before["leases"]);
+        assert_eq!(
+            after["tailscale"]["registrations"],
+            before["tailscale"]["registrations"]
+        );
+        assert_eq!(after["pending_operations"], json!([]));
+        assert_eq!(routes_after, routes_before);
+        assert_eq!(serve_after, serve_before);
+    }
 }
 
 fn exposed_frameworks_allow_the_tailnet_hostname() {
