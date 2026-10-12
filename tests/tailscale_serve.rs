@@ -38,7 +38,7 @@ fn main() {
         .skip(1)
         .find(|argument| !argument.starts_with('-'))
         .cloned();
-    let scenarios: [(&str, fn()); 10] = [
+    let scenarios: [(&str, fn()); 14] = [
         (
             "missing_client_fails_before_spawn_without_changes",
             missing_client_fails_before_spawn_without_changes,
@@ -78,6 +78,22 @@ fn main() {
         (
             "tailscale_down_up_defers_then_restores_without_taking_foreign_ports",
             tailscale_down_up_defers_then_restores_without_taking_foreign_ports,
+        ),
+        (
+            "cleanup_preserves_foreign_paths_on_the_same_port",
+            cleanup_preserves_foreign_paths_on_the_same_port,
+        ),
+        (
+            "reconciliation_withdraws_public_registrations",
+            reconciliation_withdraws_public_registrations,
+        ),
+        (
+            "forced_exposed_run_withdraws_the_displaced_registration_before_exit",
+            forced_exposed_run_withdraws_the_displaced_registration_before_exit,
+        ),
+        (
+            "exposed_frameworks_allow_the_tailnet_hostname",
+            exposed_frameworks_allow_the_tailnet_hostname,
         ),
     ];
     let mut failed = Vec::new();
@@ -699,6 +715,149 @@ fn tailscale_down_up_defers_then_restores_without_taking_foreign_ports() {
     assert_only_private_serve_commands(&world);
 }
 
+fn cleanup_preserves_foreign_paths_on_the_same_port() {
+    let world = World::new("shared-port");
+    assert!(
+        world
+            .nook(&["alias", "api", "3000", "--tailscale"])
+            .status
+            .success()
+    );
+    let foreign = json!({"Proxy": "http://127.0.0.1:9000"});
+    let host = format!("{DNS_NAME}:443");
+    world.update_tailscale(|state| {
+        state["serve"]["Web"][&host]["Handlers"]["/other"] = foreign.clone();
+    });
+    let remove = world.nook(&["alias", "remove", "api"]);
+    assert!(remove.status.success(), "{}", describe(&remove));
+    let serve = world.serve_config();
+    assert_eq!(serve["Web"][&host]["Handlers"]["/other"], foreign);
+    assert!(serve["Web"][&host]["Handlers"].get("/").is_none());
+    assert_eq!(serve["TCP"]["443"]["HTTPS"], true);
+    assert_only_private_serve_commands(&world);
+}
+
+fn reconciliation_withdraws_public_registrations() {
+    let world = World::new("public-drift");
+    assert!(
+        world
+            .nook(&["alias", "api", "3000", "--tailscale"])
+            .status
+            .success()
+    );
+    let host = format!("{DNS_NAME}:443");
+    let foreign = json!({"Proxy": "http://127.0.0.1:9000"});
+    world.update_tailscale(|state| {
+        state["serve"]["AllowFunnel"][&host] = json!(true);
+        state["serve"]["Web"][&host]["Handlers"]["/other"] = foreign.clone();
+        state["off_error"] = json!("Access denied");
+    });
+    let refused = world.nook(&["tailscale", "status"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", describe(&refused));
+    assert!(
+        stdout(&refused).contains("\tpublic\n"),
+        "{}",
+        describe(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("Funnel"),
+        "{}",
+        describe(&refused)
+    );
+
+    world.update_tailscale(|state| state["off_error"] = Value::Null);
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(status.status.success(), "{}", describe(&status));
+    assert!(stderr(&status).contains("Funnel"), "{}", describe(&status));
+    let serve = world.serve_config();
+    assert!(serve["Web"][&host]["Handlers"].get("/").is_none());
+    assert_eq!(serve["Web"][&host]["Handlers"]["/other"], foreign);
+    assert_eq!(
+        serve["AllowFunnel"][&host], true,
+        "foreign paths keep their policy"
+    );
+    assert!(
+        world.registry_value()["tailscale"]["registrations"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(world.nook(&["list"]).status.success());
+    assert_eq!(
+        world.serve_config(),
+        serve,
+        "the public registration is never restored"
+    );
+    assert_only_private_serve_commands(&world);
+}
+
+fn forced_exposed_run_withdraws_the_displaced_registration_before_exit() {
+    let world = World::new("forced-exposed");
+    assert!(
+        world
+            .nook(&["alias", "api", "3000", "--tailscale"])
+            .status
+            .success()
+    );
+    let marker = world.root.join("child.json");
+    let release = world.root.join("release");
+    let child = world
+        .nook_command(&["run", "--force", "--tailscale", "--name", "api", "--"])
+        .args(world.child_arguments(&marker, 0, Some(&release)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(Duration::from_secs(10), || marker.exists());
+    // Inspect without running another Nook command, which would itself clean up.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while world.serve_config()["TCP"].get("443").is_some() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let during_run = world.serve_config();
+    File::create(&release).unwrap();
+    let output = wait_with_timeout(child, Duration::from_secs(10));
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(during_run["TCP"].get("443").is_none(), "{during_run}");
+    assert_eq!(during_run["TCP"]["8443"]["HTTPS"], true);
+    assert_eq!(world.serve_config(), json!({}));
+}
+
+fn exposed_frameworks_allow_the_tailnet_hostname() {
+    let world = World::new("framework-hosts");
+    for framework in ["vite", "nuxt", "astro"] {
+        let program = world
+            .root
+            .join(format!("{framework}{}", env::consts::EXE_SUFFIX));
+        fs::copy(env::current_exe().unwrap(), &program).unwrap();
+        let marker = world.root.join(format!("{framework}.json"));
+        let mut arguments = world.child_arguments(&marker, 0, None);
+        arguments[0] = program.display().to_string();
+        arguments.push("dev".into());
+        let run = world
+            .nook_command(&["run", "--tailscale", "--name", "web", "--"])
+            .args(arguments)
+            .env_remove("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS")
+            .output()
+            .unwrap();
+        assert!(run.status.success(), "{}", describe(&run));
+        let observed = read_json(&marker);
+        assert_eq!(
+            observed["allowed_hosts"], DNS_NAME,
+            "{framework}: {observed}"
+        );
+        assert_eq!(observed["local_url"], "https://web.localhost");
+        if framework == "astro" {
+            let args = observed["argv"].as_array().unwrap();
+            let hosts = args
+                .iter()
+                .position(|arg| arg == "--allowed-hosts")
+                .unwrap();
+            assert_eq!(args[hosts + 1], DNS_NAME);
+        }
+    }
+}
+
 fn assert_only_private_serve_commands(world: &World) {
     for call in world.tailscale_calls() {
         let call: Vec<&str> = call.iter().map(String::as_str).collect();
@@ -711,7 +870,7 @@ fn assert_only_private_serve_commands(world: &World) {
                         || target.starts_with("https://127.0.0.1:")
                         || target.starts_with("https://localhost:"))
             }
-            ["serve", port, "off"] => port.starts_with("--https="),
+            ["serve", port, "--set-path=/", "off"] => port.starts_with("--https="),
             _ => false,
         };
         assert!(allowed, "Nook ran a forbidden Tailscale command: {call:?}");
@@ -980,7 +1139,13 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
                 json!({"Handlers": {"/": {"Proxy": target.trim_end_matches('/')}}});
             0
         }
-        ["serve", https, "off"] if https.starts_with("--https=") => {
+        ["serve", https, "off"] | ["serve", https, "--set-path=/", "off"]
+            if https.starts_with("--https=") =>
+        {
+            if let Some(message) = state["off_error"].as_str() {
+                eprintln!("{message}");
+                return 1;
+            }
             let port = &https["--https=".len()..];
             let host = format!("{dns_name}:{port}");
             let serve = state["serve"].as_object_mut().unwrap();
@@ -988,8 +1153,16 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
                 .get_mut("Web")
                 .and_then(|web| web.get_mut(&host))
                 .and_then(|entry| entry["Handlers"].as_object_mut())
-                .and_then(|handlers| handlers.remove("/"))
-                .is_some();
+                .is_some_and(|handlers| {
+                    if arguments.len() == 3 {
+                        // The real CLI removes every mount without --set-path.
+                        let removed = !handlers.is_empty();
+                        handlers.clear();
+                        removed
+                    } else {
+                        handlers.remove("/").is_some()
+                    }
+                });
             if !removed {
                 eprintln!("error: failed to remove web serve: handler does not exist");
                 return 1;
@@ -1035,6 +1208,9 @@ fn application_child(arguments: &[String]) -> i32 {
         &marker,
         &json!({
             "url": env::var("NOOK_TAILSCALE_URL").ok(),
+            "local_url": env::var("NOOK_URL").ok(),
+            "allowed_hosts": env::var("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS").ok(),
+            "argv": env::args().collect::<Vec<_>>(),
             "port": port,
             "serve": serve
         }),

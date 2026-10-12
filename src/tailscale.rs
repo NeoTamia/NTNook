@@ -3,7 +3,7 @@
 //! The module owns every interaction with the `tailscale` CLI. Nook only runs
 //! `tailscale version`, `tailscale status --json`, `tailscale serve status
 //! --json`, `tailscale serve --bg --https=<port> <target>`, and `tailscale serve
-//! --https=<port> off`. It never runs `serve reset`, `funnel`, `up`, `login`,
+//! --https=<port> --set-path=/ off`. It never runs `serve reset`, `funnel`, `up`, `login`,
 //! `set`, or `cert`, never changes ACLs or tailnet settings, and never elevates:
 //! the tailnet policy remains the only authorization source.
 //!
@@ -165,7 +165,7 @@ impl fmt::Display for Error {
             ),
             Self::FunnelEnabled(port) => write!(
                 formatter,
-                "port {port} is exposed through Tailscale Funnel; Nook only manages private Serve and removed its registration"
+                "port {port} is exposed through Tailscale Funnel; Nook only manages private Serve and refuses this public exposure"
             ),
             Self::State(error) => error.fmt(formatter),
         }
@@ -382,7 +382,11 @@ impl ServeConfig {
 
     fn observe(&self, dns_name: &str, port: u16, target: &str) -> Observation {
         if self.owns(dns_name, port, target) {
-            Observation::Owned
+            if self.funnel_enabled(port) {
+                Observation::Public
+            } else {
+                Observation::Owned
+            }
         } else if self.occupied_ports().contains(&port) {
             Observation::Foreign
         } else {
@@ -413,6 +417,7 @@ fn host_port(host: &str) -> Option<u16> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Observation {
     Owned,
+    Public,
     Absent,
     Foreign,
 }
@@ -436,6 +441,7 @@ enum Action {
 
 fn plan(owner: Owner, observation: Observation) -> Action {
     match (owner, observation) {
+        (_, Observation::Public) => Action::Remove,
         (Owner::Unknown, _) | (Owner::Alive, Observation::Owned) => Action::Keep,
         (Owner::Alive, Observation::Absent) => Action::Restore,
         (Owner::Alive, Observation::Foreign) => Action::Conflict,
@@ -644,7 +650,7 @@ impl Client {
     }
 
     fn serve_off(&self, port: u16) -> Result<(), Error> {
-        self.checked(&["serve", &format!("--https={port}"), "off"])
+        self.checked(&["serve", &format!("--https={port}"), "--set-path=/", "off"])
             .map(|_| ())
     }
 
@@ -826,7 +832,14 @@ impl Client {
         for (port, registration) in &registry.tailscale.registrations {
             let port = *port;
             let owner = owner_state(&registry, registration.owner_id, liveness);
-            match plan(owner, config.observe(dns_name, port, &registration.target)) {
+            let observation = config.observe(dns_name, port, &registration.target);
+            if observation == Observation::Public {
+                report.warnings.push(format!(
+                    "Tailscale Serve port {port} of {} is publicly exposed through Funnel; withdrawing Nook's root handler",
+                    registration.hostname
+                ));
+            }
+            match plan(owner, observation) {
                 Action::Keep => {}
                 Action::Restore => match self.serve_on(port, &registration.target) {
                     Ok(()) => report.restored += 1,

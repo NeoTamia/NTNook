@@ -1277,9 +1277,9 @@ fn run_command(
         {
             writeln!(errors, "warning: {warning}")?;
         }
-        // An exposed run already converged while registering; a local run
-        // must still withdraw the Serve registration of the owner it replaced.
-        if registration.is_none() && config.force {
+        // Registration happens before displaced owners leave the registry.
+        // Withdraw their Serve registrations once the replacement is recorded.
+        if config.force {
             for warning in converge_tailscale_now(&store) {
                 writeln!(errors, "warning: {warning}")?;
             }
@@ -1505,9 +1505,14 @@ fn tailscale_status_command(output: &mut impl Write, errors: &mut impl Write) ->
         output,
         "exposure\tprivate tailnet Serve only; Funnel is never used"
     )?;
+    let mut public_port = None;
     for observed in client.observe(&registry, &diagnosis) {
         let state = match observed.observation {
             Some(crate::tailscale::Observation::Owned) => "active",
+            Some(crate::tailscale::Observation::Public) => {
+                public_port.get_or_insert(observed.port);
+                "public"
+            }
             Some(crate::tailscale::Observation::Absent) => "missing",
             Some(crate::tailscale::Observation::Foreign) => "foreign",
             None => "pending",
@@ -1522,6 +1527,9 @@ fn tailscale_status_command(output: &mut impl Write, errors: &mut impl Write) ->
         )?;
     }
     diagnosis.result?;
+    if let Some(port) = public_port {
+        return Err(crate::tailscale::Error::FunnelEnabled(port).into());
+    }
     Ok(())
 }
 

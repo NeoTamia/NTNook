@@ -594,6 +594,10 @@ nook: domain=api.localhost url=https://api.localhost port=5173 tailscale_url=htt
 Nook removes an inherited `NOOK_TAILSCALE_URL` from every child it starts without exposure, for
 example a local run started from an exposed one.
 
+For detected Vite, Nuxt, and Astro dev servers, Nook also allows the exact tailnet hostname;
+the local `.localhost` URL keeps working. Explicit allowed-host settings and an inherited
+`__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` remain authoritative and must include that hostname.
+
 Nook also skips a port when a local server already accepts connections on it through one of the
 device's tailnet addresses, that is a server listening on the wildcard address (`*:443`,
 `0.0.0.0:443`, `[::]:443`) or directly on the tailnet IP. From this machine, such a server would
@@ -639,16 +643,19 @@ Safeguards:
   `Tailscale-User-*` identity headers set by Tailscale reach it unchanged. Aliases with any other
   upstream are refused with `--tailscale`;
 - only private Serve is used. Nook never runs `tailscale funnel`, and refuses to keep a
-  registration on a port that Funnel exposes;
+  registration on a port that Funnel exposes. If Funnel is enabled later, the next reconciliation
+  withdraws Nook's root handler and forgets its registration, without restoring it automatically;
 - Nook only runs `tailscale version`, `status --json`, `serve status --json`,
-  `serve --bg --https=<port> <target>`, and `serve --https=<port> off`. It never runs
+  `serve --bg --https=<port> <target>`, and `serve --https=<port> --set-path=/ off`. It never runs
   `serve reset`, `up`, `login`, `set`, or `cert`, never changes ACLs or tailnet settings, and never
   elevates. The tailnet policy remains the only authorization source;
-- a port is removed only when its root still proxies to the upstream Nook recorded. A
+- only the root handler is removed, and only when it still proxies to the upstream Nook recorded;
+  other paths on the same port are preserved. A
   registration replaced by someone else is reported and left untouched.
 
 `nook tailscale status` checks the client, `tailscaled`, the login state, HTTPS, and the device
-name, then lists each Nook registration as `active`, `missing`, `foreign`, or `pending`. It
+name, then lists each Nook registration as `active`, `missing`, `foreign`, or `pending`. A public
+registration that cannot be withdrawn is reported as `public` and makes the command fail. It
 reconciles Tailscale registrations first but does not need Caddy, and exits with status `1` when
 Serve cannot be used.
 

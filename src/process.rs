@@ -440,12 +440,21 @@ fn start_run_with_hook(
 
     let argv = substitute_port(&config.command, port);
     let framework = config.framework.resolve(&argv);
+    let tailscale_hostname = exposed
+        .iter()
+        .find(|(name, _)| name == crate::tailscale::URL_VARIABLE)
+        .and_then(|(_, value)| value.to_str())
+        .and_then(|value| url::Url::parse(value).ok())
+        .and_then(|url| url.host_str().map(str::to_owned));
+    // Vite-based servers already allow *.localhost. Add the exact tailnet
+    // host for Serve, which preserves the incoming Host header.
+    let allowed_hostname = tailscale_hostname.as_deref().unwrap_or(&config.hostname);
     let argv = match framework {
         Some(framework) => framework.inject_argv(
             argv,
             port,
             config.bind_address,
-            &config.hostname,
+            allowed_hostname,
             config.strict_port,
         ),
         None => argv,
@@ -453,7 +462,7 @@ fn start_run_with_hook(
     let mut environment =
         child_environment(port, config.bind_address, &config.hostname, config.tls).to_vec();
     if let Some(framework) = framework {
-        environment.extend(framework.environment(port, config.bind_address, &config.hostname));
+        environment.extend(framework.environment(port, config.bind_address, allowed_hostname));
     }
     let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
     if !conflicts.is_empty() {
