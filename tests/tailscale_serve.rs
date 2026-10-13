@@ -38,7 +38,7 @@ fn main() {
         .skip(1)
         .find(|argument| !argument.starts_with('-'))
         .cloned();
-    let scenarios: [(&str, fn()); 15] = [
+    let scenarios: [(&str, fn()); 16] = [
         (
             "missing_client_fails_before_spawn_without_changes",
             missing_client_fails_before_spawn_without_changes,
@@ -86,6 +86,10 @@ fn main() {
         (
             "reconciliation_withdraws_public_registrations",
             reconciliation_withdraws_public_registrations,
+        ),
+        (
+            "foreground_funnel_is_reported_until_the_external_session_stops",
+            foreground_funnel_is_reported_until_the_external_session_stops,
         ),
         (
             "forced_exposed_run_withdraws_the_displaced_registration_before_exit",
@@ -793,6 +797,98 @@ fn reconciliation_withdraws_public_registrations() {
         "the public registration is never restored"
     );
     assert_only_private_serve_commands(&world);
+}
+
+fn foreground_funnel_is_reported_until_the_external_session_stops() {
+    let world = World::new("foreground-funnel");
+    assert!(
+        world
+            .nook(&["alias", "api", "3000", "--tailscale"])
+            .status
+            .success()
+    );
+    let background = world.serve_config();
+    let registrations = world.registry_value()["tailscale"]["registrations"].clone();
+    let host = format!("{DNS_NAME}:443");
+    let mut foreground = background.clone();
+    foreground["AllowFunnel"][&host] = json!(true);
+    world.update_tailscale(|state| {
+        state["serve"]["Foreground"]["external-session"] = foreground;
+    });
+    let public = world.serve_config();
+    for _ in 0..2 {
+        let status = world.nook(&["tailscale", "status"]);
+        assert_eq!(status.status.code(), Some(1), "{}", describe(&status));
+        assert!(
+            stdout(&status).contains("\tpublic\n"),
+            "{}",
+            describe(&status)
+        );
+        assert!(
+            stderr(&status).contains("foreground"),
+            "{}",
+            describe(&status)
+        );
+        assert_eq!(
+            world.serve_config(),
+            public,
+            "external sessions are left untouched"
+        );
+        assert_eq!(
+            world.registry_value()["tailscale"]["registrations"],
+            registrations
+        );
+    }
+    // Removing the background handler cannot remove the foreground exposure.
+    world.update_tailscale(|state| {
+        state["serve"]["TCP"] = json!({});
+        state["serve"]["Web"] = json!({});
+    });
+    let status = world.nook(&["tailscale", "status"]);
+    assert_eq!(status.status.code(), Some(1), "{}", describe(&status));
+    assert!(
+        stdout(&status).contains("\tpublic\n"),
+        "{}",
+        describe(&status)
+    );
+    assert_eq!(
+        world.registry_value()["tailscale"]["registrations"],
+        registrations
+    );
+
+    // A private foreground handler also overrides the background handler.
+    world.update_tailscale(|state| {
+        state["serve"] = public.clone();
+        state["serve"]["Foreground"]["external-session"]["AllowFunnel"] = json!({});
+        state["serve"]["Foreground"]["external-session"]["Web"][&host]["Handlers"]["/"]["Proxy"] =
+            json!("http://127.0.0.1:9000");
+    });
+    let private = world.serve_config();
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(
+        stdout(&status).contains("\tforeign\n"),
+        "{}",
+        describe(&status)
+    );
+    assert_eq!(world.serve_config(), private);
+
+    world.update_tailscale(|state| state["serve"] = background.clone());
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(status.status.success(), "{}", describe(&status));
+    assert!(
+        stdout(&status).contains("\tactive\n"),
+        "{}",
+        describe(&status)
+    );
+    assert_eq!(world.serve_config(), background);
+
+    // Removing the alias must also remove its hidden background handler.
+    world.update_tailscale(|state| state["serve"] = private.clone());
+    let removed = world.nook(&["alias", "remove", "api"]);
+    assert!(removed.status.success(), "{}", describe(&removed));
+    let remaining = world.serve_config();
+    assert_eq!(remaining["Foreground"], private["Foreground"]);
+    assert!(remaining["Web"][&host]["Handlers"].get("/").is_none());
 }
 
 fn forced_exposed_run_withdraws_the_displaced_registration_before_exit() {

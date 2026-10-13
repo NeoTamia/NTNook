@@ -354,6 +354,7 @@ impl ServeConfig {
         ports
     }
 
+    // Only background handlers can be removed by Nook's `serve off` command.
     fn owns(&self, dns_name: &str, port: u16, target: &str) -> bool {
         let https = self
             .0
@@ -370,17 +371,46 @@ impl ServeConfig {
     }
 
     fn funnel_enabled(&self, port: u16) -> bool {
+        fn enabled(config: &Value, port: u16) -> bool {
+            config
+                .get("AllowFunnel")
+                .and_then(Value::as_object)
+                .is_some_and(|hosts| {
+                    hosts.iter().any(|(host, enabled)| {
+                        enabled.as_bool() == Some(true) && host_port(host) == Some(port)
+                    })
+                })
+                || config
+                    .get("Foreground")
+                    .and_then(Value::as_object)
+                    .is_some_and(|sessions| sessions.values().any(|session| enabled(session, port)))
+        }
+        enabled(&self.0, port)
+    }
+
+    fn foreground_uses_port(&self, port: u16) -> bool {
         self.0
-            .get("AllowFunnel")
+            .get("Foreground")
             .and_then(Value::as_object)
-            .is_some_and(|hosts| {
-                hosts.iter().any(|(host, enabled)| {
-                    enabled.as_bool() == Some(true) && host_port(host) == Some(port)
+            .is_some_and(|sessions| {
+                sessions.values().any(|session| {
+                    let mut ports = BTreeSet::new();
+                    collect_ports(session, &mut ports);
+                    ports.contains(&port)
                 })
             })
     }
 
     fn observe(&self, dns_name: &str, port: u16, target: &str) -> Observation {
+        // Foreground sessions override background handlers but belong to the
+        // external CLI session. `serve off` cannot withdraw them.
+        if self.foreground_uses_port(port) {
+            return if self.funnel_enabled(port) {
+                Observation::Public
+            } else {
+                Observation::Foreign
+            };
+        }
         if self.owns(dns_name, port, target) {
             if self.funnel_enabled(port) {
                 Observation::Public
@@ -711,7 +741,7 @@ impl Client {
             let config = self.serve_config()?;
             if config.funnel_enabled(port) {
                 Err(Error::FunnelEnabled(port))
-            } else if config.owns(&dns_name, port, &target) {
+            } else if config.observe(&dns_name, port, &target) == Observation::Owned {
                 Ok(())
             } else {
                 Err(Error::Unconfirmed(port))
@@ -834,12 +864,29 @@ impl Client {
             let owner = owner_state(&registry, registration.owner_id, liveness);
             let observation = config.observe(dns_name, port, &registration.target);
             if observation == Observation::Public {
+                if config.foreground_uses_port(port) {
+                    report.warnings.push(format!(
+                        "Tailscale Serve port {port} of {} is publicly exposed through Funnel in a foreground configuration; stop the external foreground session to restore private Serve; Nook left it untouched",
+                        registration.hostname
+                    ));
+                    continue;
+                }
                 report.warnings.push(format!(
                     "Tailscale Serve port {port} of {} is publicly exposed through Funnel; withdrawing Nook's root handler",
                     registration.hostname
                 ));
             }
-            match plan(owner, observation) {
+            let action = plan(owner, observation);
+            // A foreign foreground session can hide our background handler.
+            // Remove that handler when its owner is gone, leaving the session intact.
+            let action = if action == Action::ForgetForeign
+                && config.owns(dns_name, port, &registration.target)
+            {
+                Action::Remove
+            } else {
+                action
+            };
+            match action {
                 Action::Keep => {}
                 Action::Restore => match self.serve_on(port, &registration.target) {
                     Ok(()) => report.restored += 1,
@@ -1271,11 +1318,19 @@ mod tests {
 
     #[test]
     fn funnel_is_detected_per_port() {
-        let config = ServeConfig(
-            json!({"AllowFunnel": {"host.ts.net:443": true, "host.ts.net:8443": false}}),
-        );
+        let config = ServeConfig(json!({
+            "AllowFunnel": {"host.ts.net:443": true, "host.ts.net:8443": false},
+            "Foreground": {"session": {
+                "AllowFunnel": {"host.ts.net:8444": true},
+                "Foreground": {"nested": {"AllowFunnel": {"host.ts.net:8445": true}}}
+            }},
+            "Services": {"svc:other": {"AllowFunnel": {"host.ts.net:8443": true}}}
+        }));
         assert!(config.funnel_enabled(443));
         assert!(!config.funnel_enabled(8443));
+        assert!(config.funnel_enabled(8444));
+        assert!(config.funnel_enabled(8445));
+        assert!(!config.funnel_enabled(8446));
     }
 
     #[test]

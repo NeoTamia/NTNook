@@ -642,9 +642,12 @@ Safeguards:
 - Serve proxies straight to the loopback application (`127.0.0.1` or `localhost`), so the
   `Tailscale-User-*` identity headers set by Tailscale reach it unchanged. Aliases with any other
   upstream are refused with `--tailscale`;
-- only private Serve is used. Nook never runs `tailscale funnel`, and refuses to keep a
-  registration on a port that Funnel exposes. If Funnel is enabled later, the next reconciliation
-  withdraws Nook's root handler and forgets its registration, without restoring it automatically;
+- only private Serve is used. Nook never runs `tailscale funnel`, and refuses to keep an
+  active registration on a port that Funnel exposes. If Funnel is enabled later in the background,
+  the next reconciliation withdraws Nook's root handler and forgets its registration, without
+  restoring it automatically. Foreground sessions belong to their external caller and cannot be
+  withdrawn with `serve off`: Nook warns, keeps tracking the registration, and `tailscale status`
+  fails with a `public` state until the external session is stopped or Funnel is disabled;
 - Nook only runs `tailscale version`, `status --json`, `serve status --json`,
   `serve --bg --https=<port> <target>`, and `serve --https=<port> --set-path=/ off`. It never runs
   `serve reset`, `up`, `login`, `set`, or `cert`, never changes ACLs or tailnet settings, and never
