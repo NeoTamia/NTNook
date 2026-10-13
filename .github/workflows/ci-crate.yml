@@ -40,7 +40,7 @@ env:
 
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
 
     steps:
@@ -147,7 +147,7 @@ jobs:
           if ($errors.Count -gt 0) { throw ($errors | Out-String) }
 
   docker:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
 
     steps:
