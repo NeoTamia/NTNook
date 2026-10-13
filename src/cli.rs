@@ -1527,6 +1527,9 @@ fn tailscale_status_command(output: &mut impl Write, errors: &mut impl Write) ->
         )?;
     }
     diagnosis.result?;
+    if let Some(dns_name) = diagnosis.dns_name.as_deref() {
+        crate::tailscale::check_identity(&registry, dns_name)?;
+    }
     if let Some(port) = public_port {
         return Err(crate::tailscale::Error::FunnelEnabled(port).into());
     }

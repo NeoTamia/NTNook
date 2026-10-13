@@ -635,7 +635,12 @@ Lifecycle:
   ```
 
 - while Tailscale is stopped or unreachable, registrations are kept and reported as pending;
-  after `tailscale up` (or a manual Serve reset) the next command restores them on the same port.
+  after `tailscale up` (or a manual Serve reset) the next command restores them on the same port;
+- registrations stay bound to the device's recorded MagicDNS name. If it changes after an account
+  switch or device rename, Nook defers restoration and cleanup, refuses new exposure while old
+  registrations remain, and `nook tailscale status` fails. Returning to the original identity
+  resumes reconciliation. Remove existing exposures before switching or renaming if you intend
+  to publish services under the new identity.
 
 Safeguards:
 
@@ -647,7 +652,9 @@ Safeguards:
   the next reconciliation withdraws Nook's root handler and forgets its registration, without
   restoring it automatically. Foreground sessions belong to their external caller and cannot be
   withdrawn with `serve off`: Nook warns, keeps tracking the registration, and `tailscale status`
-  fails with a `public` state until the external session is stopped or Funnel is disabled;
+  fails with a `public` state until the external session is stopped or Funnel is disabled.
+  If the alias is removed or its run ends, Nook removes its own background handler so it cannot
+  resume serving after that session ends, while leaving the external session untouched;
 - Nook only runs `tailscale version`, `status --json`, `serve status --json`,
   `serve --bg --https=<port> <target>`, and `serve --https=<port> --set-path=/ off`. It never runs
   `serve reset`, `up`, `login`, `set`, or `cert`, never changes ACLs or tailnet settings, and never

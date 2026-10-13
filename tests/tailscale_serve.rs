@@ -38,7 +38,7 @@ fn main() {
         .skip(1)
         .find(|argument| !argument.starts_with('-'))
         .cloned();
-    let scenarios: [(&str, fn()); 16] = [
+    let scenarios: [(&str, fn()); 18] = [
         (
             "missing_client_fails_before_spawn_without_changes",
             missing_client_fails_before_spawn_without_changes,
@@ -78,6 +78,14 @@ fn main() {
         (
             "tailscale_down_up_defers_then_restores_without_taking_foreign_ports",
             tailscale_down_up_defers_then_restores_without_taking_foreign_ports,
+        ),
+        (
+            "tailnet_switch_defers_existing_registrations_until_the_original_identity_returns",
+            tailnet_switch_defers_existing_registrations_until_the_original_identity_returns,
+        ),
+        (
+            "tailnet_switch_defers_run_cleanup_without_touching_the_new_profile",
+            tailnet_switch_defers_run_cleanup_without_touching_the_new_profile,
         ),
         (
             "cleanup_preserves_foreign_paths_on_the_same_port",
@@ -723,6 +731,101 @@ fn tailscale_down_up_defers_then_restores_without_taking_foreign_ports() {
     assert_only_private_serve_commands(&world);
 }
 
+fn tailnet_switch_defers_existing_registrations_until_the_original_identity_returns() {
+    let world = World::new("tailnet-switch");
+    assert!(
+        world
+            .nook(&["alias", "api", "3000", "--tailscale"])
+            .status
+            .success()
+    );
+    let registered = world.serve_config();
+    let original = world.registry_value()["tailscale"].clone();
+    world.update_tailscale(|state| {
+        state["dns_name"] = json!("other.personal.ts.net.");
+        state["serve"] = json!({});
+    });
+    for command in [vec!["list"], vec!["prune"], vec!["tailscale", "status"]] {
+        let output = world.nook(&command);
+        assert_eq!(world.serve_config(), json!({}), "{}", describe(&output));
+        assert!(
+            stderr(&output).contains("identity changed"),
+            "{}",
+            describe(&output)
+        );
+        assert_eq!(world.registry_value()["tailscale"], original);
+        if command[0] == "tailscale" {
+            assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+            assert!(!stdout(&output).contains("\tactive\n"));
+        }
+    }
+    // An explicit new registration must not rebind all existing owners.
+    let refused = world.nook(&["alias", "other", "3001", "--tailscale"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", describe(&refused));
+    assert_eq!(world.serve_config(), json!({}));
+    assert_eq!(world.registry_value()["tailscale"], original);
+    assert!(
+        world.registry_value()["aliases"]
+            .get("other.localhost")
+            .is_none()
+    );
+
+    world.update_tailscale(|state| state["dns_name"] = json!(format!("{DNS_NAME}.")));
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(status.status.success(), "{}", describe(&status));
+    assert_eq!(world.serve_config(), registered);
+}
+
+fn tailnet_switch_defers_run_cleanup_without_touching_the_new_profile() {
+    let world = World::new("tailnet-switch-run");
+    let marker = world.root.join("child.json");
+    let release = world.root.join("release");
+    let child = world
+        .nook_command(&["run", "--tailscale", "--name", "api", "--"])
+        .args(world.child_arguments(&marker, 0, Some(&release)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(Duration::from_secs(10), || {
+        world.registry_value()["leases"]
+            .as_object()
+            .is_some_and(|leases| leases.values().any(|lease| lease["state"] == "ready"))
+    });
+    let original = world.registry_value()["tailscale"].clone();
+    let registered = world.serve_config();
+    // Even a coincidentally matching handler in another profile is not ours.
+    world.update_tailscale(|state| state["dns_name"] = json!("other.personal.ts.net."));
+    File::create(&release).unwrap();
+    let output = wait_with_timeout(child, Duration::from_secs(10));
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(
+        stderr(&output).contains("identity changed"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(world.serve_config(), registered);
+    assert_eq!(world.registry_value()["tailscale"], original);
+
+    world.update_tailscale(|state| state["dns_name"] = json!(format!("{DNS_NAME}.")));
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(status.status.success(), "{}", describe(&status));
+    assert_eq!(world.serve_config(), json!({}));
+    assert_eq!(
+        world.registry_value()["tailscale"]["registrations"],
+        json!({})
+    );
+
+    // With no old registrations left, an explicit opt-in can use a new identity.
+    world.update_tailscale(|state| state["dns_name"] = json!("other.personal.ts.net."));
+    let alias = world.nook(&["alias", "other", "3001", "--tailscale"]);
+    assert!(alias.status.success(), "{}", describe(&alias));
+    assert_eq!(
+        world.registry_value()["tailscale"]["dns_name"],
+        "other.personal.ts.net"
+    );
+}
+
 fn cleanup_preserves_foreign_paths_on_the_same_port() {
     let world = World::new("shared-port");
     assert!(
@@ -882,10 +985,41 @@ fn foreground_funnel_is_reported_until_the_external_session_stops() {
     );
     assert_eq!(world.serve_config(), background);
 
-    // Removing the alias must also remove its hidden background handler.
-    world.update_tailscale(|state| state["serve"] = private.clone());
+    // Removing the alias must also remove its hidden background handler, even
+    // when the external session is public. Keep reporting that external exposure.
+    world.update_tailscale(|state| state["serve"] = public.clone());
     let removed = world.nook(&["alias", "remove", "api"]);
     assert!(removed.status.success(), "{}", describe(&removed));
+    let remaining = world.serve_config();
+    assert_eq!(remaining["Foreground"], public["Foreground"]);
+    assert!(remaining["Web"][&host]["Handlers"].get("/").is_none());
+    let status = world.nook(&["tailscale", "status"]);
+    assert_eq!(status.status.code(), Some(1), "{}", describe(&status));
+    assert!(stdout(&status).contains("\tpublic\n"));
+    // Once the external session stops, no route may resume serving the removed alias.
+    world.update_tailscale(|state| {
+        state["serve"].as_object_mut().unwrap().remove("Foreground");
+    });
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(status.status.success(), "{}", describe(&status));
+    assert!(
+        world.serve_config()["Web"][&host]["Handlers"]
+            .get("/")
+            .is_none()
+    );
+    assert_eq!(
+        world.registry_value()["tailscale"]["registrations"],
+        json!({})
+    );
+    // Private foreground overrides must retain the same cleanup behavior.
+    assert!(
+        world
+            .nook(&["alias", "api", "3000", "--tailscale"])
+            .status
+            .success()
+    );
+    world.update_tailscale(|state| state["serve"] = private.clone());
+    assert!(world.nook(&["alias", "remove", "api"]).status.success());
     let remaining = world.serve_config();
     assert_eq!(remaining["Foreground"], private["Foreground"]);
     assert!(remaining["Web"][&host]["Handlers"].get("/").is_none());

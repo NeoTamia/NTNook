@@ -56,6 +56,10 @@ pub(crate) enum Error {
     },
     HttpsDisabled,
     MissingDnsName,
+    IdentityChanged {
+        recorded: String,
+        current: String,
+    },
     AccessDenied(String),
     Command {
         command: String,
@@ -131,6 +135,10 @@ impl fmt::Display for Error {
             Self::MissingDnsName => write!(
                 formatter,
                 "Tailscale reports no MagicDNS name for this device; enable MagicDNS at {HTTPS_SETTINGS_URL}"
+            ),
+            Self::IdentityChanged { recorded, current } => write!(
+                formatter,
+                "Tailscale identity changed from {recorded} to {current}; existing Serve registrations are pending and unchanged; switch back to the original Tailscale account/device identity before managing them"
             ),
             Self::AccessDenied(message) => write!(
                 formatter,
@@ -322,6 +330,24 @@ struct DeviceJson {
     dns_name: String,
     #[serde(rename = "TailscaleIPs", default)]
     tailscale_ips: Option<Vec<String>>,
+}
+
+/// Registrations belong to the device identity that originally published them.
+/// Refuse to migrate them implicitly, including after a device rename.
+pub(crate) fn check_identity(registry: &Registry, dns_name: &str) -> Result<(), Error> {
+    if !registry.tailscale.registrations.is_empty()
+        && registry.tailscale.dns_name.as_deref() != Some(dns_name)
+    {
+        return Err(Error::IdentityChanged {
+            recorded: registry
+                .tailscale
+                .dns_name
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
+            current: dns_name.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Diagnosis of the local Tailscale installation, filled as far as the checks
@@ -809,6 +835,9 @@ impl Client {
         else {
             return Ok(());
         };
+        // Cleanup must not forget an old-profile registration while inspecting
+        // the active profile's unrelated Serve configuration.
+        check_identity(&registry, &self.diagnose().ready_dns_name()?)?;
         if self
             .serve_config()?
             .owns(dns_name, port, &registration.target)
@@ -857,6 +886,7 @@ impl Client {
         liveness: &mut impl FnMut(&Lease) -> Liveness,
     ) -> Result<Report, Error> {
         let registry = store.load()?;
+        check_identity(&registry, dns_name)?;
         let mut report = Report::default();
         let mut forgotten = Vec::new();
         for (port, registration) in &registry.tailscale.registrations {
@@ -866,9 +896,19 @@ impl Client {
             if observation == Observation::Public {
                 if config.foreground_uses_port(port) {
                     report.warnings.push(format!(
-                        "Tailscale Serve port {port} of {} is publicly exposed through Funnel in a foreground configuration; stop the external foreground session to restore private Serve; Nook left it untouched",
+                        "Tailscale Serve port {port} of {} is publicly exposed through Funnel in a foreground configuration; stop the external foreground session; Nook left that session untouched",
                         registration.hostname
                     ));
+                    if owner == Owner::Gone && config.owns(dns_name, port, &registration.target) {
+                        // Retain the registration to report the external public
+                        // session, but prevent our hidden handler from resuming.
+                        if let Err(error) = self.serve_off(port) {
+                            report.warnings.push(format!(
+                                "Tailscale Serve cleanup of port {port} for {} is pending: {error}",
+                                registration.hostname
+                            ));
+                        }
+                    }
                     continue;
                 }
                 report.warnings.push(format!(
@@ -950,9 +990,10 @@ impl Client {
             .result
             .as_ref()
             .ok()
-            .and(diagnosis.dns_name.as_deref());
+            .and(diagnosis.dns_name.as_deref())
+            .filter(|dns_name| check_identity(registry, dns_name).is_ok());
         let config = ready_dns_name.and_then(|_| self.serve_config().ok());
-        let dns_name = ready_dns_name.or(registry.tailscale.dns_name.as_deref());
+        let dns_name = registry.tailscale.dns_name.as_deref().or(ready_dns_name);
         registry
             .tailscale
             .registrations
