@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -76,6 +77,9 @@ pub(crate) struct InitArgs {
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Application bind IP address, also injected as HOST.
+    #[arg(long, value_name = "IP")]
+    pub(crate) run_bind_address: Option<IpAddr>,
     /// Preferred application port.
     #[arg(long, value_name = "PORT")]
     pub(crate) app_port: Option<u16>,
@@ -85,6 +89,9 @@ pub(crate) struct InitArgs {
     /// Seconds before warning that the application is not ready.
     #[arg(long, value_name = "SECONDS")]
     pub(crate) readiness_warn_after: Option<u64>,
+    /// Align Vite, Nuxt, or Astro when the child argv is that CLI.
+    #[arg(long, value_name = "NAME", value_parser = ["vite", "nuxt", "astro", "none"])]
+    pub(crate) framework: Option<String>,
     /// Child argv to store in the project configuration.
     #[arg(last = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
@@ -187,6 +194,9 @@ pub(crate) struct RunArgs {
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Application bind IP address, also injected as HOST.
+    #[arg(long, value_name = "IP")]
+    pub(crate) run_bind_address: Option<IpAddr>,
     /// Preferred application port.
     #[arg(long, value_name = "PORT")]
     pub(crate) app_port: Option<u16>,
@@ -205,6 +215,12 @@ pub(crate) struct RunArgs {
     /// Seconds before warning that the application is not ready.
     #[arg(long, value_name = "SECONDS")]
     pub(crate) readiness_warn_after: Option<u64>,
+    /// Align Vite, Nuxt, or Astro when the child argv is that CLI.
+    #[arg(long, value_name = "NAME", value_parser = ["vite", "nuxt", "astro", "none"])]
+    pub(crate) framework: Option<String>,
+    /// Do not detect or inject framework host and port flags.
+    #[arg(long, conflicts_with = "framework")]
+    pub(crate) no_framework: bool,
     /// Child argv, preserved exactly and never passed through a shell.
     #[arg(last = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
@@ -437,9 +453,21 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
             "# Delay before the readiness warning.\n# readiness_warn_after_seconds = 30\n",
         ),
     }
+    contents.push_str("\n# Interface used to bind the application and injected as HOST.\n");
+    match arguments.run_bind_address {
+        Some(address) => contents.push_str(&format!(
+            "run_bind_address = {}\n",
+            toml_string(&address.to_string())
+        )),
+        None => contents.push_str("# run_bind_address = \"127.0.0.1\"\n"),
+    }
     contents.push_str(
-        "\n# Interface used to bind the application and injected as HOST.\n# run_bind_address = \"127.0.0.1\"\n",
+        "\n# Align Vite/Nuxt/Astro when the command is that CLI. Use \"none\" to disable.\n",
     );
+    match arguments.framework.as_deref() {
+        Some(framework) => contents.push_str(&format!("framework = {}\n", toml_string(framework))),
+        None => contents.push_str("# framework = \"vite\"\n"),
+    }
     Ok(contents)
 }
 
@@ -1730,6 +1758,30 @@ mod tests {
     }
 
     #[test]
+    fn bind_address_accepts_ip_addresses_and_rejects_invalid_values() {
+        for command in ["run", "init"] {
+            for address in ["127.0.0.2", "0.0.0.0", "::1", "::"] {
+                let cli = try_parse(&[command, "--run-bind-address", address]).unwrap();
+                let parsed = match cli.command {
+                    Command::Run(args) => args.run_bind_address,
+                    Command::Init(args) => args.run_bind_address,
+                    _ => unreachable!(),
+                };
+                assert_eq!(parsed, Some(address.parse().unwrap()));
+            }
+            for address in ["localhost", "127.0.0.1:3000", "invalid"] {
+                assert_eq!(
+                    try_parse(&[command, "--run-bind-address", address])
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::ValueValidation
+                );
+            }
+            assert!(try_parse(&[command, "--run-bind-address"]).is_err());
+        }
+    }
+
+    #[test]
     fn parses_run_with_name_option() {
         let cli = parse(&["run", "--name", "api", "--", "server", "--flag"]);
         let Command::Run(run) = cli.command else {
@@ -1737,6 +1789,35 @@ mod tests {
         };
         assert_eq!(run.name.as_deref(), Some("api"));
         assert_eq!(run.command, ["server", "--flag"]);
+    }
+
+    #[test]
+    fn parses_framework_options_and_rejects_conflicts() {
+        let cli = parse(&["run", "--framework", "astro", "--", "astro", "dev"]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(run.framework.as_deref(), Some("astro"));
+        assert!(!run.no_framework);
+        assert!(try_parse(&["run", "--framework", "angular", "--", "ng", "serve"]).is_err());
+        for arguments in [
+            ["run", "--framework", "vite", "--no-framework", "--", "vite"].as_slice(),
+            [
+                "run",
+                "--no-framework",
+                "--framework",
+                "nuxt",
+                "--",
+                "nuxt",
+                "dev",
+            ]
+            .as_slice(),
+        ] {
+            assert_eq!(
+                try_parse(arguments).unwrap_err().kind(),
+                ErrorKind::ArgumentConflict
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.8.0](https://github.com/NeoTamia/NTNook/compare/v0.7.0...v0.8.0) (2026-10-12)
+
+
+### ✨ Features
+
+* **cli:** Add run bind address option ([fea4575](https://github.com/NeoTamia/NTNook/commit/fea45751d747a2d7473304bab754432648952e14))
+* **run:** Align vite nuxt next nitro and astro ([b4657d6](https://github.com/NeoTamia/NTNook/commit/b4657d6075db30369573c81cd04d5d8178aff3d0))
+
+
+### 🐛 Bug Fixes
+
+* **run:** Align Astro host and focus framework support ([0dc6275](https://github.com/NeoTamia/NTNook/commit/0dc6275d19aaa79a8aade6a6b7afec2e9e7fb82e))
+* **run:** Align only serving commands and keep npm -- ([1cc3f60](https://github.com/NeoTamia/NTNook/commit/1cc3f60bafcbacf02f92941a141b9045dd6daeb3))
+* **run:** Classify servers like portless ([fc4e4b7](https://github.com/NeoTamia/NTNook/commit/fc4e4b74f91491bc9880a26a9fad7a1ee2e66e5f))
+* **run:** Detect frameworks from executable positions only ([f40682f](https://github.com/NeoTamia/NTNook/commit/f40682fc881c71ef2ab86ad311f636337cddb011))
+* **run:** Detect versioned packages and workspace scripts ([7b5e64b](https://github.com/NeoTamia/NTNook/commit/7b5e64b8abe6ea87b85e1f0614eb43f45bb869e5))
+* **run:** Drop duplicate test attribute ([4e0a964](https://github.com/NeoTamia/NTNook/commit/4e0a964129536b947c3f19ac1d507a3c34cd4070))
+* **run:** Drop npm exec -- rewriting ([c04f0d2](https://github.com/NeoTamia/NTNook/commit/c04f0d2a8b904100b98916e016a7a1825eafadeb))
+* **run:** Drop the leftover npm exec -- ([50afbb1](https://github.com/NeoTamia/NTNook/commit/50afbb18a55d14cb2d3255bcb2120e6f9c799751))
+* **run:** Follow portless vite root and runner flags ([ee06004](https://github.com/NeoTamia/NTNook/commit/ee060044483d06ef9415c2f08c63cbd70dcb6ad4))
+* **run:** Honor npm -- and pnpm workspace-root ([620e052](https://github.com/NeoTamia/NTNook/commit/620e052999def2db5f42fa28f8c21e04e721a921))
+* **run:** Ignore compound package scripts ([94874b7](https://github.com/NeoTamia/NTNook/commit/94874b7b4abe447c73fbb8081590455080ca85e2))
+* **run:** Inject flags only for the forced framework binary ([67bd976](https://github.com/NeoTamia/NTNook/commit/67bd976ff0587d89fed8a13447d8aa6cd70f4669))
+* **run:** Keep npm exec flags off npm itself ([dbdb55f](https://github.com/NeoTamia/NTNook/commit/dbdb55f09fb24a92d86bf0841d57b7511242a088))
+* **run:** Keep pnpm yarn flags before -- ([0d52289](https://github.com/NeoTamia/NTNook/commit/0d52289072d260ca6a1f29776908e779a31be5e1))
+* **run:** Keep reserved port and inherited vite hosts ([27fbadb](https://github.com/NeoTamia/NTNook/commit/27fbadb151ad94ca2f98fa48a053e96738259b7f))
+* **run:** Overwrite framework --host to the nook bind ([6deed2f](https://github.com/NeoTamia/NTNook/commit/6deed2ff27d0d75d822ff29e00f8b1983c403d60))
+* **run:** Pass script flags without -- for pnpm and yarn ([ac3dc58](https://github.com/NeoTamia/NTNook/commit/ac3dc58107813f1e944f18d39ec122094e0f865d))
+* **run:** Preserve inherited vite allowed hosts ([321f27b](https://github.com/NeoTamia/NTNook/commit/321f27b63eac79c6937368e4c52349a56d863f95))
+* **run:** Put npm exec -- before the package ([b9abb1b](https://github.com/NeoTamia/NTNook/commit/b9abb1b74a97c8a2c7d010cdad25c798fa0c3225))
+* **run:** Rewrite every port and skip npm global values ([15839fb](https://github.com/NeoTamia/NTNook/commit/15839fb34c721ba8361adf6a995a1951f253e5bb))
+* **run:** Rewrite port only on forwarded script args ([07362c0](https://github.com/NeoTamia/NTNook/commit/07362c00566d3d99e76c7674c385842236b7d51e))
+* **run:** Skip argv flags on forced framework builds ([4660f91](https://github.com/NeoTamia/NTNook/commit/4660f912aa5f12a24b67468061b3f0797b1e8c64))
+* **run:** Skip Astro --root values when detecting the server ([982f2dd](https://github.com/NeoTamia/NTNook/commit/982f2ddfb3d68452ae1d1d09e48d896dfa87076b))
+* **run:** Skip non-utf8 package-script arguments ([328e54a](https://github.com/NeoTamia/NTNook/commit/328e54a750b05d0bf07a92fff552865d13ce77e5))
+* **run:** Treat bare next as a dev server ([481bb4e](https://github.com/NeoTamia/NTNook/commit/481bb4e266f99701ec99522771bf18a596ea178d))
+
+
+### 📚 Documentation
+
+* **run:** Clarify nook run vs nook-run ([35d2674](https://github.com/NeoTamia/NTNook/commit/35d2674a2e782e775cc05d4904bd88d419d3e2eb))
+
+
+### ♻️ Code Refactoring
+
+* **run:** Align only the framework CLI argv ([c91ac6e](https://github.com/NeoTamia/NTNook/commit/c91ac6e6615af4510846822e597a8b7aa1b5ddaa))
+
+
+### 🧪 Tests
+
+* **run:** Lock framework injection and document it ([64350c4](https://github.com/NeoTamia/NTNook/commit/64350c405fdc589cfd56f8fb36c74232845b22bb))
+
+
+### 🔧 Build System
+
+* **deps:** Update rust crate toml to v1.1.5 ([#35](https://github.com/NeoTamia/NTNook/issues/35)) ([8a07a61](https://github.com/NeoTamia/NTNook/commit/8a07a61beb2336585c13e81c8f334cf68b397b9e))
+* **deps:** Update rust crate uuid to v1.26.1 ([#22](https://github.com/NeoTamia/NTNook/issues/22)) ([6820cf4](https://github.com/NeoTamia/NTNook/commit/6820cf4da08e473ddeb4a0feea0d9c730703d5a7))
+
 ## [0.7.0](https://github.com/NeoTamia/NTNook/compare/v0.6.0...v0.7.0) (2026-09-09)
 
 

@@ -15,6 +15,8 @@ fn init_creates_a_documented_project_configuration() {
             "--no-tls",
             "--app-port",
             "5173",
+            "--run-bind-address",
+            "::1",
             "--strict-port",
             "--readiness-warn-after",
             "12",
@@ -38,7 +40,8 @@ fn init_creates_a_documented_project_configuration() {
     assert!(contents.contains("app_port = 5173"));
     assert!(contents.contains("strict_port = true"));
     assert!(contents.contains("readiness_warn_after_seconds = 12"));
-    assert!(contents.contains("# run_bind_address = \"127.0.0.1\""));
+    let parsed = toml::from_str::<toml::Value>(&contents).unwrap();
+    assert_eq!(parsed["run_bind_address"].as_str(), Some("::1"));
 
     toml::from_str::<toml::Value>(&contents).expect("generated TOML should parse");
     fs::remove_dir_all(directory).unwrap();
@@ -84,6 +87,7 @@ fn local_init_creates_only_local_overrides() {
     assert!(!directory.join("nook.toml").exists());
     let contents = fs::read_to_string(directory.join("nook.local.toml")).unwrap();
     assert!(contents.contains("# name ="));
+    assert!(contents.contains("# run_bind_address = \"127.0.0.1\""));
     assert!(contents.contains("app_port = 5180"));
     assert!(!contents.contains("\nname ="));
     fs::remove_dir_all(directory).unwrap();
