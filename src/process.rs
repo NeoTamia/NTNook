@@ -27,9 +27,11 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::config::ResolvedRunConfig;
-use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
+use crate::reconcile::{RouteBackend, RouteError, RouteSpec, route_for_alias, route_for_lease};
 use crate::state::Lease;
-use crate::state::{LeaseState, PendingOperation, PendingOperationKind, Scheme, Store};
+use crate::state::{
+    LeaseState, OperationGuard, PendingOperation, PendingOperationKind, Scheme, Store,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +210,7 @@ pub(crate) enum RunError {
     State(crate::state::Error),
     Route(RouteError),
     Process(Error),
+    Exposure(Box<dyn std::error::Error + Send + Sync>),
     Conflict(String),
 }
 
@@ -217,6 +220,7 @@ impl fmt::Display for RunError {
             Self::State(error) => error.fmt(formatter),
             Self::Route(error) => error.fmt(formatter),
             Self::Process(error) => error.fmt(formatter),
+            Self::Exposure(error) => error.fmt(formatter),
             Self::Conflict(hostname) => write!(
                 formatter,
                 "hostname `{hostname}` is already managed by Nook; use --force to replace it"
@@ -231,6 +235,7 @@ impl std::error::Error for RunError {
             Self::State(error) => Some(error),
             Self::Route(error) => Some(error),
             Self::Process(error) => Some(error),
+            Self::Exposure(error) => Some(error.as_ref()),
             Self::Conflict(_) => None,
         }
     }
@@ -264,38 +269,86 @@ pub(crate) struct RunningChild {
     signals: ForwardedSignals,
 }
 
+/// Additional exposure of a run beyond its local Caddy route.
+///
+/// `expose` runs with the operations lock held, after the route exists and
+/// before the child is spawned; the returned variables are added to the child
+/// environment. `withdraw` undoes it when the child cannot be spawned.
+pub(crate) trait RunExposure {
+    fn expose(
+        &mut self,
+        operations: &OperationGuard,
+        store: &Store,
+        owner_id: Uuid,
+        hostname: &str,
+        target: &str,
+    ) -> Result<Vec<(OsString, OsString)>, RunError>;
+    fn withdraw(&mut self, operations: &OperationGuard, store: &Store, owner_id: Uuid);
+}
+
+struct LocalOnly;
+
+impl RunExposure for LocalOnly {
+    fn expose(
+        &mut self,
+        _operations: &OperationGuard,
+        _store: &Store,
+        _owner_id: Uuid,
+        _hostname: &str,
+        _target: &str,
+    ) -> Result<Vec<(OsString, OsString)>, RunError> {
+        Ok(Vec::new())
+    }
+
+    fn withdraw(&mut self, _operations: &OperationGuard, _store: &Store, _owner_id: Uuid) {}
+}
+
 pub(crate) fn start_run(
     config: &ResolvedRunConfig,
     store: &Store,
     routes: &mut impl RouteBackend,
 ) -> Result<RunningChild, RunError> {
-    start_run_with_hook(config, store, routes, |_| {})
+    start_run_with_hook(config, store, routes, &mut LocalOnly, |_| {})
+}
+
+pub(crate) fn start_exposed_run(
+    config: &ResolvedRunConfig,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    exposure: &mut impl RunExposure,
+) -> Result<RunningChild, RunError> {
+    start_run_with_hook(config, store, routes, exposure, |_| {})
 }
 
 fn start_run_with_hook(
     config: &ResolvedRunConfig,
     store: &Store,
     routes: &mut impl RouteBackend,
+    exposure: &mut impl RunExposure,
     after_release: impl FnOnce(u16),
 ) -> Result<RunningChild, RunError> {
     let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
-    let _operations = store.lock_operations()?;
-    let conflicts = store.mutate(|registry| {
+    let operations = store.lock_operations()?;
+    let displaced = store.mutate(|registry| {
         let aliases = registry
             .aliases
             .values()
             .filter(|alias| alias.hostname == config.hostname)
-            .map(|alias| (alias.id, alias.tls));
+            .map(route_for_alias);
         let leases = registry
             .leases
             .values()
             .filter(|lease| lease.hostname == config.hostname)
-            .map(|lease| (lease.id, lease.tls));
+            .map(route_for_lease);
         Ok(aliases.chain(leases).collect::<Vec<_>>())
     })?;
-    if !conflicts.is_empty() && !config.force {
+    if !displaced.is_empty() && !config.force {
         return Err(RunError::Conflict(config.hostname.clone()));
     }
+    let conflicts: Vec<_> = displaced
+        .iter()
+        .map(|route| (route.owner_id, route.tls))
+        .collect();
     let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
     let port = reservation.port;
     let owner_id = Uuid::new_v4();
@@ -324,6 +377,74 @@ fn start_run_with_hook(
         Ok(())
     })?;
     routes.ensure(&route)?;
+    let exposed = match exposure.expose(&operations, store, owner_id, &config.hostname, &target) {
+        Ok(exposed) => exposed,
+        Err(error) => {
+            abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
+            return Err(error);
+        }
+    };
+    store.mutate(|registry| {
+        replace_operation(
+            registry,
+            operation_id,
+            PendingOperationKind::StartProcess {
+                hostname: route.hostname.clone(),
+                target: target.clone(),
+                scheme: Scheme::Http,
+                owner_id,
+                tls: config.tls,
+            },
+        );
+        Ok(())
+    })?;
+
+    let argv = substitute_port(&config.command, port);
+    let framework = config.framework.resolve(&argv);
+    let tailscale_hostname = exposed
+        .iter()
+        .find(|(name, _)| name == crate::tailscale::URL_VARIABLE)
+        .and_then(|(_, value)| value.to_str())
+        .and_then(|value| url::Url::parse(value).ok())
+        .and_then(|url| url.host_str().map(str::to_owned));
+    // Vite-based servers already allow *.localhost. Add the exact tailnet
+    // host for Serve, which preserves the incoming Host header.
+    let allowed_hostname = tailscale_hostname.as_deref().unwrap_or(&config.hostname);
+    let argv = match framework {
+        Some(framework) => framework.inject_argv(
+            argv,
+            port,
+            config.bind_address,
+            allowed_hostname,
+            config.strict_port,
+        ),
+        None => argv,
+    };
+    let mut environment =
+        child_environment(port, config.bind_address, &config.hostname, config.tls).to_vec();
+    if let Some(framework) = framework {
+        environment.extend(framework.environment(port, config.bind_address, allowed_hostname));
+    }
+    let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
+    if !conflicts.is_empty() {
+        warnings.push(format!(
+            "replaced existing Nook route for {}; the previous owner is no longer managed",
+            config.hostname
+        ));
+    }
+    reservation.release();
+    after_release(port);
+    let environment: Vec<_> = environment.into_iter().chain(exposed).collect();
+    let child = match spawn_managed_child(&argv, &environment, owner_id) {
+        Ok(child) => child,
+        Err(error) => {
+            exposure.withdraw(&operations, store, owner_id);
+            abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
+            return Err(error.into());
+        }
+    };
+    // Keep displaced owners recorded until spawn succeeds, so either startup
+    // failure can restore their routes without losing aliases or live leases.
     let cleanup_results: Vec<_> = conflicts
         .iter()
         .map(|(id, tls)| {
@@ -356,76 +477,6 @@ fn start_run_with_hook(
                 });
             }
         }
-        replace_operation(
-            registry,
-            operation_id,
-            PendingOperationKind::StartProcess {
-                hostname: route.hostname.clone(),
-                target: target.clone(),
-                scheme: Scheme::Http,
-                owner_id,
-                tls: config.tls,
-            },
-        );
-        Ok(())
-    })?;
-
-    let argv = substitute_port(&config.command, port);
-    let framework = config.framework.resolve(&argv);
-    let argv = match framework {
-        Some(framework) => framework.inject_argv(
-            argv,
-            port,
-            config.bind_address,
-            &config.hostname,
-            config.strict_port,
-        ),
-        None => argv,
-    };
-    let mut environment =
-        child_environment(port, config.bind_address, &config.hostname, config.tls).to_vec();
-    if let Some(framework) = framework {
-        environment.extend(framework.environment(port, config.bind_address, &config.hostname));
-    }
-    let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
-    if !conflicts.is_empty() {
-        warnings.push(format!(
-            "replaced existing Nook route for {}; the previous owner is no longer managed",
-            config.hostname
-        ));
-    }
-    for (_, _, result) in &cleanup_results {
-        if let Err(error) = result {
-            warnings.push(format!("cleanup of the previous route is pending: {error}"));
-        }
-    }
-    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
-    reservation.release();
-    after_release(port);
-    let child = match spawn_managed_child(&argv, &environment, owner_id) {
-        Ok(child) => child,
-        Err(error) => {
-            let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
-            store.mutate(|registry| {
-                registry
-                    .pending_operations
-                    .retain(|operation| operation.id != operation_id);
-                if cleanup.is_err() {
-                    registry.pending_operations.push(PendingOperation {
-                        id: Uuid::new_v4(),
-                        kind: PendingOperationKind::RemoveRoute {
-                            hostname: config.hostname.clone(),
-                            owner_id,
-                            tls: config.tls,
-                        },
-                    });
-                }
-                Ok(())
-            })?;
-            return Err(error.into());
-        }
-    };
-    store.mutate(|registry| {
         registry
             .pending_operations
             .retain(|operation| operation.id != operation_id);
@@ -445,6 +496,12 @@ fn start_run_with_hook(
         );
         Ok(())
     })?;
+    for (_, _, result) in &cleanup_results {
+        if let Err(error) = result {
+            warnings.push(format!("cleanup of the previous route is pending: {error}"));
+        }
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     Ok(RunningChild {
         child,
         lease_id: owner_id,
@@ -456,6 +513,44 @@ fn start_run_with_hook(
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
         signals,
     })
+}
+
+/// Removes the route of a run that will not start and drops its journal entry,
+/// queueing the removal when Caddy cannot be reached. Restores displaced routes.
+fn abandon_route(
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    config: &ResolvedRunConfig,
+    owner_id: Uuid,
+    operation_id: Uuid,
+    displaced: &[RouteSpec],
+) -> Result<(), RunError> {
+    let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
+    for route in displaced {
+        // The registry still records these owners, so failed restorations are
+        // retried by the next reconciliation.
+        let _ = routes.ensure(&RouteSpec {
+            replace_existing: true,
+            ..route.clone()
+        });
+    }
+    store.mutate(|registry| {
+        registry
+            .pending_operations
+            .retain(|operation| operation.id != operation_id);
+        if cleanup.is_err() {
+            registry.pending_operations.push(PendingOperation {
+                id: Uuid::new_v4(),
+                kind: PendingOperationKind::RemoveRoute {
+                    hostname: config.hostname.clone(),
+                    owner_id,
+                    tls: config.tls,
+                },
+            });
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn pending_owner(kind: &PendingOperationKind) -> Option<Uuid> {
@@ -690,7 +785,12 @@ fn spawn_managed_child(
         internal_environment,
     } = prepare_windows_command(program, arguments, environment, lease_id)?;
     let mut command = Command::new(program);
-    command.args(arguments).envs(environment.iter().cloned());
+    // A run started from an exposed run must not inherit its tailnet URL;
+    // an exposed child gets its own value back from `environment`.
+    command
+        .env_remove(crate::tailscale::URL_VARIABLE)
+        .args(arguments)
+        .envs(environment.iter().cloned());
     #[cfg(windows)]
     if let Some((key, value)) = internal_environment {
         command.env(key, value);
@@ -1436,15 +1536,169 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Error, Liveness, ProcIdentity, ProcessSignal, StopError, StopSystem, child_environment,
-        cleanup_unidentified_child, configure_child, identity_liveness, parse_stat,
-        read_process_identity, readiness_probe_address, reserve_port, spawn_child, start_run,
-        start_run_with_hook, stop_managed, substitute_port,
+        Error, Liveness, LocalOnly, ProcIdentity, ProcessSignal, RunError, RunExposure, StopError,
+        StopSystem, child_environment, cleanup_unidentified_child, configure_child,
+        identity_liveness, parse_stat, read_process_identity, readiness_probe_address,
+        reserve_port, spawn_child, start_exposed_run, start_run, start_run_with_hook, stop_managed,
+        substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
-    use crate::state::{LeaseState, Store, decode};
+    use crate::state::{
+        Alias, LeaseState, OperationGuard, PendingOperationKind, Scheme, Store, decode,
+    };
     use uuid::Uuid;
+
+    #[derive(Default)]
+    struct RecordingExposure {
+        fail: bool,
+        exposed_after_route_before_lease: Vec<Uuid>,
+        withdrawn: Vec<Uuid>,
+    }
+
+    impl RunExposure for RecordingExposure {
+        fn expose(
+            &mut self,
+            _operations: &OperationGuard,
+            store: &Store,
+            owner_id: Uuid,
+            _hostname: &str,
+            _target: &str,
+        ) -> Result<Vec<(OsString, OsString)>, RunError> {
+            let registry = store.load().unwrap();
+            let route_journaled = registry.pending_operations.iter().any(|operation| {
+                matches!(
+                    operation.kind,
+                    PendingOperationKind::InstallRoute { owner_id: id, .. }
+                        | PendingOperationKind::StartProcess { owner_id: id, .. } if id == owner_id
+                )
+            });
+            if route_journaled && !registry.leases.contains_key(&owner_id) {
+                self.exposed_after_route_before_lease.push(owner_id);
+            }
+            if self.fail {
+                return Err(RunError::Exposure("tailnet unavailable".into()));
+            }
+            Ok(vec![(
+                OsString::from("NOOK_TAILSCALE_URL"),
+                OsString::from("https://host.example.ts.net:8443"),
+            )])
+        }
+
+        fn withdraw(&mut self, _operations: &OperationGuard, _store: &Store, owner_id: Uuid) {
+            self.withdrawn.push(owner_id);
+        }
+    }
+
+    #[test]
+    fn exposure_runs_between_route_and_spawn_and_its_variables_reach_the_child() {
+        let (store, path) = temporary_store();
+        let marker = path.parent().unwrap().join("tailscale-url");
+        let script = format!("printf %s \"$NOOK_TAILSCALE_URL\" > '{}'", marker.display());
+        let config = run_config(vec!["/bin/sh", "-c", &script], 30);
+        let mut routes = Routes::default();
+        let mut exposure = RecordingExposure::default();
+        let mut running = start_exposed_run(&config, &store, &mut routes, &mut exposure).unwrap();
+        assert_eq!(
+            exposure.exposed_after_route_before_lease,
+            [running.lease_id]
+        );
+        assert_eq!(running.finish(&store, &mut routes).unwrap().exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "https://host.example.ts.net:8443"
+        );
+        assert!(exposure.withdrawn.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_exposure_never_spawns_and_removes_the_route() {
+        let (store, path) = temporary_store();
+        let marker = path.parent().unwrap().join("child-started");
+        let script = format!("touch '{}'", marker.display());
+        let config = run_config(vec!["/bin/sh", "-c", &script], 30);
+        let mut routes = Routes::default();
+        let mut exposure = RecordingExposure {
+            fail: true,
+            ..RecordingExposure::default()
+        };
+        assert!(matches!(
+            start_exposed_run(&config, &store, &mut routes, &mut exposure),
+            Err(RunError::Exposure(_))
+        ));
+        thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists());
+        assert!(routes.owners.is_empty());
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(registry.leases.is_empty());
+        assert!(registry.pending_operations.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_exposure_of_a_forced_run_restores_the_displaced_alias() {
+        let (store, path) = temporary_store();
+        let mut config = run_config(vec!["/bin/true"], 30);
+        config.force = true;
+        let displaced = Alias {
+            id: Uuid::new_v4(),
+            hostname: config.hostname.clone(),
+            target: "http://127.0.0.1:3000/".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            preserve_host: true,
+        };
+        store
+            .mutate(|registry| {
+                registry
+                    .aliases
+                    .insert(displaced.hostname.clone(), displaced.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut routes = Routes {
+            owners: BTreeMap::from([(displaced.hostname.clone(), displaced.id)]),
+            ..Routes::default()
+        };
+        let mut exposure = RecordingExposure {
+            fail: true,
+            ..RecordingExposure::default()
+        };
+        assert!(matches!(
+            start_exposed_run(&config, &store, &mut routes, &mut exposure),
+            Err(RunError::Exposure(_))
+        ));
+        assert_eq!(exposure.exposed_after_route_before_lease.len(), 1);
+        assert_eq!(routes.owners[&displaced.hostname], displaced.id);
+        let registry = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            registry.aliases.into_values().collect::<Vec<_>>(),
+            [displaced]
+        );
+        assert!(registry.leases.is_empty());
+        assert!(registry.pending_operations.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_spawn_withdraws_the_exposure_it_created() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/nonexistent/nook-test-command"], 30);
+        let mut routes = Routes::default();
+        let mut exposure = RecordingExposure::default();
+        assert!(matches!(
+            start_exposed_run(&config, &store, &mut routes, &mut exposure),
+            Err(RunError::Process(Error::Spawn(_)))
+        ));
+        assert_eq!(
+            exposure.withdrawn,
+            exposure.exposed_after_route_before_lease
+        );
+        assert_eq!(exposure.withdrawn.len(), 1);
+        assert!(routes.owners.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     #[derive(Default)]
     struct Routes {
@@ -1928,10 +2182,12 @@ mod tests {
         let config = run_config(vec!["/usr/bin/python3", "-c", code], 30);
         let stolen = RefCell::new(None);
         let mut routes = Routes::default();
-        let mut running = start_run_with_hook(&config, &store, &mut routes, |port| {
-            *stolen.borrow_mut() = Some(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap());
-        })
-        .unwrap();
+        let mut running =
+            start_run_with_hook(&config, &store, &mut routes, &mut LocalOnly, |port| {
+                *stolen.borrow_mut() =
+                    Some(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap());
+            })
+            .unwrap();
         let outcome = running.finish(&store, &mut routes).unwrap();
         assert_ne!(outcome.exit_code, 0);
         assert!(
@@ -2053,6 +2309,7 @@ mod tests {
             hostname: "api.localhost".into(),
             command: command.into_iter().map(OsString::from).collect(),
             tls: true,
+            tailscale: false,
             app_port: None,
             strict_port: false,
             force: false,
