@@ -38,7 +38,23 @@ fn main() {
         .skip(1)
         .find(|argument| !argument.starts_with('-'))
         .cloned();
-    let scenarios: [(&str, fn()); 18] = [
+    let scenarios: [(&str, fn()); 22] = [
+        (
+            "funnel_run_exports_public_url_and_cleans_up",
+            funnel_run_exports_public_url_and_cleans_up,
+        ),
+        (
+            "funnel_alias_restores_and_preserves_external_changes",
+            funnel_alias_restores_and_preserves_external_changes,
+        ),
+        (
+            "funnel_ports_are_limited_and_foreign_configs_are_preserved",
+            funnel_ports_are_limited_and_foreign_configs_are_preserved,
+        ),
+        (
+            "funnel_requires_authorization_before_changes",
+            funnel_requires_authorization_before_changes,
+        ),
         (
             "missing_client_fails_before_spawn_without_changes",
             missing_client_fails_before_spawn_without_changes,
@@ -318,6 +334,153 @@ fn run_takes_port_443_exports_its_url_and_cleans_up_preserving_exit_code() {
     assert_eq!(read_json(&marker)["url"], format!("https://{DNS_NAME}"));
 }
 
+fn funnel_run_exports_public_url_and_cleans_up() {
+    let world = World::new("funnel-run");
+    let marker = world.root.join("child.json");
+    let output = world
+        .nook_command(&["run", "--funnel", "--name", "public", "--"])
+        .args(world.child_arguments(&marker, 42, None))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(42), "{}", describe(&output));
+    assert_eq!(read_json(&marker)["url"], format!("https://{DNS_NAME}"));
+    assert!(stderr(&output).contains("exposure=public"));
+    assert!(
+        world
+            .tailscale_calls()
+            .iter()
+            .any(|call| call[0] == "funnel")
+    );
+    assert_eq!(world.serve_config(), json!({}));
+    assert!(world.caddy_routes_are_empty());
+}
+
+fn funnel_alias_restores_and_preserves_external_changes() {
+    let world = World::new("funnel-alias");
+    let output = world.nook(&["alias", "web", "3000", "--funnel"]);
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout(&output).contains("exposure=public"));
+    assert_eq!(
+        world.registry_value()["tailscale"]["registrations"]["443"]["funnel"],
+        true
+    );
+    let registered = world.serve_config();
+    assert_eq!(registered["AllowFunnel"][format!("{DNS_NAME}:443")], true);
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(status.status.success(), "{}", describe(&status));
+    assert!(stdout(&status).contains("\tactive-public\n"));
+    assert!(stdout(&world.nook(&["list"])).contains("\tpublic\n"));
+    assert_eq!(world.serve_config(), registered);
+
+    world.update_tailscale(|state| {
+        state["serve"] = json!({});
+        state["funnel"] = json!(false);
+    });
+    let pending = world.nook(&["prune"]);
+    assert!(
+        stderr(&pending).contains("Funnel is not enabled"),
+        "{}",
+        describe(&pending)
+    );
+    assert_eq!(world.serve_config(), json!({}));
+    world.update_tailscale(|state| state["funnel"] = json!(true));
+    let restored = world.nook(&["prune"]);
+    assert!(
+        stdout(&restored).contains("tailscale_restored=1"),
+        "{}",
+        describe(&restored)
+    );
+    assert_eq!(world.serve_config(), registered);
+
+    // An external decision to make this private must not be reversed.
+    world.update_tailscale(|state| {
+        state["serve"]
+            .as_object_mut()
+            .unwrap()
+            .remove("AllowFunnel")
+            .map(|_| ())
+            .unwrap()
+    });
+    let private = world.serve_config();
+    let status = world.nook(&["tailscale", "status"]);
+    assert!(stdout(&status).contains("\tforeign\n"));
+    assert_eq!(world.serve_config(), private);
+    let removed = world.nook(&["alias", "remove", "web"]);
+    assert!(removed.status.success(), "{}", describe(&removed));
+    assert_eq!(world.serve_config(), json!({}));
+
+    assert!(
+        world
+            .nook(&["alias", "web", "3000", "--funnel"])
+            .status
+            .success()
+    );
+    // Cleanup remains possible after Funnel authorization is revoked.
+    world.update_tailscale(|state| state["funnel"] = json!(false));
+    assert!(world.nook(&["alias", "remove", "web"]).status.success());
+    assert_eq!(world.serve_config(), json!({}));
+}
+
+fn funnel_ports_are_limited_and_foreign_configs_are_preserved() {
+    let world = World::new("funnel-ports");
+    // An orphan Funnel permission is occupied even with no associated handler.
+    let foreign = json!({"AllowFunnel": {format!("{DNS_NAME}:443"): true}});
+    world.update_tailscale(|state| state["serve"] = foreign.clone());
+    for (name, port) in [("one", "8443"), ("two", "10000")] {
+        let output = world.nook(&["alias", name, "3000", "--funnel"]);
+        assert!(output.status.success(), "{}", describe(&output));
+        assert!(world.registry_value()["tailscale"]["registrations"][port].is_object());
+    }
+    let before = world.serve_config();
+    let exhausted = world.nook(&["alias", "three", "3000", "--funnel"]);
+    assert_eq!(exhausted.status.code(), Some(1));
+    assert!(stderr(&exhausted).contains("no free Tailscale Funnel HTTPS port"));
+    assert_eq!(world.serve_config(), before);
+    for name in ["one", "two"] {
+        assert!(world.nook(&["alias", "remove", name]).status.success());
+    }
+    assert_eq!(world.serve_config(), foreign);
+}
+
+fn funnel_requires_authorization_before_changes() {
+    let world = World::new("funnel-denied");
+    world.update_tailscale(|state| state["funnel"] = json!(false));
+    let marker = world.root.join("child.json");
+    let output = world
+        .nook_command(&["run", "--funnel", "--name", "public", "--"])
+        .args(world.child_arguments(&marker, 0, None))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("Funnel is not enabled"));
+    assert!(!marker.exists());
+    assert!(world.caddy_routes_are_empty());
+    assert_eq!(world.serve_config(), json!({}));
+    let alias = world.nook(&["alias", "public", "3000", "--funnel"]);
+    assert_eq!(alias.status.code(), Some(1));
+    assert!(world.caddy_routes_are_empty());
+    assert!(
+        !world
+            .tailscale_calls()
+            .iter()
+            .any(|call| call[0] == "funnel")
+    );
+    world.update_tailscale(|state| {
+        state["funnel"] = json!(true);
+        state["suppress_funnel"] = json!(true);
+    });
+    let unconfirmed = world.nook(&["alias", "public", "3000", "--funnel"]);
+    assert_eq!(
+        unconfirmed.status.code(),
+        Some(1),
+        "{}",
+        describe(&unconfirmed)
+    );
+    assert!(stderr(&unconfirmed).contains("after creating it"));
+    assert_eq!(world.serve_config(), json!({}));
+    assert!(world.caddy_routes_are_empty());
+}
+
 fn project_configuration_opts_in_and_no_tailscale_opts_out() {
     let world = World::new("project");
     let config = world.root.join("nook.toml");
@@ -332,25 +495,64 @@ fn project_configuration_opts_in_and_no_tailscale_opts_out() {
         let mut arguments = vec!["run", "--config", &config];
         arguments.extend_from_slice(flags);
         arguments.push("--");
+        let previous_calls = world.tailscale_calls().len();
         let output = world
             .nook_command(&arguments)
             .args(world.child_arguments(&marker, 0, None))
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", describe(&output));
-        read_json(&marker)["url"].clone()
+        let public = stderr(&output).contains("exposure=public");
+        assert_eq!(
+            public,
+            world.tailscale_calls()[previous_calls..]
+                .iter()
+                .any(|call| call[0] == "funnel")
+        );
+        assert_eq!(world.serve_config(), json!({}));
+        (read_json(&marker)["url"].clone(), public)
     };
-    assert_eq!(run(&[]), format!("https://{DNS_NAME}"));
-    assert_eq!(run(&["--no-tailscale"]), Value::Null);
+    assert_eq!(run(&[]), (json!(format!("https://{DNS_NAME}")), false));
+    assert_eq!(run(&["--no-tailscale"]), (Value::Null, false));
 
     fs::write(
         &config,
         "format_version = 1\nname = \"site\"\ntailscale = false\n",
     )
     .unwrap();
-    assert_eq!(run(&[]), Value::Null);
-    assert_eq!(run(&["--tailscale"]), format!("https://{DNS_NAME}"));
-    assert_eq!(world.serve_config(), json!({}));
+    assert_eq!(run(&[]), (Value::Null, false));
+    assert_eq!(
+        run(&["--tailscale"]),
+        (json!(format!("https://{DNS_NAME}")), false)
+    );
+    fs::write(
+        &config,
+        "format_version = 1\nname = \"site\"\nfunnel = true\n",
+    )
+    .unwrap();
+    assert_eq!(run(&[]), (json!(format!("https://{DNS_NAME}")), true));
+    assert_eq!(
+        run(&["--tailscale"]),
+        (json!(format!("https://{DNS_NAME}")), false)
+    );
+    assert_eq!(run(&["--no-tailscale"]), (Value::Null, false));
+    let local = world.root.join("nook.local.toml");
+    fs::write(&local, "format_version = 1\nfunnel = false\n").unwrap();
+    assert_eq!(run(&["--local"]), (Value::Null, false));
+    assert_eq!(
+        run(&["--local", "--funnel"]),
+        (json!(format!("https://{DNS_NAME}")), true)
+    );
+    fs::write(
+        &config,
+        "format_version = 1\nname = \"site\"\nfunnel = false\n",
+    )
+    .unwrap();
+    fs::write(&local, "format_version = 1\nfunnel = true\n").unwrap();
+    assert_eq!(
+        run(&["--local"]),
+        (json!(format!("https://{DNS_NAME}")), true)
+    );
 }
 
 fn locally_shadowed_ports_are_skipped_and_explained() {
@@ -1204,6 +1406,7 @@ impl World {
                 "auth_url": "",
                 "dns_name": format!("{DNS_NAME}."),
                 "https": true,
+                "funnel": true,
                 "serve": {},
                 "calls": []
             }),
@@ -1403,6 +1606,7 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
                     "Self": {
                         "DNSName": state["dns_name"],
                         "TailscaleIPs": state["tailscale_ips"],
+                        "CapMap": if state["funnel"] == true { json!({"https": [], "funnel": []}) } else { json!({"https": []}) },
                         "Online": running
                     },
                     "CertDomains": cert_domains,
@@ -1415,7 +1619,13 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
             println!("{}", state["serve"]);
             0
         }
-        ["serve", "--bg", https, target] if https.starts_with("--https=") => {
+        [command @ ("serve" | "funnel"), "--bg", https, target]
+            if https.starts_with("--https=") =>
+        {
+            if *command == "funnel" && state["funnel"] != true {
+                eprintln!("Funnel is not enabled on your tailnet.");
+                return 1;
+            }
             if let Some(message) = state["serve_error"].as_str() {
                 eprintln!("{message}");
                 return 1;
@@ -1428,8 +1638,17 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
                 println!("Serve is not enabled on your tailnet.");
                 return 1;
             }
+            let suppress_funnel = state["suppress_funnel"] == true;
             let port = &https["--https=".len()..];
+            if *command == "funnel" && !["443", "8443", "10000"].contains(&port) {
+                eprintln!("invalid Funnel port {port}");
+                return 1;
+            }
             let serve = state["serve"].as_object_mut().unwrap();
+            if *command == "funnel" && !suppress_funnel {
+                serve.entry("AllowFunnel").or_insert_with(|| json!({}))
+                    [format!("{dns_name}:{port}")] = json!(true);
+            }
             let tcp = serve.entry("TCP").or_insert_with(|| json!({}));
             if tcp.get(port).is_some_and(|entry| entry["HTTPS"] != true) {
                 eprintln!("error: port {port} is already serving TCP");
@@ -1475,8 +1694,11 @@ fn fake_command(state: &mut Value, arguments: &[String]) -> i32 {
             if !handlers_left {
                 serve["Web"].as_object_mut().unwrap().remove(&host);
                 serve["TCP"].as_object_mut().unwrap().remove(port);
+                if let Some(funnel) = serve.get_mut("AllowFunnel").and_then(Value::as_object_mut) {
+                    funnel.remove(&host);
+                }
             }
-            for key in ["Web", "TCP"] {
+            for key in ["Web", "TCP", "AllowFunnel"] {
                 if serve
                     .get(key)
                     .and_then(Value::as_object)

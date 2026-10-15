@@ -42,7 +42,7 @@ pub(crate) enum Command {
     Status,
     /// Stop a managed run.
     Stop(StopArgs),
-    /// Diagnose private Tailscale Serve exposure.
+    /// Diagnose Tailscale Serve and Funnel exposure.
     Tailscale(TailscaleArgs),
     /// Remove stale leases and reconcile routes.
     Prune,
@@ -199,8 +199,11 @@ pub(crate) struct RunArgs {
     /// Also expose the run privately to the tailnet with Tailscale Serve.
     #[arg(long)]
     pub(crate) tailscale: bool,
-    /// Keep the run local even when the project sets `tailscale = true`.
+    /// Also expose publicly on the internet with Tailscale Funnel.
     #[arg(long, conflicts_with = "tailscale")]
+    pub(crate) funnel: bool,
+    /// Keep the run local even when the project enables Serve or Funnel.
+    #[arg(long, conflicts_with_all = ["tailscale", "funnel"])]
     pub(crate) no_tailscale: bool,
     /// Application bind IP address, also injected as HOST.
     #[arg(long, value_name = "IP")]
@@ -262,6 +265,9 @@ pub(crate) struct AliasSetArgs {
     /// Also expose the alias privately to the tailnet with Tailscale Serve.
     #[arg(long)]
     pub(crate) tailscale: bool,
+    /// Also expose publicly on the internet with Tailscale Funnel.
+    #[arg(long, conflicts_with = "tailscale")]
+    pub(crate) funnel: bool,
     /// Pass the requested `.localhost` Host header to the upstream.
     #[arg(long)]
     pub(crate) preserve_host: bool,
@@ -464,6 +470,9 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
     }
     contents.push_str(
         "# Also expose `nook run` privately to the tailnet with Tailscale Serve.\n# tailscale = false\n\n",
+    );
+    contents.push_str(
+        "# Also expose `nook run` publicly on the internet with Tailscale Funnel.\n# funnel = false\n\n",
     );
     match arguments.app_port {
         Some(port) => contents.push_str(&format!(
@@ -1246,7 +1255,8 @@ fn run_command(
     let store = state_store()?;
     let tailscale = config
         .tailscale
-        .then(crate::tailscale::Client::from_environment);
+        .then(crate::tailscale::Client::from_environment)
+        .map(|client| client.with_funnel(config.funnel));
     if let Some(client) = &tailscale {
         crate::tailscale::reachable_bind_address(config.bind_address)?;
         client.require_ready()?;
@@ -1259,6 +1269,12 @@ fn run_command(
         };
         let registration = exposure.and_then(|exposure| exposure.registration);
         let scheme = if config.tls { "https" } else { "http" };
+        if config.funnel {
+            writeln!(
+                errors,
+                "nook: exposure=public (Tailscale Funnel; accessible from the internet)"
+            )?;
+        }
         let tailscale_url = registration
             .as_ref()
             .map(|registration| format!(" tailscale_url={}", registration.url))
@@ -1341,9 +1357,9 @@ fn set_alias_command(
         force: arguments.force,
     };
     let store = crate::state::Store::new(crate::state::state_path()?);
-    let tailscale = arguments
-        .tailscale
-        .then(crate::tailscale::Client::from_environment);
+    let tailscale = (arguments.tailscale || arguments.funnel)
+        .then(crate::tailscale::Client::from_environment)
+        .map(|client| client.with_funnel(arguments.funnel));
     if let Some(client) = &tailscale {
         crate::tailscale::serve_target(&request.target)?;
         client.require_ready()?;
@@ -1375,6 +1391,12 @@ fn set_alias_command(
         let alias = outcome.alias;
         writeln!(output, "{} -> {}", alias.hostname, alias.target)?;
         if let Some(registration) = registration {
+            if arguments.funnel {
+                writeln!(
+                    output,
+                    "exposure=public (Tailscale Funnel; accessible from the internet)"
+                )?;
+            }
             for warning in &registration.warnings {
                 writeln!(errors, "warning: {warning}")?;
             }
@@ -1458,7 +1480,16 @@ fn write_tailscale_columns(
     match crate::tailscale::recorded_url(registry, owner_id) {
         Some(url) => {
             let scheme = if tls { "https" } else { "http" };
-            writeln!(output, "\t{scheme}://{hostname}\t{url}")?;
+            write!(output, "\t{scheme}://{hostname}\t{url}")?;
+            if registry
+                .tailscale
+                .registrations
+                .values()
+                .any(|registration| registration.owner_id == owner_id && registration.funnel)
+            {
+                write!(output, "\tpublic")?;
+            }
+            writeln!(output)?;
         }
         None => writeln!(output)?,
     }
@@ -1503,11 +1534,14 @@ fn tailscale_status_command(output: &mut impl Write, errors: &mut impl Write) ->
     )?;
     writeln!(
         output,
-        "exposure\tprivate tailnet Serve only; Funnel is never used"
+        "exposure\tprivate tailnet Serve; public internet Funnel with --funnel or funnel = true"
     )?;
     let mut public_port = None;
     for observed in client.observe(&registry, &diagnosis) {
         let state = match observed.observation {
+            Some(crate::tailscale::Observation::Owned) if observed.registration.funnel => {
+                "active-public"
+            }
             Some(crate::tailscale::Observation::Owned) => "active",
             Some(crate::tailscale::Observation::Public) => {
                 public_port.get_or_insert(observed.port);
@@ -2350,6 +2384,7 @@ mod tests {
         registry.tailscale.registrations.insert(
             8443,
             crate::state::ServeRegistration {
+                funnel: false,
                 owner_id: exposed.id,
                 hostname: exposed.hostname.clone(),
                 target: "http://127.0.0.1:4000".into(),
@@ -2390,6 +2425,9 @@ mod tests {
             Command::Tailscale(_)
         ));
         assert!(try_parse(&["tailscale", "funnel"]).is_err());
+        assert!(try_parse(&["run", "--funnel", "--tailscale", "--", "server"]).is_err());
+        assert!(try_parse(&["run", "--funnel", "--no-tailscale", "--", "server"]).is_err());
+        assert!(try_parse(&["alias", "api", "3000", "--funnel", "--tailscale"]).is_err());
         assert!(try_parse(&["tailscale", "reset"]).is_err());
     }
 

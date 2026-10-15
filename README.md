@@ -548,11 +548,14 @@ preserve native loopback behavior.
 
 Nook can additionally publish a run or an alias to the devices of your tailnet with private
 [Tailscale Serve](https://tailscale.com/kb/1312/serve). The local `.localhost` route stays
-unchanged; Serve is an opt-in second entry point.
+unchanged; Serve is an opt-in second entry point. Use `--funnel` instead to publish publicly
+on the internet with [Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel).
 
 ```sh
 nook run --tailscale --name api -- bun run dev
 nook alias set docs 5173 --tailscale
+nook run --funnel --name demo -- bun run dev
+nook alias set webhook 3000 --funnel
 nook tailscale status
 ```
 
@@ -563,10 +566,25 @@ tailscale = true
 ```
 
 `--tailscale` enables the exposure for one run even when the project sets `tailscale = false`, and
-`--no-tailscale` keeps one run local even when it sets `tailscale = true`; the two flags cannot be
+`--no-tailscale` keeps one run local even when it sets `tailscale = true` or `funnel = true`; the two flags cannot be
 combined. The usual precedence applies: `nook.toml`, then `nook.local.toml`, then the command line.
 Without any of them, runs stay local. Aliases are not read from project files and only use
-`--tailscale`.
+`--tailscale` or `--funnel`.
+
+To expose every run publicly instead, set this in `nook.toml` or `nook.local.toml`:
+
+```toml
+funnel = true
+```
+
+`funnel = true` takes precedence if `tailscale = true` is also set. Set `funnel = false` in
+`nook.local.toml` to disable the project's public default (Serve remains enabled if `tailscale`
+is true). CLI flags override both settings: `--funnel` selects public Funnel, `--tailscale`
+selects private Serve, and `--no-tailscale` keeps the run local. These flags cannot be combined.
+Funnel must already be authorized for this device by the tailnet policy;
+Nook checks the device capabilities before making changes and never starts the interactive
+activation flow. Funnel URLs are accessible from the internet without tailnet membership.
+Run and alias output labels them `exposure=public`, and `nook list` appends a `public` column.
 
 Requirements: Tailscale 1.52 or newer installed and connected, HTTPS certificates enabled for the
 tailnet, and a user allowed to change Serve (on Linux, root or the Tailscale operator). Nook runs
@@ -580,7 +598,7 @@ an unreachable `tailscaled`, a disconnected device (with the login URL Tailscale
 version without background Serve, or disabled HTTPS certificates (with the admin page where they
 are enabled) is reported as an error and the command exits with status `1`.
 
-Each exposed run or alias takes the root of one tailnet HTTPS port: the first gets `443`
+Each private exposed run or alias takes the root of one tailnet HTTPS port: the first gets `443`
 (`https://<device>.<tailnet>.ts.net`), then `8443`, `8444`, and so on. Ports used by any Serve
 configuration Nook does not own are skipped, a name gets its previous port back when it is still
 free, and allocation is recorded in the registry under the operations lock, so concurrent Nook
@@ -590,6 +608,12 @@ run information line gains the tailnet URL:
 ```text
 nook: domain=api.localhost url=https://api.localhost port=5173 tailscale_url=https://laptop.example.ts.net
 ```
+
+Funnel uses the same lifecycle and `NOOK_TAILSCALE_URL`, but only allocates ports `443`, `8443`,
+and `10000`, as required by the [Funnel CLI](https://tailscale.com/docs/reference/tailscale-cli/funnel).
+Serve and Funnel share the same port pool: occupied ports are skipped, including foreign Funnel
+permissions without a handler. If all three public ports are unavailable, Nook reports an error.
+A previous Serve port outside that set is not reused for Funnel.
 
 Nook removes an inherited `NOOK_TAILSCALE_URL` from every child it starts without exposure, for
 example a local run started from an exposed one.
@@ -621,7 +645,7 @@ Lifecycle:
 
 - the Serve registration is created after the local Caddy route and before the child starts;
 - a run removes it when it ends; an alias keeps it until `nook alias remove`, or until it is
-  replaced without `--tailscale`;
+  replaced without `--tailscale` or `--funnel`;
 - `alias set --tailscale` publishes the alias under the same lock that records it. If Serve
   refuses, the previous alias, its route, and its tailnet URL stay in place. A forced replacement
   of an exposed alias therefore gets the next free port while the previous one is still served, and
@@ -646,9 +670,10 @@ Safeguards:
 
 - Serve proxies straight to the loopback application (`127.0.0.1` or `localhost`), so the
   `Tailscale-User-*` identity headers set by Tailscale reach it unchanged. Aliases with any other
-  upstream are refused with `--tailscale`;
-- only private Serve is used. Nook never runs `tailscale funnel`, and refuses to keep an
-  active registration on a port that Funnel exposes. If Funnel is enabled later in the background,
+  upstream are refused with either exposure flag. Funnel visitors are public and do not receive
+  tailnet user identity headers; applications must provide their own authentication if needed;
+- a private Serve registration is never silently made public. Nook refuses to keep it on
+  a port that Funnel exposes unless it was explicitly created with `--funnel` or `funnel = true`. If Funnel is enabled later in the background,
   the next reconciliation withdraws Nook's root handler and forgets its registration, without
   restoring it automatically. Foreground sessions belong to their external caller and cannot be
   withdrawn with `serve off`: Nook warns, keeps tracking the registration, and `tailscale status`
@@ -656,16 +681,19 @@ Safeguards:
   If the alias is removed or its run ends, Nook removes its own background handler so it cannot
   resume serving after that session ends, while leaving the external session untouched;
 - Nook only runs `tailscale version`, `status --json`, `serve status --json`,
-  `serve --bg --https=<port> <target>`, and `serve --https=<port> --set-path=/ off`. It never runs
+  `{serve,funnel} --bg --https=<port> <target>`, and `serve --https=<port> --set-path=/ off`.
+  The scoped `serve off` removes the handler and its Funnel permission when no other paths remain,
+  and works even if Funnel authorization has since been revoked. It never runs
   `serve reset`, `up`, `login`, `set`, or `cert`, never changes ACLs or tailnet settings, and never
   elevates. The tailnet policy remains the only authorization source;
 - only the root handler is removed, and only when it still proxies to the upstream Nook recorded;
   other paths on the same port are preserved. A
-  registration replaced by someone else is reported and left untouched.
+  registration replaced by someone else is reported and left untouched. If an external change
+  makes a Funnel registration private, Nook reports it as `foreign` instead of making it public again.
 
 `nook tailscale status` checks the client, `tailscaled`, the login state, HTTPS, and the device
-name, then lists each Nook registration as `active`, `missing`, `foreign`, or `pending`. A public
-registration that cannot be withdrawn is reported as `public` and makes the command fail. It
+name, then lists each Nook registration as `active` (Serve), `active-public` (requested Funnel),
+`missing`, `foreign`, or `pending`. An unexpected public registration that cannot be withdrawn is reported as `public` and makes the command fail. It
 reconciles Tailscale registrations first but does not need Caddy, and exits with status `1` when
 Serve cannot be used.
 
@@ -708,9 +736,9 @@ secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Funnel, rewriting
-framework config files, Angular-specific origin allow-lists, and any public exposure.
-Private Tailscale Serve is opt-in, as described in “Tailscale.”
+LAN/mDNS, multiple services or workspaces, native macOS support, rewriting framework config files,
+Angular-specific origin allow-lists, and public exposure outside Tailscale Funnel.
+Private Tailscale Serve and public Tailscale Funnel are opt-in, as described in [Tailscale](#tailscale).
 
 ## Development
 
