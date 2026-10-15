@@ -134,6 +134,7 @@ struct ProjectConfig {
     command: Option<Vec<String>>,
     tls: Option<bool>,
     tailscale: Option<bool>,
+    funnel: Option<bool>,
     app_port: Option<u16>,
     strict_port: Option<bool>,
     readiness_warn_after_seconds: Option<u64>,
@@ -204,6 +205,7 @@ pub(crate) struct ResolvedRunConfig {
     pub(crate) command: Vec<OsString>,
     pub(crate) tls: bool,
     pub(crate) tailscale: bool,
+    pub(crate) funnel: bool,
     pub(crate) app_port: Option<u16>,
     pub(crate) strict_port: bool,
     pub(crate) force: bool,
@@ -419,6 +421,7 @@ fn merge_project(
         command: local.command.or(base.command),
         tls: local.tls.or(base.tls),
         tailscale: local.tailscale.or(base.tailscale),
+        funnel: local.funnel.or(base.funnel),
         app_port: local.app_port.or(base.app_port),
         strict_port: local.strict_port.or(base.strict_port),
         readiness_warn_after_seconds: local
@@ -442,6 +445,7 @@ fn merge_run(
         command: None,
         tls: None,
         tailscale: None,
+        funnel: None,
         app_port: None,
         strict_port: None,
         readiness_warn_after_seconds: None,
@@ -462,6 +466,9 @@ fn merge_run(
     } else {
         arguments.command.clone()
     };
+    let funnel = !arguments.no_tailscale
+        && !arguments.tailscale
+        && (arguments.funnel || project.funnel.unwrap_or(false));
     Ok(ResolvedRunConfig {
         hostname,
         command,
@@ -473,8 +480,9 @@ fn merge_run(
         tailscale: if arguments.no_tailscale {
             false
         } else {
-            arguments.tailscale || project.tailscale.unwrap_or(false)
+            funnel || arguments.tailscale || project.tailscale.unwrap_or(false)
         },
+        funnel,
         app_port: arguments.app_port.or(project.app_port),
         strict_port: arguments.strict_port || project.strict_port.unwrap_or(false),
         force: arguments.force,
@@ -874,6 +882,9 @@ mod tests {
             (None, Some(false), false),
             (Some("--tailscale"), Some(false), true),
             (Some("--tailscale"), None, true),
+            (Some("--funnel"), None, true),
+            (Some("--funnel"), Some(false), true),
+            (Some("--funnel"), Some(true), true),
             (Some("--no-tailscale"), Some(true), false),
             (Some("--no-tailscale"), None, false),
         ] {
@@ -895,6 +906,39 @@ mod tests {
         }
         let both = Cli::try_parse_from(["nook", "run", "--tailscale", "--no-tailscale"]);
         assert!(both.is_err(), "--tailscale and --no-tailscale conflict");
+    }
+
+    #[test]
+    fn funnel_configuration_respects_cli_exposure_overrides() {
+        for (flag, configured, private, exposure, public) in [
+            (None, None, None, false, false),
+            (None, Some(false), None, false, false),
+            (None, Some(true), None, true, true),
+            (None, Some(true), Some(false), true, true),
+            (None, Some(true), Some(true), true, true),
+            (None, Some(false), Some(true), true, false),
+            (Some("--funnel"), Some(false), None, true, true),
+            (Some("--tailscale"), Some(true), None, true, false),
+            (Some("--no-tailscale"), Some(true), Some(true), false, false),
+        ] {
+            let mut project = project();
+            project.funnel = configured;
+            project.tailscale = private;
+            let args = run_args(&["run"].into_iter().chain(flag).collect::<Vec<_>>());
+            let resolved = merge_run(
+                &args,
+                Some(project),
+                None,
+                Path::new("/cwd"),
+                default_run_bind_address(),
+            )
+            .unwrap();
+            assert_eq!(
+                (resolved.tailscale, resolved.funnel),
+                (exposure, public),
+                "{flag:?}, funnel={configured:?}, tailscale={private:?}"
+            );
+        }
     }
 
     #[test]
@@ -941,6 +985,7 @@ mod tests {
                 "command = [\"base-command\"]\n",
                 "tls = true\n",
                 "tailscale = true\n",
+                "funnel = true\n",
                 "app_port = 8000\n",
                 "strict_port = true\n",
                 "readiness_warn_after_seconds = 20\n",
@@ -956,6 +1001,7 @@ mod tests {
                 "command = [\"local-command\"]\n",
                 "tls = false\n",
                 "tailscale = false\n",
+                "funnel = false\n",
                 "strict_port = false\n",
                 "readiness_warn_after_seconds = 5\n",
                 "run_bind_address = \"0.0.0.0\"\n",
@@ -968,6 +1014,7 @@ mod tests {
         assert_eq!(resolved.command, ["local-command"]);
         assert!(!resolved.tls);
         assert!(!resolved.tailscale);
+        assert!(!resolved.funnel);
         assert_eq!(resolved.app_port, Some(8000));
         assert!(!resolved.strict_port);
         assert_eq!(resolved.readiness_warn_after_seconds, 5);
@@ -1206,6 +1253,7 @@ mod tests {
             command: Some(vec!["project-command".into()]),
             tls: Some(true),
             tailscale: None,
+            funnel: None,
             app_port: Some(8000),
             strict_port: Some(false),
             readiness_warn_after_seconds: Some(20),

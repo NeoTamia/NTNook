@@ -138,6 +138,9 @@ pub(crate) struct TailscaleState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServeRegistration {
+    /// Public exposure must be explicitly requested; older registrations are private.
+    #[serde(default)]
+    pub(crate) funnel: bool,
     pub(crate) owner_id: Uuid,
     pub(crate) hostname: String,
     pub(crate) target: String,
@@ -511,6 +514,7 @@ mod tests {
         registry.tailscale.registrations.insert(
             8443,
             ServeRegistration {
+                funnel: false,
                 owner_id: owner,
                 hostname: "api.localhost".into(),
                 target: "http://127.0.0.1:3000".into(),
@@ -523,6 +527,31 @@ mod tests {
         let json = serde_json::to_vec(&registry).unwrap();
         let decoded = decode(&json).unwrap();
         assert_eq!(decoded.tailscale.registrations[&8443].owner_id, owner);
+        let mut old = serde_json::to_value(&registry).unwrap();
+        old["tailscale"]["registrations"]["8443"]
+            .as_object_mut()
+            .unwrap()
+            .remove("funnel");
+        assert!(
+            !decode(&serde_json::to_vec(&old).unwrap())
+                .unwrap()
+                .tailscale
+                .registrations[&8443]
+                .funnel
+        );
+        registry
+            .tailscale
+            .registrations
+            .get_mut(&8443)
+            .unwrap()
+            .funnel = true;
+        assert!(
+            decode(&serde_json::to_vec(&registry).unwrap())
+                .unwrap()
+                .tailscale
+                .registrations[&8443]
+                .funnel
+        );
         assert_eq!(decoded.tailscale.preferred_ports["api.localhost"], 8443);
     }
 

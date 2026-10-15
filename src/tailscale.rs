@@ -1,9 +1,9 @@
-//! Private Tailscale Serve exposure for runs and aliases.
+//! Private Tailscale Serve and opt-in public Funnel exposure for runs and aliases.
 //!
 //! The module owns every interaction with the `tailscale` CLI. Nook only runs
 //! `tailscale version`, `tailscale status --json`, `tailscale serve status
-//! --json`, `tailscale serve --bg --https=<port> <target>`, and `tailscale serve
-//! --https=<port> --set-path=/ off`. It never runs `serve reset`, `funnel`, `up`, `login`,
+//! --json`, `tailscale {serve,funnel} --bg --https=<port> <target>`, and `tailscale serve
+//! --https=<port> --set-path=/ off`. It never runs `serve reset`, `up`, `login`,
 //! `set`, or `cert`, never changes ACLs or tailnet settings, and never elevates:
 //! the tailnet policy remains the only authorization source.
 //!
@@ -35,6 +35,7 @@ const PROGRAM_VARIABLE: &str = "NOOK_TAILSCALE";
 const MINIMUM_VERSION: (u64, u64) = (1, 52);
 const FIRST_PORT: u16 = 443;
 const FALLBACK_PORTS: std::ops::RangeInclusive<u16> = 8443..=9442;
+const FUNNEL_PORTS: [u16; 3] = [443, 8443, 10000];
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const HTTPS_SETTINGS_URL: &str = "https://login.tailscale.com/admin/dns";
@@ -72,6 +73,8 @@ pub(crate) enum Error {
     NonLoopbackTarget(String),
     UnreachableBindAddress(IpAddr),
     NoFreePort,
+    NoFreeFunnelPort,
+    FunnelDisabled,
     Unconfirmed(u16),
     FunnelEnabled(u16),
     State(crate::state::Error),
@@ -167,13 +170,21 @@ impl fmt::Display for Error {
                 FALLBACK_PORTS.start(),
                 FALLBACK_PORTS.end()
             ),
+            Self::NoFreeFunnelPort => write!(
+                formatter,
+                "no free Tailscale Funnel HTTPS port is left among 443, 8443, and 10000"
+            ),
+            Self::FunnelDisabled => write!(
+                formatter,
+                "Tailscale Funnel is not enabled for this device; a tailnet admin must authorize Funnel first (https://tailscale.com/docs/features/tailscale-funnel); Nook never enables it or changes tailnet settings"
+            ),
             Self::Unconfirmed(port) => write!(
                 formatter,
                 "Tailscale did not report the Serve registration on port {port} after creating it"
             ),
             Self::FunnelEnabled(port) => write!(
                 formatter,
-                "port {port} is exposed through Tailscale Funnel; Nook only manages private Serve and refuses this public exposure"
+                "port {port} is exposed through Tailscale Funnel without a matching Nook Funnel registration; refusing this public exposure"
             ),
             Self::State(error) => error.fmt(formatter),
         }
@@ -267,10 +278,15 @@ struct Shadowed {
 fn allocate_port(
     preferred: Option<u16>,
     taken: &BTreeSet<u16>,
+    funnel: bool,
     mut shadowed: impl FnMut(u16) -> Option<SocketAddr>,
 ) -> (Option<u16>, Vec<Shadowed>) {
     let mut skipped: Vec<Shadowed> = Vec::new();
-    for port in preferred.into_iter().chain(candidate_ports()) {
+    let candidates = candidate_ports().chain(funnel.then_some(10000));
+    for port in preferred.into_iter().chain(candidates) {
+        if funnel && !FUNNEL_PORTS.contains(&port) {
+            continue;
+        }
         if taken.contains(&port) || skipped.iter().any(|skip| skip.port == port) {
             continue;
         }
@@ -330,6 +346,10 @@ struct DeviceJson {
     dns_name: String,
     #[serde(rename = "TailscaleIPs", default)]
     tailscale_ips: Option<Vec<String>>,
+    #[serde(rename = "CapMap", default)]
+    cap_map: Option<std::collections::BTreeMap<String, Value>>,
+    #[serde(rename = "Capabilities", default)]
+    capabilities: Option<Vec<String>>,
 }
 
 /// Registrations belong to the device identity that originally published them.
@@ -358,11 +378,20 @@ pub(crate) struct Diagnosis {
     pub(crate) backend_state: Option<String>,
     pub(crate) https_enabled: Option<bool>,
     pub(crate) dns_name: Option<String>,
+    pub(crate) funnel_enabled: bool,
     tailnet_ips: Vec<IpAddr>,
     pub(crate) result: Result<(), Error>,
 }
 
 impl Diagnosis {
+    fn require_funnel(&self) -> Result<(), Error> {
+        if self.funnel_enabled {
+            Ok(())
+        } else {
+            Err(Error::FunnelDisabled)
+        }
+    }
+
     fn ready_dns_name(self) -> Result<String, Error> {
         self.result?;
         self.dns_name.ok_or(Error::MissingDnsName)
@@ -449,9 +478,36 @@ impl ServeConfig {
             Observation::Absent
         }
     }
+
+    fn observe_registration(
+        &self,
+        dns_name: &str,
+        port: u16,
+        registration: &ServeRegistration,
+    ) -> Observation {
+        let observation = self.observe(dns_name, port, &registration.target);
+        if registration.funnel && !self.foreground_uses_port(port) {
+            match observation {
+                Observation::Public => Observation::Owned,
+                // An external switch to private must not be undone automatically.
+                Observation::Owned => Observation::Foreign,
+                other => other,
+            }
+        } else {
+            observation
+        }
+    }
 }
 
 fn collect_ports(config: &Value, ports: &mut BTreeSet<u16>) {
+    if let Some(funnel) = config.get("AllowFunnel").and_then(Value::as_object) {
+        ports.extend(
+            funnel
+                .iter()
+                .filter(|(_, enabled)| enabled.as_bool() == Some(true))
+                .filter_map(|(host, _)| host_port(host)),
+        );
+    }
     if let Some(tcp) = config.get("TCP").and_then(Value::as_object) {
         ports.extend(tcp.keys().filter_map(|port| port.parse::<u16>().ok()));
     }
@@ -559,6 +615,7 @@ struct Output {
 pub(crate) struct Client {
     program: PathBuf,
     overridden: bool,
+    funnel: bool,
 }
 
 impl Client {
@@ -569,12 +626,19 @@ impl Client {
             Some(program) => Self {
                 program: PathBuf::from(program),
                 overridden: true,
+                funnel: false,
             },
             None => Self {
                 program: PathBuf::from("tailscale"),
                 overridden: false,
+                funnel: false,
             },
         }
+    }
+
+    pub(crate) fn with_funnel(mut self, funnel: bool) -> Self {
+        self.funnel = funnel;
+        self
     }
 
     fn run(&self, arguments: &[&str]) -> Result<Output, Error> {
@@ -620,6 +684,7 @@ impl Client {
             backend_state: None,
             https_enabled: None,
             dns_name: None,
+            funnel_enabled: false,
             tailnet_ips: Vec::new(),
             result: Ok(()),
         };
@@ -645,6 +710,16 @@ impl Client {
             })?;
         diagnosis.backend_state = Some(status.backend_state.clone());
         if let Some(device) = status.this_device {
+            diagnosis.funnel_enabled = ["https", "funnel"].iter().all(|capability| {
+                device
+                    .cap_map
+                    .as_ref()
+                    .is_some_and(|caps| caps.contains_key(*capability))
+                    || device
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(|caps| caps.iter().any(|value| value == capability))
+            });
             let dns_name = device.dns_name.trim_end_matches('.');
             if !dns_name.is_empty() {
                 diagnosis.dns_name = Some(dns_name.to_owned());
@@ -677,7 +752,13 @@ impl Client {
 
     /// Fails with an actionable diagnosis unless Serve can be used now.
     pub(crate) fn require_ready(&self) -> Result<(), Error> {
-        self.diagnose().ready_dns_name().map(|_| ())
+        let diagnosis = self.diagnose();
+        let funnel_enabled = diagnosis.funnel_enabled;
+        diagnosis.ready_dns_name()?;
+        if self.funnel && !funnel_enabled {
+            return Err(Error::FunnelDisabled);
+        }
+        Ok(())
     }
 
     fn serve_config(&self) -> Result<ServeConfig, Error> {
@@ -700,9 +781,26 @@ impl Client {
         }
     }
 
-    fn serve_on(&self, port: u16, target: &str) -> Result<(), Error> {
-        self.checked(&["serve", "--bg", &format!("--https={port}"), target])
-            .map(|_| ())
+    fn serve_on(&self, dns_name: &str, port: u16, target: &str, funnel: bool) -> Result<(), Error> {
+        if funnel {
+            let diagnosis = self.diagnose();
+            let allowed = diagnosis.require_funnel();
+            diagnosis.ready_dns_name()?;
+            allowed?;
+        }
+        let command = if funnel { "funnel" } else { "serve" };
+        self.checked(&[command, "--bg", &format!("--https={port}"), target])?;
+        let config = self.serve_config()?;
+        if !funnel && config.funnel_enabled(port) {
+            Err(Error::FunnelEnabled(port))
+        } else if config.owns(dns_name, port, target)
+            && !config.foreground_uses_port(port)
+            && config.funnel_enabled(port) == funnel
+        {
+            Ok(())
+        } else {
+            Err(Error::Unconfirmed(port))
+        }
     }
 
     fn serve_off(&self, port: u16) -> Result<(), Error> {
@@ -725,6 +823,9 @@ impl Client {
     ) -> Result<Registration, Error> {
         let target = serve_target(target)?;
         let diagnosis = self.diagnose();
+        if self.funnel {
+            diagnosis.require_funnel()?;
+        }
         let tailnet_ips = diagnosis.tailnet_ips.clone();
         let dns_name = diagnosis.ready_dns_name()?;
         let mut config = self.serve_config()?;
@@ -741,8 +842,9 @@ impl Client {
                 .copied()
                 .collect();
             let preferred = registry.tailscale.preferred_ports.get(hostname).copied();
-            let (port, shadowed) =
-                allocate_port(preferred, &taken, |port| local_listener(&tailnet_ips, port));
+            let (port, shadowed) = allocate_port(preferred, &taken, self.funnel, |port| {
+                local_listener(&tailnet_ips, port)
+            });
             skipped = shadowed;
             let Some(port) = port else {
                 return Ok(None);
@@ -750,6 +852,7 @@ impl Client {
             registry.tailscale.registrations.insert(
                 port,
                 ServeRegistration {
+                    funnel: self.funnel,
                     owner_id,
                     hostname: hostname.to_owned(),
                     target: target.clone(),
@@ -762,17 +865,12 @@ impl Client {
             registry.tailscale.dns_name = Some(dns_name.clone());
             Ok(Some(port))
         })?;
-        let port = port.ok_or(Error::NoFreePort)?;
-        let applied = self.serve_on(port, &target).and_then(|()| {
-            let config = self.serve_config()?;
-            if config.funnel_enabled(port) {
-                Err(Error::FunnelEnabled(port))
-            } else if config.observe(&dns_name, port, &target) == Observation::Owned {
-                Ok(())
-            } else {
-                Err(Error::Unconfirmed(port))
-            }
-        });
+        let port = port.ok_or(if self.funnel {
+            Error::NoFreeFunnelPort
+        } else {
+            Error::NoFreePort
+        })?;
+        let applied = self.serve_on(&dns_name, port, &target, self.funnel);
         if let Err(error) = applied {
             let _ = self.release(store, &dns_name, port, owner_id);
             return Err(error);
@@ -892,7 +990,7 @@ impl Client {
         for (port, registration) in &registry.tailscale.registrations {
             let port = *port;
             let owner = owner_state(&registry, registration.owner_id, liveness);
-            let observation = config.observe(dns_name, port, &registration.target);
+            let observation = config.observe_registration(dns_name, port, registration);
             if observation == Observation::Public {
                 if config.foreground_uses_port(port) {
                     report.warnings.push(format!(
@@ -928,7 +1026,7 @@ impl Client {
             };
             match action {
                 Action::Keep => {}
-                Action::Restore => match self.serve_on(port, &registration.target) {
+                Action::Restore => match self.serve_on(dns_name, port, &registration.target, registration.funnel) {
                     Ok(()) => report.restored += 1,
                     Err(error) => report.warnings.push(format!(
                         "restoration of Tailscale Serve port {port} for {} is pending: {error}",
@@ -1006,7 +1104,7 @@ impl Client {
                     .as_ref()
                     .zip(ready_dns_name)
                     .map(|(config, dns_name)| {
-                        config.observe(dns_name, *port, &registration.target)
+                        config.observe_registration(dns_name, *port, registration)
                     }),
             })
             .collect()
@@ -1182,6 +1280,7 @@ mod tests {
         allocate_port(
             preferred,
             &BTreeSet::from_iter(taken.iter().copied()),
+            false,
             |_| None,
         )
         .0
@@ -1197,6 +1296,24 @@ mod tests {
     }
 
     #[test]
+    fn funnel_ignores_an_ineligible_preferred_port() {
+        assert_eq!(
+            allocate_port(Some(8444), &BTreeSet::from([443, 8443]), true, |_| None).0,
+            Some(10000)
+        );
+        assert_eq!(
+            allocate_port(
+                Some(8444),
+                &BTreeSet::from([443, 8443, 10000]),
+                true,
+                |_| None
+            )
+            .0,
+            None
+        );
+    }
+
+    #[test]
     fn a_hostname_gets_its_previous_port_back_when_it_is_still_free() {
         assert_eq!(allocate(Some(8444), &[443]), Some(8444));
         assert_eq!(allocate(Some(8444), &[8444]), Some(443));
@@ -1207,7 +1324,7 @@ mod tests {
         let caddy: SocketAddr = "100.64.0.1:443".parse().unwrap();
         let other: SocketAddr = "100.64.0.1:8444".parse().unwrap();
         let mut probed = Vec::new();
-        let (port, skipped) = allocate_port(Some(443), &BTreeSet::from([8443]), |port| {
+        let (port, skipped) = allocate_port(Some(443), &BTreeSet::from([8443]), false, |port| {
             probed.push(port);
             [caddy, other]
                 .into_iter()
@@ -1442,6 +1559,7 @@ mod tests {
         registry.tailscale.registrations.insert(
             8443,
             ServeRegistration {
+                funnel: false,
                 owner_id: owner,
                 hostname: "api.localhost".into(),
                 target: "http://127.0.0.1:3000".into(),

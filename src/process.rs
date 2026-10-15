@@ -2310,6 +2310,7 @@ mod tests {
             command: command.into_iter().map(OsString::from).collect(),
             tls: true,
             tailscale: false,
+            funnel: false,
             app_port: None,
             strict_port: false,
             force: false,
