@@ -736,9 +736,9 @@ secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-LAN/mDNS, multiple services or workspaces, native macOS support, Tailscale Funnel, rewriting
-framework config files, Angular-specific origin allow-lists, and any public exposure.
-Private Tailscale Serve is opt-in, as described in “Tailscale.”
+LAN/mDNS, multiple services or workspaces, native macOS support, rewriting framework config files,
+Angular-specific origin allow-lists, and public exposure outside Tailscale Funnel.
+Private Tailscale Serve and public Tailscale Funnel are opt-in, as described in [Tailscale](#tailscale).
 
 ## Development
 
