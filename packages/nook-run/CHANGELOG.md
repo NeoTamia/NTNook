@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.0](https://github.com/NeoTamia/NTNook/compare/nook-run-v1.0.1...nook-run-v1.1.0) (2026-10-16)
+
+
+### ✨ Features
+
+* **lan:** Expose local apps through Caddy and mDNS ([faedec9](https://github.com/NeoTamia/NTNook/commit/faedec9ce11c593e11ee984e8960619000e86500))
+* **lan:** Expose local apps through Caddy and mDNS ([a026de4](https://github.com/NeoTamia/NTNook/commit/a026de45b2550ac8d351e93494e7e30c6d33c482))
+
+
+### 🔧 Build System
+
+* **deps:** Update pnpm to v11.25.0 ([#34](https://github.com/NeoTamia/NTNook/issues/34)) ([373a874](https://github.com/NeoTamia/NTNook/commit/373a87436b0a3cbcdb2bdf4a583a55a2b226ffeb))
+* **deps:** Update pnpm to v11.28.5 ([#43](https://github.com/NeoTamia/NTNook/issues/43)) ([35994fa](https://github.com/NeoTamia/NTNook/commit/35994fa2ca76b90ba7d229c63a2703b1db205475))
+* **deps:** Update pnpm to v12 ([#61](https://github.com/NeoTamia/NTNook/issues/61)) ([8546d6d](https://github.com/NeoTamia/NTNook/commit/8546d6d243809eb0d5b6f5d735e70179bfd4c12f))
+* **deps:** Update pnpm to v12.14.0 ([#66](https://github.com/NeoTamia/NTNook/issues/66)) ([f7ea75d](https://github.com/NeoTamia/NTNook/commit/f7ea75da59e5128b82f099d4c11024c1f101c358))
+
 ## [1.0.1](https://github.com/NeoTamia/NTNook/compare/nook-run-v1.0.0...nook-run-v1.0.1) (2026-09-09)
 
 
