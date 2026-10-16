@@ -1,6 +1,6 @@
 //! Command-line parsing, terminal output, and exit-code policy.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -42,6 +42,8 @@ pub(crate) enum Command {
     Status,
     /// Stop a managed run.
     Stop(StopArgs),
+    /// Diagnose Tailscale Serve and Funnel exposure.
+    Tailscale(TailscaleArgs),
     /// Remove stale leases and reconcile routes.
     Prune,
     /// Manage Caddy's local certificate authority.
@@ -77,6 +79,12 @@ pub(crate) struct InitArgs {
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Enable LAN access and automatic .local name discovery.
+    #[arg(long, conflicts_with = "no_lan")]
+    pub(crate) lan: bool,
+    /// Disable LAN mode in this configuration.
+    #[arg(long)]
+    pub(crate) no_lan: bool,
     /// Application bind IP address, also injected as HOST.
     #[arg(long, value_name = "IP")]
     pub(crate) run_bind_address: Option<IpAddr>,
@@ -194,6 +202,21 @@ pub(crate) struct RunArgs {
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Also expose the run privately to the tailnet with Tailscale Serve.
+    #[arg(long)]
+    pub(crate) tailscale: bool,
+    /// Also expose publicly on the internet with Tailscale Funnel.
+    #[arg(long, conflicts_with = "tailscale")]
+    pub(crate) funnel: bool,
+    /// Disable Tailscale Serve and Funnel even when enabled in the project configuration.
+    #[arg(long, conflicts_with_all = ["tailscale", "funnel"])]
+    pub(crate) no_tailscale: bool,
+    /// Expose http://<name>.local on the LAN through Caddy.
+    #[arg(long, conflicts_with = "no_lan")]
+    pub(crate) lan: bool,
+    /// Disable LAN mode even when enabled in the project configuration.
+    #[arg(long)]
+    pub(crate) no_lan: bool,
     /// Application bind IP address, also injected as HOST.
     #[arg(long, value_name = "IP")]
     pub(crate) run_bind_address: Option<IpAddr>,
@@ -251,6 +274,12 @@ pub(crate) struct AliasSetArgs {
     /// Expose the alias over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Also expose the alias privately to the tailnet with Tailscale Serve.
+    #[arg(long)]
+    pub(crate) tailscale: bool,
+    /// Also expose publicly on the internet with Tailscale Funnel.
+    #[arg(long, conflicts_with = "tailscale")]
+    pub(crate) funnel: bool,
     /// Pass the requested `.localhost` Host header to the upstream.
     #[arg(long)]
     pub(crate) preserve_host: bool,
@@ -263,6 +292,18 @@ pub(crate) struct AliasSetArgs {
 pub(crate) struct AliasRemoveArgs {
     /// Alias name to remove.
     pub(crate) name: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TailscaleArgs {
+    #[command(subcommand)]
+    pub(crate) command: TailscaleCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum TailscaleCommand {
+    /// Check client, tailscaled, login, HTTPS, and Nook Serve registrations.
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -334,7 +375,10 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
     if let Some(socket) = caddy_socket {
         global.caddy_admin = format!("unix/{socket}");
     }
-    if !matches!(&command, Command::Prune | Command::Ca(_)) {
+    if !matches!(
+        &command,
+        Command::Prune | Command::Ca(_) | Command::Tailscale(_)
+    ) {
         reconcile_before_command(&global, errors)?;
     }
     match command {
@@ -352,6 +396,9 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Prune => prune_command(&global, output, errors).map(|()| 0),
         Command::Run(arguments) => run_command(arguments, &global, errors),
         Command::Stop(arguments) => stop_command(arguments, output).map(|()| 0),
+        Command::Tailscale(TailscaleArgs {
+            command: TailscaleCommand::Status,
+        }) => tailscale_status_command(output, errors).map(|()| 0),
         Command::Ca(CaArgs {
             command: CaCommand::Export(arguments),
         }) => ca_export_command(arguments, &global, output).map(|()| 0),
@@ -433,6 +480,23 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
     } else {
         contents.push_str("# Expose the application over HTTPS.\n# tls = true\n\n");
     }
+    contents.push_str(
+        "# Also expose `nook run` privately to the tailnet with Tailscale Serve.\n# tailscale = false\n\n",
+    );
+    contents.push_str(
+        "# Also expose `nook run` publicly on the internet with Tailscale Funnel.\n# funnel = false\n\n",
+    );
+    contents.push_str(
+        "# Serve http://<name>.local through Caddy with automatic name discovery.\n\
+         # Requires Caddy to listen on port 80 on the LAN.\n\
+         # lan = true does NOT set run_bind_address to 0.0.0.0.\n\
+         # With the default 127.0.0.1 bind, LAN access goes through Caddy only.\n",
+    );
+    if arguments.lan || arguments.no_lan {
+        contents.push_str(&format!("lan = {}\n\n", arguments.lan));
+    } else {
+        contents.push_str("# lan = false\n\n");
+    }
     match arguments.app_port {
         Some(port) => contents.push_str(&format!(
             "# Preferred application port.\napp_port = {port}\n\n"
@@ -453,7 +517,12 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
             "# Delay before the readiness warning.\n# readiness_warn_after_seconds = 30\n",
         ),
     }
-    contents.push_str("\n# Interface used to bind the application and injected as HOST.\n");
+    contents.push_str(
+        "\n# Interface used to bind the application and injected as HOST.\n\
+         # If omitted, uses the global run_bind_address (default: 127.0.0.1).\n\
+         # --run-bind-address overrides this value.\n\
+         # Set 0.0.0.0 explicitly to also allow direct LAN access via IP:port.\n",
+    );
     match arguments.run_bind_address {
         Some(address) => contents.push_str(&format!(
             "run_bind_address = {}\n",
@@ -770,7 +839,7 @@ _nook_dynamic() {
     fi
 
     case "$subcommand" in
-        init|run|alias|list|status|stop|prune|ca|config|completions|update|help|-*) ;;
+        init|run|alias|list|status|stop|prune|tailscale|ca|config|completions|update|help|-*) ;;
         *)
             if (( COMP_CWORD == command_index + 1 )); then
                 _nook_dynamic_word run "$current"
@@ -932,7 +1001,7 @@ _nook_dynamic() {
     fi
 
     case "$subcommand" in
-        init|run|alias|list|status|stop|prune|ca|config|completions|update|help|-*) ;;
+        init|run|alias|list|status|stop|prune|tailscale|ca|config|completions|update|help|-*) ;;
         *)
             (( CURRENT == command_index + 1 )) && _nook_dynamic_word run "$current"
             ;;
@@ -1021,7 +1090,7 @@ const POWERSHELL_DYNAMIC_COMPLETION: &str = r#"
                 $dynamicKind = 'aliases'
             }
         } elseif ($subcommand -notin @(
-            'init', 'run', 'list', 'status', 'prune', 'ca', 'config',
+            'init', 'run', 'list', 'status', 'prune', 'tailscale', 'ca', 'config',
             'completions', 'update', 'help'
         ) -and $currentIndex -eq $commandIndex + 1 -and
             'run'.StartsWith($wordToComplete)) {
@@ -1212,16 +1281,78 @@ fn run_command(
         )?;
     }
     let store = state_store()?;
-    with_caddy_routes(global, config.tls, !config.tls, |routes| {
-        let mut running = crate::process::start_run(&config, &store, routes)?;
+    let tailscale = config
+        .tailscale
+        .then(crate::tailscale::Client::from_environment)
+        .map(|client| client.with_funnel(config.funnel));
+    if let Some(client) = &tailscale {
+        crate::tailscale::reachable_bind_address(config.bind_address)?;
+        client.require_ready()?;
+    }
+    with_caddy_routes(global, config.tls, !config.tls || config.lan, |routes| {
+        if config.lan {
+            routes.require_lan_listener()?;
+        }
+        let mut exposure = tailscale.as_ref().map(crate::tailscale::ServeExposure::new);
+        let mut running = match &mut exposure {
+            Some(exposure) => crate::process::start_exposed_run(&config, &store, routes, exposure)?,
+            None => crate::process::start_run(&config, &store, routes)?,
+        };
+        let registration = exposure.and_then(|exposure| exposure.registration);
         let scheme = if config.tls { "https" } else { "http" };
+        if config.funnel {
+            writeln!(
+                errors,
+                "nook: exposure=public (Tailscale Funnel; accessible from the internet)"
+            )?;
+        }
+        let tailscale_url = registration
+            .as_ref()
+            .map(|registration| format!(" tailscale_url={}", registration.url))
+            .unwrap_or_default();
         writeln!(
             errors,
-            "nook: domain={} url={scheme}://{} port={}",
+            "nook: domain={} url={scheme}://{} port={}{tailscale_url}",
             running.hostname, running.hostname, running.port
         )?;
+        if config.lan {
+            writeln!(
+                errors,
+                "nook: lan_url=http://{}",
+                crate::lan::hostname(&running.hostname)
+            )?;
+            match crate::lan::addresses() {
+                Ok(addresses) if !addresses.is_empty() => {
+                    for address in addresses {
+                        if config.bind_address == std::net::IpAddr::V4(address)
+                            || config.bind_address == std::net::Ipv4Addr::UNSPECIFIED
+                        {
+                            writeln!(errors, "nook: lan_ip_url=http://{address}:{}", running.port)?;
+                        }
+                    }
+                }
+                Ok(_) => writeln!(
+                    errors,
+                    "warning: no LAN IPv4 address found; connect to a network to use --lan"
+                )?,
+                Err(error) => writeln!(errors, "warning: cannot list LAN addresses: {error}")?,
+            }
+        }
         if let Some(warning) = &running.warning {
             writeln!(errors, "warning: {warning}")?;
+        }
+        for warning in registration
+            .iter()
+            .flat_map(|registration| &registration.warnings)
+        {
+            writeln!(errors, "warning: {warning}")?;
+        }
+        // Registration happens before displaced owners leave the registry.
+        // Withdraw their Serve registrations once the replacement is recorded.
+        if config.force {
+            for warning in converge_tailscale_now(&store) {
+                writeln!(errors, "warning: {warning}")?;
+            }
         }
         let _ready = running.wait_for_readiness(&store, |warning| {
             let _ = writeln!(errors, "warning: {warning}");
@@ -1229,6 +1360,11 @@ fn run_command(
         let outcome = running.finish(&store, routes)?;
         for warning in outcome.warnings {
             writeln!(errors, "warning: {warning}")?;
+        }
+        if registration.is_some() {
+            for warning in converge_tailscale_now(&store) {
+                writeln!(errors, "warning: {warning}")?;
+            }
         }
         Ok(outcome.exit_code)
     })
@@ -1275,16 +1411,51 @@ fn set_alias_command(
         force: arguments.force,
     };
     let store = crate::state::Store::new(crate::state::state_path()?);
+    let tailscale = (arguments.tailscale || arguments.funnel)
+        .then(crate::tailscale::Client::from_environment)
+        .map(|client| client.with_funnel(arguments.funnel));
+    if let Some(client) = &tailscale {
+        crate::tailscale::serve_target(&request.target)?;
+        client.require_ready()?;
+    }
     with_caddy_routes(global, request.tls, !request.tls, |routes| {
-        let outcome = crate::reconcile::set_alias(&store, routes, request)?;
+        let (outcome, registration) =
+            crate::reconcile::set_alias_with(&store, routes, request, |operations, alias| {
+                tailscale
+                    .as_ref()
+                    .map(|client| {
+                        client.register(
+                            operations,
+                            &store,
+                            alias.id,
+                            &alias.hostname,
+                            &alias.target,
+                            crate::process::lease_liveness,
+                        )
+                    })
+                    .transpose()
+                    .map_err(crate::Error::from)
+            })?;
         for warning in outcome.warnings {
             writeln!(errors, "warning: {warning}")?;
         }
-        writeln!(
-            output,
-            "{} -> {}",
-            outcome.alias.hostname, outcome.alias.target
-        )?;
+        for warning in converge_tailscale_now(&store) {
+            writeln!(errors, "warning: {warning}")?;
+        }
+        let alias = outcome.alias;
+        writeln!(output, "{} -> {}", alias.hostname, alias.target)?;
+        if let Some(registration) = registration {
+            if arguments.funnel {
+                writeln!(
+                    output,
+                    "exposure=public (Tailscale Funnel; accessible from the internet)"
+                )?;
+            }
+            for warning in &registration.warnings {
+                writeln!(errors, "warning: {warning}")?;
+            }
+            writeln!(output, "{} -> {}", registration.url, alias.target)?;
+        }
         Ok(())
     })
 }
@@ -1304,6 +1475,9 @@ fn remove_alias_command(
     };
     with_caddy_routes(global, alias.tls, !alias.tls, |routes| {
         for warning in crate::reconcile::remove_alias(&store, routes, &hostname)? {
+            writeln!(errors, "warning: {warning}")?;
+        }
+        for warning in converge_tailscale_now(&store) {
             writeln!(errors, "warning: {warning}")?;
         }
         writeln!(output, "removed {hostname}")?;
@@ -1335,14 +1509,117 @@ fn write_registry_list(
             crate::state::LeaseState::Starting => "starting",
             crate::state::LeaseState::Ready => "ready",
         };
-        writeln!(output, "run\t{state}\t{}\t{}", lease.hostname, lease.target)?;
+        write!(output, "run\t{state}\t{}\t{}", lease.hostname, lease.target)?;
+        write_tailscale_columns(registry, lease.id, &lease.hostname, lease.tls, output)?;
     }
     for alias in registry.aliases.values() {
-        writeln!(
+        write!(
             output,
             "alias\tpersistent\t{}\t{}",
             alias.hostname, alias.target
         )?;
+        write_tailscale_columns(registry, alias.id, &alias.hostname, alias.tls, output)?;
+    }
+    Ok(())
+}
+
+/// Tailscale-exposed entries also list their local and tailnet URLs.
+fn write_tailscale_columns(
+    registry: &crate::state::Registry,
+    owner_id: uuid::Uuid,
+    hostname: &str,
+    tls: bool,
+    output: &mut impl Write,
+) -> crate::Result<()> {
+    match crate::tailscale::recorded_url(registry, owner_id) {
+        Some(url) => {
+            let scheme = if tls { "https" } else { "http" };
+            write!(output, "\t{scheme}://{hostname}\t{url}")?;
+            if registry
+                .tailscale
+                .registrations
+                .values()
+                .any(|registration| registration.owner_id == owner_id && registration.funnel)
+            {
+                write!(output, "\tpublic")?;
+            }
+            writeln!(output)?;
+        }
+        None => writeln!(output)?,
+    }
+    Ok(())
+}
+
+fn tailscale_status_command(output: &mut impl Write, errors: &mut impl Write) -> crate::Result<()> {
+    let store = state_store()?;
+    let client = crate::tailscale::Client::from_environment();
+    for warning in converge_tailscale_now(&store) {
+        writeln!(errors, "warning: {warning}")?;
+    }
+    let diagnosis = client.diagnose();
+    let registry = store.load()?;
+    let unknown = "unknown";
+    writeln!(
+        output,
+        "client\t{}",
+        diagnosis.version.as_deref().unwrap_or("unavailable")
+    )?;
+    let daemon = match (&diagnosis.backend_state, &diagnosis.result) {
+        (Some(_), _) => "reachable",
+        (None, Err(crate::tailscale::Error::DaemonUnavailable(_))) => "unreachable",
+        (None, _) => unknown,
+    };
+    writeln!(output, "tailscaled\t{daemon}")?;
+    writeln!(
+        output,
+        "backend\t{}",
+        diagnosis.backend_state.as_deref().unwrap_or(unknown)
+    )?;
+    let https = match diagnosis.https_enabled {
+        Some(true) => "enabled",
+        Some(false) => "disabled",
+        None => unknown,
+    };
+    writeln!(output, "https\t{https}")?;
+    writeln!(
+        output,
+        "dns_name\t{}",
+        diagnosis.dns_name.as_deref().unwrap_or(unknown)
+    )?;
+    writeln!(
+        output,
+        "exposure\tprivate tailnet Serve; public internet Funnel with --funnel or funnel = true"
+    )?;
+    let mut public_port = None;
+    for observed in client.observe(&registry, &diagnosis) {
+        let state = match observed.observation {
+            Some(crate::tailscale::Observation::Owned) if observed.registration.funnel => {
+                "active-public"
+            }
+            Some(crate::tailscale::Observation::Owned) => "active",
+            Some(crate::tailscale::Observation::Public) => {
+                public_port.get_or_insert(observed.port);
+                "public"
+            }
+            Some(crate::tailscale::Observation::Absent) => "missing",
+            Some(crate::tailscale::Observation::Foreign) => "foreign",
+            None => "pending",
+        };
+        writeln!(
+            output,
+            "registration\t{}\t{}\t{}\t{}\t{state}",
+            observed.port,
+            observed.registration.hostname,
+            observed.registration.target,
+            observed.url.as_deref().unwrap_or(unknown)
+        )?;
+    }
+    diagnosis.result?;
+    if let Some(dns_name) = diagnosis.dns_name.as_deref() {
+        crate::tailscale::check_identity(&registry, dns_name)?;
+    }
+    if let Some(port) = public_port {
+        return Err(crate::tailscale::Error::FunnelEnabled(port).into());
     }
     Ok(())
 }
@@ -1435,7 +1712,7 @@ fn prune_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
-    let _operations = store.lock_operations()?;
+    let operations = store.lock_operations()?;
     let registry = store.load()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
@@ -1451,7 +1728,7 @@ fn prune_command(
     let expected = expected_routes(&registry);
     let mut removed_orphans = 0;
     for observed in inspection.routes {
-        if !expected.contains_key(&observed.owner_id) {
+        if !expected.iter().any(|(id, _, _)| *id == observed.owner_id) {
             match routes.remove_if_owned(&observed.hostname, observed.owner_id, observed.tls) {
                 Ok(()) => removed_orphans += 1,
                 Err(error) => writeln!(
@@ -1466,10 +1743,19 @@ fn prune_command(
     for warning in &report.warnings {
         writeln!(errors, "warning: {warning}")?;
     }
+    let tailscale = converge_tailscale(&operations, &store);
+    for warning in &tailscale.warnings {
+        writeln!(errors, "warning: {warning}")?;
+    }
     writeln!(
         output,
-        "restored={} removed_dead={} removed_orphans={} completed_operations={}",
-        report.restored, report.removed_dead_leases, removed_orphans, report.completed_operations
+        "restored={} removed_dead={} removed_orphans={} completed_operations={} tailscale_restored={} tailscale_removed={}",
+        report.restored,
+        report.removed_dead_leases,
+        removed_orphans,
+        report.completed_operations,
+        tailscale.restored,
+        tailscale.removed
     )?;
     Ok(())
 }
@@ -1479,9 +1765,42 @@ fn reconcile_before_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
+    let operations = store.lock_operations()?;
+    let registry = store.load()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let selection = available_servers(global, &config)?;
+    let mut protocols: BTreeSet<_> = expected_routes(&registry)
+        .into_iter()
+        .map(|(_, _, tls)| tls)
+        .collect();
+    for operation in &registry.pending_operations {
+        use crate::state::PendingOperationKind::*;
+        match operation.kind {
+            InstallRoute { tls, .. }
+            | RestoreRoute { tls, .. }
+            | RemoveRoute { tls, .. }
+            | StartProcess { tls, .. } => {
+                protocols.insert(tls);
+            }
+            FinalizeLease { .. } => {}
+        }
+    }
+    let mut selection = crate::caddy::ServerSelection {
+        https: None,
+        http: None,
+    };
+    for tls in protocols {
+        match select_servers(global, &config, tls, !tls) {
+            Ok(selected) => {
+                if tls {
+                    selection.https = selected.https;
+                } else {
+                    selection.http = selected.http;
+                }
+            }
+            Err(error) => writeln!(errors, "warning: route reconciliation is pending: {error}")?,
+        }
+    }
     let mut routes = crate::caddy::ManagedCaddyRoutes {
         client: &client,
         https_server: selection.https.as_deref(),
@@ -1489,12 +1808,39 @@ fn reconcile_before_command(
         loopback_host: &global.caddy_loopback_host,
         client_ip_ranges: &global.caddy_client_ip_ranges,
     };
-    let _operations = store.lock_operations()?;
     let report = reconcile_and_record(&store, &mut routes, &selection)?;
     for warning in report.warnings {
         writeln!(errors, "warning: {warning}")?;
     }
+    for warning in converge_tailscale(&operations, &store).warnings {
+        writeln!(errors, "warning: {warning}")?;
+    }
     Ok(())
+}
+
+/// Converges Tailscale Serve registrations; Tailscale only runs when the
+/// registry tracks at least one, and failures never abort the command.
+fn converge_tailscale(
+    operations: &crate::state::OperationGuard,
+    store: &crate::state::Store,
+) -> crate::tailscale::Report {
+    crate::tailscale::Client::from_environment()
+        .reconcile(operations, store, crate::process::lease_liveness)
+        .unwrap_or_else(|error| crate::tailscale::Report {
+            warnings: vec![format!(
+                "Tailscale Serve reconciliation is pending: {error}"
+            )],
+            ..crate::tailscale::Report::default()
+        })
+}
+
+fn converge_tailscale_now(store: &crate::state::Store) -> Vec<String> {
+    match store.lock_operations() {
+        Ok(operations) => converge_tailscale(&operations, store).warnings,
+        Err(error) => vec![format!(
+            "Tailscale Serve reconciliation is pending: {error}"
+        )],
+    }
 }
 
 fn reconcile_and_record(
@@ -1563,18 +1909,24 @@ fn available_servers(
     )?)
 }
 
-fn expected_routes(registry: &crate::state::Registry) -> BTreeMap<uuid::Uuid, (&str, bool)> {
-    registry
+fn expected_routes(
+    registry: &crate::state::Registry,
+) -> std::collections::BTreeSet<(uuid::Uuid, String, bool)> {
+    let mut routes: std::collections::BTreeSet<_> = registry
         .aliases
         .values()
-        .map(|alias| (alias.id, (alias.hostname.as_str(), alias.tls)))
+        .map(|alias| (alias.id, alias.hostname.clone(), alias.tls))
         .chain(
             registry
                 .leases
                 .values()
-                .map(|lease| (lease.id, (lease.hostname.as_str(), lease.tls))),
+                .map(|lease| (lease.id, lease.hostname.clone(), lease.tls)),
         )
-        .collect()
+        .collect();
+    for lease in registry.leases.values().filter(|lease| lease.lan) {
+        routes.insert((lease.id, crate::lan::hostname(&lease.hostname), false));
+    }
+    routes
 }
 
 fn drift_messages(
@@ -1582,23 +1934,20 @@ fn drift_messages(
     inspection: &crate::caddy::ManagedInspection,
 ) -> Vec<String> {
     let expected = expected_routes(registry);
-    let observed: BTreeMap<_, _> = inspection
+    let observed: std::collections::BTreeSet<_> = inspection
         .routes
         .iter()
-        .map(|route| (route.owner_id, (route.hostname.as_str(), route.tls)))
+        .map(|route| (route.owner_id, route.hostname.clone(), route.tls))
         .collect();
     let mut messages = Vec::new();
-    for (owner, route) in &expected {
-        if observed.get(owner) != Some(route) {
-            messages.push(format!(
-                "route {} is missing or differs from the registry",
-                route.0
-            ));
-        }
+    for (_, hostname, _) in expected.difference(&observed) {
+        messages.push(format!(
+            "route {hostname} is missing or differs from the registry"
+        ));
     }
-    for (owner, route) in observed {
-        if !expected.contains_key(&owner) {
-            messages.push(format!("route {} has no registry owner", route.0));
+    for (owner, hostname, _) in observed.difference(&expected) {
+        if !expected.iter().any(|(id, _, _)| id == owner) {
+            messages.push(format!("route {hostname} has no registry owner"));
         }
     }
     messages
@@ -1676,6 +2025,7 @@ fn is_command(value: &OsStr) -> bool {
         "status",
         "stop",
         "prune",
+        "tailscale",
         "ca",
         "config",
         "completions",
@@ -1755,6 +2105,38 @@ mod tests {
         assert!(run.local);
         assert_eq!(run.readiness_warn_after, Some(12));
         assert_eq!(run.command, ["bun", "dev"]);
+    }
+
+    #[test]
+    fn lan_is_opt_in_and_accepts_an_explicit_bind_address() {
+        for command in ["run", "init"] {
+            assert_eq!(
+                try_parse(&[command, "--lan", "--no-lan"])
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::ArgumentConflict
+            );
+            assert!(try_parse(&[command, "--no-lan"]).is_ok());
+        }
+        for args in [
+            vec!["run", "--lan", "--", "server"],
+            vec!["api", "run", "--lan", "--", "server"],
+        ] {
+            let Command::Run(run) = parse(&args).command else {
+                unreachable!()
+            };
+            assert!(run.lan);
+        }
+        for command in ["run", "init"] {
+            for address in ["127.0.0.1", "0.0.0.0"] {
+                assert!(try_parse(&[command, "--lan", "--run-bind-address", address]).is_ok());
+            }
+        }
+        let Command::Run(run) = parse(&["run", "--", "server", "--lan"]).command else {
+            unreachable!()
+        };
+        assert!(!run.lan);
+        assert_eq!(run.command, ["server", "--lan"]);
     }
 
     #[test]
@@ -2074,6 +2456,7 @@ mod tests {
             registry.leases.insert(
                 id,
                 Lease {
+                    lan: false,
                     id,
                     hostname: hostname.into(),
                     target: "http://127.0.0.1:3000".into(),
@@ -2101,6 +2484,73 @@ mod tests {
         assert!(output.contains("run\tstarting\tstarting.localhost"));
         assert!(output.contains("run\tready\tready.localhost"));
         assert!(output.contains("alias\tpersistent\talias.localhost"));
+    }
+
+    #[test]
+    fn list_output_adds_local_and_tailnet_urls_only_to_tailscale_exposed_entries() {
+        let mut registry = Registry::empty();
+        let exposed = Alias {
+            id: Uuid::new_v4(),
+            hostname: "exposed.localhost".into(),
+            target: "http://127.0.0.1:4000/".into(),
+            scheme: Scheme::Http,
+            tls: false,
+            preserve_host: false,
+        };
+        let local = Alias {
+            id: Uuid::new_v4(),
+            hostname: "local.localhost".into(),
+            ..exposed.clone()
+        };
+        registry.tailscale.dns_name = Some("host.example.ts.net".into());
+        registry.tailscale.registrations.insert(
+            8443,
+            crate::state::ServeRegistration {
+                funnel: false,
+                owner_id: exposed.id,
+                hostname: exposed.hostname.clone(),
+                target: "http://127.0.0.1:4000".into(),
+            },
+        );
+        registry.aliases.insert(exposed.hostname.clone(), exposed);
+        registry.aliases.insert(local.hostname.clone(), local);
+        let mut output = Vec::new();
+        write_registry_list(&registry, &mut output).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "alias\tpersistent\texposed.localhost\thttp://127.0.0.1:4000/\thttp://exposed.localhost\thttps://host.example.ts.net:8443\n\
+             alias\tpersistent\tlocal.localhost\thttp://127.0.0.1:4000/\n"
+        );
+    }
+
+    #[test]
+    fn tailscale_is_opt_in_for_run_and_alias_and_has_a_status_command() {
+        let Command::Run(run) = parse(&["api", "run", "--tailscale", "--", "server"]).command
+        else {
+            panic!("expected run command");
+        };
+        assert!(run.tailscale);
+        let Command::Run(run) = parse(&["run", "--", "server", "--tailscale"]).command else {
+            panic!("expected run command");
+        };
+        assert!(!run.tailscale);
+        assert_eq!(run.command, ["server", "--tailscale"]);
+        let Command::Alias(alias) = parse(&["alias", "api", "3000", "--tailscale"]).command else {
+            panic!("expected alias command");
+        };
+        let AliasCommand::Set(set) = alias.command else {
+            panic!("expected alias set");
+        };
+        assert!(set.tailscale);
+        assert!(matches!(
+            parse(&["tailscale", "status"]).command,
+            Command::Tailscale(_)
+        ));
+        assert!(try_parse(&["tailscale", "funnel"]).is_err());
+        assert!(try_parse(&["run", "--funnel", "--tailscale", "--", "server"]).is_err());
+        assert!(try_parse(&["run", "--funnel", "--no-tailscale", "--", "server"]).is_err());
+        assert!(try_parse(&["alias", "api", "3000", "--funnel", "--tailscale"]).is_err());
+        assert!(try_parse(&["tailscale", "reset"]).is_err());
     }
 
     #[test]

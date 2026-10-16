@@ -1,6 +1,6 @@
 [package]
 name = "ntnook"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Expose local applications through stable *.localhost domains using Caddy"
@@ -16,6 +16,10 @@ exclude = ["packages/**"]
 name = "nook"
 path = "src/main.rs"
 
+[[test]]
+name = "tailscale_serve"
+harness = false
+
 [dependencies]
 clap = { version = "4.5.45", features = ["derive"] }
 clap_complete = "4.6.8"
@@ -26,6 +30,8 @@ uuid = { version = "1.18.0", features = ["serde", "v4"] }
 url = "2.5.7"
 base64 = "0.23.1"
 ipnet = "2.11.0"
+if-addrs = "0.15.0"
+mdns-sd = { version = "0.21.5", default-features = false }
 sha2 = "0.11.0"
 tar = "0.4.46"
 lzma-rs = "0.3.0"

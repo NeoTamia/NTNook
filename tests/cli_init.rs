@@ -39,11 +39,45 @@ fn init_creates_a_documented_project_configuration() {
     assert!(contents.contains("tls = false"));
     assert!(contents.contains("app_port = 5173"));
     assert!(contents.contains("strict_port = true"));
+    assert!(contents.contains("# lan = false"));
     assert!(contents.contains("readiness_warn_after_seconds = 12"));
     let parsed = toml::from_str::<toml::Value>(&contents).unwrap();
     assert_eq!(parsed["run_bind_address"].as_str(), Some("::1"));
 
     toml::from_str::<toml::Value>(&contents).expect("generated TOML should parse");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn init_writes_explicit_lan_overrides_to_shared_and_local_files() {
+    let directory = temporary_directory();
+    for (flag, expected) in [("--lan", true), ("--no-lan", false)] {
+        for (local, filename) in [(false, "nook.toml"), (true, "nook.local.toml")] {
+            let mut args = vec!["init", "--force", flag];
+            if local {
+                args.push("--local");
+            }
+            let output = nook(&directory, &args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let contents = fs::read_to_string(directory.join(filename)).unwrap();
+            let parsed: toml::Value = toml::from_str(&contents).unwrap();
+            assert_eq!(parsed["lan"].as_bool(), Some(expected));
+            assert!(parsed.get("run_bind_address").is_none());
+        }
+    }
+    let output = nook(
+        &directory,
+        &["init", "--force", "--lan", "--run-bind-address", "0.0.0.0"],
+    );
+    assert!(output.status.success());
+    let parsed: toml::Value =
+        toml::from_str(&fs::read_to_string(directory.join("nook.toml")).unwrap()).unwrap();
+    assert_eq!(parsed["lan"].as_bool(), Some(true));
+    assert_eq!(parsed["run_bind_address"].as_str(), Some("0.0.0.0"));
     fs::remove_dir_all(directory).unwrap();
 }
 

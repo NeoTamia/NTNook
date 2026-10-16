@@ -27,7 +27,19 @@ All arguments are passed directly to `nook run` without an intermediate shell:
 
 ```sh
 nook-run --name api --app-port 3000 --strict-port -- node server.js
+nook-run --name web --lan -- vite
 ```
+
+With `--lan`, Nook prints an HTTP `.local` URL without a port, served through Caddy on port 80.
+The application keeps its random port and loopback bind by default. Add
+`--run-bind-address 0.0.0.0` to also allow direct `IP:port` access. Recognized framework CLIs receive host/port flags automatically; other applications
+must listen on `HOST`/`PORT` or receive equivalent flags.
+This requires a system Nook version that supports `--lan`; the direct fallback does not provide
+mDNS announcements.
+
+LAN mode can also be enabled with `lan = true` in `nook.toml` or `nook.local.toml`.
+The local file overrides the shared file, including `lan = false`; `--lan` and `--no-lan`
+override either setting.
 
 The command inherits the terminal and environment, forwards `SIGINT` and `SIGTERM`, and returns the launched process's exit code.
 

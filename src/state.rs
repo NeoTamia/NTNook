@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -61,6 +61,8 @@ pub(crate) struct Registry {
     #[serde(default)]
     pub(crate) leases: BTreeMap<Uuid, Lease>,
     #[serde(default)]
+    pub(crate) tailscale: TailscaleState,
+    #[serde(default)]
     pub(crate) selected_servers: SelectedServers,
     pub(crate) last_synchronized_at_unix_ms: Option<u64>,
     #[serde(default)]
@@ -92,6 +94,8 @@ pub(crate) struct Alias {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Lease {
+    #[serde(default)]
+    pub(crate) lan: bool,
     pub(crate) id: Uuid,
     pub(crate) hostname: String,
     pub(crate) target: String,
@@ -116,6 +120,32 @@ pub(crate) enum Scheme {
 pub(crate) enum LeaseState {
     Starting,
     Ready,
+}
+
+/// Tailscale Serve registrations created by Nook, keyed by tailnet HTTPS port.
+///
+/// A registration is written before the Serve change is applied and removed
+/// only after Tailscale confirms the removal, so it doubles as the journal for
+/// interrupted operations. Its owner is the UUID of a lease or alias.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TailscaleState {
+    pub(crate) dns_name: Option<String>,
+    #[serde(default)]
+    pub(crate) registrations: BTreeMap<u16, ServeRegistration>,
+    #[serde(default)]
+    pub(crate) preferred_ports: BTreeMap<String, u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServeRegistration {
+    /// Public exposure must be explicitly requested; older registrations are private.
+    #[serde(default)]
+    pub(crate) funnel: bool,
+    pub(crate) owner_id: Uuid,
+    pub(crate) hostname: String,
+    pub(crate) target: String,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,9 +207,23 @@ pub(crate) fn decode(contents: &[u8]) -> Result<Registry, Error> {
         .and_then(Value::as_u64)
         .ok_or(Error::MissingVersion)?;
     match version {
-        1 => serde_json::from_value(value).map_err(Error::InvalidJson),
+        1 => migrate_v1(value),
+        2 => serde_json::from_value(value).map_err(Error::InvalidJson),
         other => Err(Error::UnsupportedVersion(other)),
     }
+}
+
+/// Version 2 only adds the `tailscale` section; aliases, leases, and journals
+/// keep their v1 wire format and are carried over unchanged.
+fn migrate_v1(value: Value) -> Result<Registry, Error> {
+    if value.get("tailscale").is_some() {
+        return Err(Error::InvalidJson(serde::de::Error::custom(
+            "format_version 1 registries cannot contain `tailscale`",
+        )));
+    }
+    let mut registry: Registry = serde_json::from_value(value).map_err(Error::InvalidJson)?;
+    registry.format_version = FORMAT_VERSION;
+    Ok(registry)
 }
 
 fn default_true() -> bool {
@@ -351,8 +395,8 @@ fn state_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Er
 #[cfg(test)]
 mod tests {
     use super::{
-        Alias, Error, LeaseState, PendingOperation, PendingOperationKind, Registry, Scheme, Store,
-        decode, state_path_with,
+        Alias, Error, LeaseState, PendingOperation, PendingOperationKind, Registry, Scheme,
+        ServeRegistration, Store, decode, state_path_with,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -416,11 +460,101 @@ mod tests {
     #[test]
     fn unknown_versions_corruption_and_unknown_fields_are_safe_errors() {
         assert!(matches!(
-            decode(br#"{"format_version":2}"#),
-            Err(Error::UnsupportedVersion(2))
+            decode(br#"{"format_version":3}"#),
+            Err(Error::UnsupportedVersion(3))
         ));
         assert!(matches!(decode(b"not json"), Err(Error::InvalidJson(_))));
         assert!(matches!(decode(br#"{"format_version":1,"aliases":{},"leases":{},"selected_servers":{},"last_synchronized_at_unix_ms":null,"pending_operations":[],"surprise":true}"#), Err(Error::InvalidJson(_))));
+        assert!(matches!(decode(br#"{"format_version":2,"tailscale":{"registrations":{},"surprise":1},"last_synchronized_at_unix_ms":null}"#), Err(Error::InvalidJson(_))));
+        assert!(matches!(
+            decode(br#"{"format_version":1,"tailscale":{},"last_synchronized_at_unix_ms":null}"#),
+            Err(Error::InvalidJson(_))
+        ));
+    }
+
+    #[test]
+    fn v1_registry_is_rewritten_as_v2_without_losing_runs_aliases_or_journals() {
+        let directory = temporary_directory("migration");
+        let path = directory.join("state.json");
+        let alias_id = Uuid::new_v4();
+        let lease_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"format_version":1,
+                "aliases":{{"api.localhost":{{"id":"{alias_id}","hostname":"api.localhost","target":"http://127.0.0.1:3000/","scheme":"http","tls":true,"preserve_host":true}}}},
+                "leases":{{"{lease_id}":{{"id":"{lease_id}","hostname":"web.localhost","target":"http://127.0.0.1:5173","scheme":"http","tls":false,"pid":42,"pgid":42,"process_start_time_ticks":7,"state":"ready"}}}},
+                "selected_servers":{{"https":"srv0","http":null}},
+                "last_synchronized_at_unix_ms":9,
+                "pending_operations":[{{"id":"{operation_id}","kind":{{"kind":"remove_route","hostname":"old.localhost","owner_id":"{alias_id}","tls":true}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        let store = Store::new(path.clone());
+        store.mutate(|_| Ok(())).unwrap();
+
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["format_version"], 2);
+        let registry = decode(&fs::read(&path).unwrap()).unwrap();
+        assert!(registry.aliases["api.localhost"].preserve_host);
+        assert_eq!(registry.aliases["api.localhost"].id, alias_id);
+        assert_eq!(registry.leases[&lease_id].pid, 42);
+        assert!(!registry.leases[&lease_id].tls);
+        assert_eq!(registry.selected_servers.https.as_deref(), Some("srv0"));
+        assert_eq!(registry.last_synchronized_at_unix_ms, Some(9));
+        assert_eq!(registry.pending_operations[0].id, operation_id);
+        assert!(registry.tailscale.registrations.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tailscale_registrations_round_trip_with_numeric_port_keys() {
+        let mut registry = Registry::empty();
+        let owner = Uuid::new_v4();
+        registry.tailscale.dns_name = Some("host.example.ts.net".into());
+        registry.tailscale.registrations.insert(
+            8443,
+            ServeRegistration {
+                funnel: false,
+                owner_id: owner,
+                hostname: "api.localhost".into(),
+                target: "http://127.0.0.1:3000".into(),
+            },
+        );
+        registry
+            .tailscale
+            .preferred_ports
+            .insert("api.localhost".into(), 8443);
+        let json = serde_json::to_vec(&registry).unwrap();
+        let decoded = decode(&json).unwrap();
+        assert_eq!(decoded.tailscale.registrations[&8443].owner_id, owner);
+        let mut old = serde_json::to_value(&registry).unwrap();
+        old["tailscale"]["registrations"]["8443"]
+            .as_object_mut()
+            .unwrap()
+            .remove("funnel");
+        assert!(
+            !decode(&serde_json::to_vec(&old).unwrap())
+                .unwrap()
+                .tailscale
+                .registrations[&8443]
+                .funnel
+        );
+        registry
+            .tailscale
+            .registrations
+            .get_mut(&8443)
+            .unwrap()
+            .funnel = true;
+        assert!(
+            decode(&serde_json::to_vec(&registry).unwrap())
+                .unwrap()
+                .tailscale
+                .registrations[&8443]
+                .funnel
+        );
+        assert_eq!(decoded.tailscale.preferred_ports["api.localhost"], 8443);
     }
 
     #[test]

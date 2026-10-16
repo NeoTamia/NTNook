@@ -19,7 +19,7 @@ jobs:
   release-assets:
     name: GitHub Release assets
     if: ${{ startsWith(github.ref_name, 'v') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       artifact-metadata: write
       attestations: write
@@ -151,7 +151,7 @@ jobs:
   crates-io:
     name: crates.io
     needs: [release-assets, windows-release-assets]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     environment: release
     permissions:
       contents: read
@@ -188,7 +188,7 @@ jobs:
   npm:
     name: npm
     if: ${{ startsWith(github.ref_name, 'nook-run-v') }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     environment: release
     permissions:
       contents: read
@@ -203,7 +203,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           package-manager-cache: false
@@ -213,9 +213,9 @@ jobs:
         run: npm install --global npm@12.0.2
 
       - name: Install pnpm
-        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
         with:
-          version: 11.25.0
+          version: 12.13.0
           install: false
 
       - name: Install package

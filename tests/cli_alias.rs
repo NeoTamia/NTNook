@@ -46,7 +46,7 @@ fn alias_shortcuts_persist_list_and_remove_idempotently() {
 
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 25));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 26));
 
     let set = nook(&config_home, &state_home, &["alias", "api", "3000"]);
     assert_success(&set);
@@ -172,7 +172,7 @@ fn run_reports_inferred_domain_url_and_effective_port() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 7));
     let script = "import os,socket,time;s=socket.socket();s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(.1)";
     let run = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
@@ -235,7 +235,7 @@ fn stop_command_targets_the_current_managed_process_group() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 9));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 10));
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(["run", "--name", "sleeper", "--", "/bin/sleep", "10"])
@@ -278,7 +278,7 @@ fn sigint_is_forwarded_and_the_route_is_cleaned_up() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 7));
     let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
@@ -317,7 +317,7 @@ fn sigint_during_starting_is_forwarded_and_cleaned_up() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 6));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 7));
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args(["run", "--name", "starting", "--", "/bin/sleep", "10"])
@@ -352,7 +352,7 @@ fn force_stop_kills_a_group_that_ignores_sigterm() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 9));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 10));
     let script = "import os,signal,socket,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
@@ -388,7 +388,7 @@ fn prune_recovers_after_the_supervising_cli_is_killed() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 7));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 8));
     let script = "import os,socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ['PORT'])));s.listen();time.sleep(10)";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
@@ -522,7 +522,7 @@ fn concurrent_clis_create_and_remove_aliases_without_lost_updates() {
     write_global_config(&config_home, listener.local_addr().unwrap());
     let routes = Arc::new(Mutex::new(Vec::<Value>::new()));
     let server_routes = Arc::clone(&routes);
-    let server = thread::spawn(move || serve_caddy(listener, server_routes, 29));
+    let server = thread::spawn(move || serve_caddy(listener, server_routes, 31));
     let create: Vec<_> = [("one", "3001"), ("two", "3002")]
         .into_iter()
         .map(|(name, port)| {

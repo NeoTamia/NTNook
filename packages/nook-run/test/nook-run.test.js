@@ -126,6 +126,7 @@ writeFileSync(process.env.NOOK_RUN_RECORD, JSON.stringify({
   );
 
   const args = [
+    "--lan",
     "--name",
     "my app",
     "--",
