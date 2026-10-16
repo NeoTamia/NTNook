@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.9.0](https://github.com/NeoTamia/NTNook/compare/v0.8.0...v0.9.0) (2026-10-16)
+
+
+### ✨ Features
+
+* **lan:** Expose local apps through Caddy and mDNS ([faedec9](https://github.com/NeoTamia/NTNook/commit/faedec9ce11c593e11ee984e8960619000e86500))
+* **lan:** Expose local apps through Caddy and mDNS ([a026de4](https://github.com/NeoTamia/NTNook/commit/a026de45b2550ac8d351e93494e7e30c6d33c482))
+* **tailscale:** Add public Funnel exposure ([3275395](https://github.com/NeoTamia/NTNook/commit/327539568fe80b79e3d9d75a05af671639ad8844))
+* **tailscale:** Add public Funnel exposure ([0d28131](https://github.com/NeoTamia/NTNook/commit/0d28131f67e44266f72d89d5b9842572d0392a9e))
+
+
+### 🐛 Bug Fixes
+
+* **lan:** Preserve route ownership during replacement ([1a6ee66](https://github.com/NeoTamia/NTNook/commit/1a6ee66176d93439ed716de764e865620ea7815d))
+* **tailscale:** Detect foreground Funnel exposure ([a45d570](https://github.com/NeoTamia/NTNook/commit/a45d57059f3d8242fb8557230a878638ac778b86))
+* **tailscale:** Keep registrations bound to their original identity ([9801000](https://github.com/NeoTamia/NTNook/commit/98010006e80e76d2fbd5696addaa56a363284344))
+
+
+### 📚 Documentation
+
+* Include Tailscale Funnel in supported scope ([b22c124](https://github.com/NeoTamia/NTNook/commit/b22c124101409bca40579abd5321f31197f220f6))
+
+
+### 🔧 Build System
+
+* **deps:** Update actions/setup-node action to v7 ([#59](https://github.com/NeoTamia/NTNook/issues/59)) ([a268ce1](https://github.com/NeoTamia/NTNook/commit/a268ce191a5bb2249f0feaad6737516557c89711))
+* **deps:** Update actions/upload-artifact action to v7.0.2 ([#52](https://github.com/NeoTamia/NTNook/issues/52)) ([f919f03](https://github.com/NeoTamia/NTNook/commit/f919f039644d72088b6f03e87a960e78e4032bd3))
+* **deps:** Update caddy docker tag to v2.11.7 ([#53](https://github.com/NeoTamia/NTNook/issues/53)) ([a2a74e5](https://github.com/NeoTamia/NTNook/commit/a2a74e51edad059ddf69bd1f9974f022a89e6be1))
+* **deps:** Update caddy:2.11.4-alpine docker digest to 6aeddd4 ([#48](https://github.com/NeoTamia/NTNook/issues/48)) ([7f31d89](https://github.com/NeoTamia/NTNook/commit/7f31d8929289ef8a114e78d3421c8946254a7428))
+* **deps:** Update dependency ubuntu to v26 ([#60](https://github.com/NeoTamia/NTNook/issues/60)) ([9a4ba29](https://github.com/NeoTamia/NTNook/commit/9a4ba2980b82ce8b68f9b78ff077b52b97f459a4))
+* **deps:** Update neotamia/actions digest to 2bd963b ([#24](https://github.com/NeoTamia/NTNook/issues/24)) ([05f20d1](https://github.com/NeoTamia/NTNook/commit/05f20d11a54dea0e0856fe05af4eda754363db03))
+* **deps:** Update pnpm to v11.28.5 ([#43](https://github.com/NeoTamia/NTNook/issues/43)) ([35994fa](https://github.com/NeoTamia/NTNook/commit/35994fa2ca76b90ba7d229c63a2703b1db205475))
+* **deps:** Update pnpm to v12 ([#61](https://github.com/NeoTamia/NTNook/issues/61)) ([8546d6d](https://github.com/NeoTamia/NTNook/commit/8546d6d243809eb0d5b6f5d735e70179bfd4c12f))
+* **deps:** Update pnpm/setup action to v3 ([#62](https://github.com/NeoTamia/NTNook/issues/62)) ([18a421f](https://github.com/NeoTamia/NTNook/commit/18a421f57f201762a7cc7e843488266cdedc844f))
+* **deps:** Update rust crate clap to v4.6.7 ([#46](https://github.com/NeoTamia/NTNook/issues/46)) ([54a02c0](https://github.com/NeoTamia/NTNook/commit/54a02c0853a57d110575813d8c9185c6537cc5d2))
+* **deps:** Update rust crate clap_complete to v4.6.11 ([#47](https://github.com/NeoTamia/NTNook/issues/47)) ([b908de3](https://github.com/NeoTamia/NTNook/commit/b908de3fe4fd17cfab9dfbcc1916f88706cd61ee))
+* **deps:** Update rust crate ipnet to v2.12.2 ([#37](https://github.com/NeoTamia/NTNook/issues/37)) ([67d5747](https://github.com/NeoTamia/NTNook/commit/67d574736473385901d82e0134ccd7d3a5062ca5))
+* **deps:** Update rust crate libc to v0.2.190 ([#54](https://github.com/NeoTamia/NTNook/issues/54)) ([78fce9f](https://github.com/NeoTamia/NTNook/commit/78fce9faef72060a48575fc998fb2d0a81739572))
+* **deps:** Update rust crate serde_json to v1.0.154 ([#55](https://github.com/NeoTamia/NTNook/issues/55)) ([8d8569f](https://github.com/NeoTamia/NTNook/commit/8d8569f1e58f1c1db7c7d18d0987dc9277f55876))
+* **deps:** Update rust crate sha2 to v0.11.1 ([#56](https://github.com/NeoTamia/NTNook/issues/56)) ([b9586e6](https://github.com/NeoTamia/NTNook/commit/b9586e6779a9e28ddd0fa1a0b326d53c6e0d4f6b))
+* **deps:** Update rust crate signal-hook to v0.4.5 ([#57](https://github.com/NeoTamia/NTNook/issues/57)) ([3550b91](https://github.com/NeoTamia/NTNook/commit/3550b9142774fe8d5750becfce1cd4acd400fce3))
+* **deps:** Update rust crate toml to v1.1.8 ([#44](https://github.com/NeoTamia/NTNook/issues/44)) ([a703fcd](https://github.com/NeoTamia/NTNook/commit/a703fcd82ed84e998a29a07df50107ce059ddf6f))
+* **deps:** Update rust crate ureq to v3.4.2 ([#38](https://github.com/NeoTamia/NTNook/issues/38)) ([c6d7479](https://github.com/NeoTamia/NTNook/commit/c6d747932284ad3ea1ea5b207f87afbe1fffe1fb))
+* **deps:** Update rust crate uuid to v1.28.0 ([#58](https://github.com/NeoTamia/NTNook/issues/58)) ([e20a640](https://github.com/NeoTamia/NTNook/commit/e20a640d38c63e0e41bbe8b920d9a4c7b6874bd5))
+* **deps:** Update rust to v1.99.0 ([#36](https://github.com/NeoTamia/NTNook/issues/36)) ([6728e0f](https://github.com/NeoTamia/NTNook/commit/6728e0f94918a3799f36dc96937f7492c5d3d824))
+
 ## [0.8.0](https://github.com/NeoTamia/NTNook/compare/v0.7.0...v0.8.0) (2026-10-12)
 
 
