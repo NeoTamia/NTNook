@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/NeoTamia/NTNook/compare/v0.9.0...v0.9.1) (2026-10-16)
+
+
+### 🔧 Build System
+
+* **deps:** Update pnpm to v12.14.0 ([#66](https://github.com/NeoTamia/NTNook/issues/66)) ([f7ea75d](https://github.com/NeoTamia/NTNook/commit/f7ea75da59e5128b82f099d4c11024c1f101c358))
+
 ## [0.9.0](https://github.com/NeoTamia/NTNook/compare/v0.8.0...v0.9.0) (2026-10-16)
 
 
