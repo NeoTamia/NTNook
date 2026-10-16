@@ -39,7 +39,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
         with:
-          version: 11.28.5
+          version: 12.13.0
           install: false
 
       - name: Install package
@@ -73,7 +73,7 @@ jobs:
         if: ${{ matrix.package-manager == 'pnpm' }}
         uses: pnpm/setup@a0881977cd8ea73b1ed212236c99ca10dcc80cf4 # v3.1.1
         with:
-          version: 11.28.5
+          version: 12.13.0
           install: false
 
       - name: Install Yarn
