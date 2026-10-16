@@ -7,7 +7,7 @@ domains by configuring an existing Caddy instance.
 
 - Linux x86-64 or Windows x86-64;
 - Caddy `2.11.x`, running natively or in Docker, already started and accessible through its Admin API;
-- unambiguous Caddy servers listening on `:443` for HTTPS and, when `--no-tls` is used, on `:80` for HTTP.
+- unambiguous Caddy servers listening on `:443` for HTTPS and, when `--no-tls` or `--lan` is used, on `:80` for HTTP.
 
 Recommended installation for the prebuilt Linux x86-64 binary:
 
@@ -239,6 +239,8 @@ nook run --name legacy --no-tls -- ./server
 
 - `--name <name>` selects the domain; `.localhost` is appended automatically;
 - `--no-tls` uses the HTTP frontend exclusively;
+- `--lan` exposes `http://<name>.local` through Caddy and announces the name via mDNS;
+- `--no-lan` disables LAN mode enabled in a project configuration;
 - `--run-bind-address <IP>` overrides the project and global bind address (IPv4 or IPv6), also injected as `HOST`;
 - `--app-port <port>` requests a port, with an explicit fallback if it is occupied;
 - `--strict-port` disables that fallback and requires `--app-port`;
@@ -259,6 +261,78 @@ nook: domain=api.localhost url=https://api.localhost port=5173
 ```
 
 This information is written to stderr to keep supervision messages separate from the application's standard output.
+
+### Access from other devices
+
+Use `--lan` to open an application from another device on the same network:
+
+```sh
+nook run --name api --lan -- node server.js
+nook run --name web --lan -- vite
+```
+
+The application keeps its dynamically allocated port and its configured bind address
+(`127.0.0.1` by default). Caddy forwards `http://web.local` on port 80 to that application;
+the `.local` URL has no port to enter. The local `https://web.localhost` URL stays available.
+
+```text
+nook: domain=web.localhost url=https://web.localhost port=5173
+nook: lan_url=http://web.local
+```
+
+Caddy must have an explicit HTTP server on port 80, listening on all interfaces or a LAN IPv4
+address. If needed, add this site to your existing Caddyfile and reload Caddy:
+
+```caddyfile
+http://:80 {
+    respond 404
+}
+```
+
+Nook adds and removes the `.local` route automatically. It keeps the existing client restrictions
+on `.localhost` routes and does not change Caddy's listeners, Admin API, or firewall rules.
+The LAN route accepts IPv4 clients on the HTTP listener; firewall rules determine which networks
+can reach it. HTTPS remains available through the local `.localhost` route, while LAN access
+uses HTTP and requires no certificate installation on other devices.
+
+To **also allow direct access by IP and application port**, set the application bind address:
+
+```sh
+nook run --name web --lan --run-bind-address 0.0.0.0 -- vite
+```
+
+Nook then also prints URLs such as `http://192.168.1.20:5173`. With the default loopback bind,
+other devices access the application through Caddy only. `--app-port 5173 --strict-port` can
+fix the direct application port if needed.
+
+Both choices can be saved in `nook.toml` or `nook.local.toml`:
+
+```toml
+format_version = 1
+lan = true
+# Optional: also expose the application port directly on all IPv4 interfaces.
+# run_bind_address = "0.0.0.0"
+```
+
+LAN mode defaults to disabled. A local `lan = false` overrides a shared `lan = true`;
+`--lan` and `--no-lan` override both files. With `--config`, the neighboring local file is
+only applied when `--local` is passed. The bind address remains independent of `lan`, with
+CLI > project/local configuration > global configuration precedence. `--no-lan` removes
+`.local` exposure; it does not change an explicitly configured application bind address.
+
+`HOST` and `PORT` contain the effective application bind address and port. `NOOK_LAN_URL`
+contains the `.local` proxy URL. Recognized framework CLIs receive host/port flags automatically;
+other applications must honor these variables or receive equivalent arguments. Nook also adds
+the `.local` hostname to `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` for Vite-based servers.
+
+mDNS runs inside Nook on Linux and Windows. Devices need mDNS support, multicast discovery
+(UDP 5353), and access to Caddy's HTTP port. The announcement and proxy route are withdrawn
+when the run ends. If mDNS reports a name conflict, restart with another `--name` so that
+Caddy and mDNS use the same hostname. If discovery is blocked, direct IP access requires
+an application bind address reachable from the LAN.
+
+LAN access can be combined with Tailscale Serve (`--tailscale`) or Funnel (`--funnel`).
+`--no-tailscale` only disables Serve and Funnel.
 
 ### JavaScript package scripts
 
@@ -338,6 +412,8 @@ Create a documented project configuration in the current directory:
 nook init
 nook init --name api --app-port 5173 -- pnpm run dev
 nook init --local
+nook init --local --lan
+nook init --local --no-lan
 nook init --local --run-bind-address 0.0.0.0
 nook init --print
 ```
@@ -354,6 +430,7 @@ format_version = 1
 name = "api.neotamia"
 command = ["bun", "run", "dev"]
 tls = true
+lan = false
 app_port = 5173
 strict_port = false
 readiness_warn_after_seconds = 30
@@ -425,9 +502,9 @@ Each developer can add a `nook.local.toml` in the same directory. Its fields ove
 ```toml
 format_version = 1
 name = "api-alwyn"
+lan = true
 app_port = 5180
 strict_port = true
-run_bind_address = "0.0.0.0"
 ```
 
 The complete precedence order is: defaults and global configuration, `nook.toml`,
@@ -736,7 +813,7 @@ secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-LAN/mDNS, multiple services or workspaces, native macOS support, rewriting framework config files,
+multiple services or workspaces, native macOS support, rewriting framework config files,
 Angular-specific origin allow-lists, and public exposure outside Tailscale Funnel.
 Private Tailscale Serve and public Tailscale Funnel are opt-in, as described in [Tailscale](#tailscale).
 

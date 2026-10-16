@@ -257,7 +257,7 @@ https://localhost:443 {{
     let _ = tls_upstream.kill();
     let _ = tls_upstream.wait();
 
-    let script = "import os,http.server;http.server.ThreadingHTTPServer(('127.0.0.1',int(os.environ['PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()";
+    let script = "import os,http.server;http.server.ThreadingHTTPServer((os.environ['HOST'],int(os.environ['PORT'])),http.server.SimpleHTTPRequestHandler).serve_forever()";
     let mut running = Command::new(env!("CARGO_BIN_EXE_nook"))
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .args([
@@ -277,6 +277,13 @@ https://localhost:443 {{
         .unwrap();
     wait_for_state(&state_home, &run_host, "ready");
     assert!(https_body(&run_host).contains("Directory listing"));
+    assert!(
+        TcpStream::connect((
+            Ipv4Addr::new(127, 0, 0, 2),
+            application_port(&state_home, &run_host)
+        ))
+        .is_err()
+    );
     assert_success(
         &Command::new("kill")
             .args(["-INT", &running.id().to_string()])
@@ -285,34 +292,118 @@ https://localhost:443 {{
     );
     assert_eq!(running.wait().unwrap().code(), Some(130));
 
-    let mut http_running = Command::new(env!("CARGO_BIN_EXE_nook"))
-        .env("NOOK_DISABLE_UPDATE_CHECK", "1")
-        .args([
+    let lan_host = http_run_host.replace(".localhost", ".local");
+    let lan_config = directory.join("nook.toml");
+    fs::write(&lan_config, "format_version = 1\nlan = false\n").unwrap();
+    fs::write(
+        directory.join("nook.local.toml"),
+        "format_version = 1\nlan = true\n",
+    )
+    .unwrap();
+    for (bind, tls) in [
+        ("127.0.0.1", false),
+        ("0.0.0.0", false),
+        ("127.0.0.1", true),
+        ("0.0.0.0", true),
+    ] {
+        let lan_script = format!(
+            "import os;assert os.environ['HOST']=='{bind}';assert os.environ['NOOK_LAN_URL']=='http://{lan_host}';assert os.environ['__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS']=='{lan_host}';{script}"
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nook"));
+        command.env("NOOK_DISABLE_UPDATE_CHECK", "1").args([
             "run",
             "--name",
             &http_run_host,
-            "--no-tls",
-            "--",
-            "/usr/bin/python3",
-            "-c",
-            script,
-        ])
-        .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_STATE_HOME", &state_home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_for_state(&state_home, &http_run_host, "ready");
-    assert!(http_body(&http_run_host).contains("Directory listing"));
-    assert_not_exposed_over_https(&http_run_host, "Directory listing");
-    assert_success(
-        &Command::new("kill")
-            .args(["-TERM", &http_running.id().to_string()])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(http_running.wait().unwrap().code(), Some(143));
+            "--config",
+            lan_config.to_str().unwrap(),
+            "--local",
+            "--run-bind-address",
+            bind,
+        ]);
+        if !tls {
+            command.arg("--no-tls");
+        }
+        let mut running = command
+            .args(["--", "/usr/bin/python3", "-c", &lan_script])
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_state(&state_home, &http_run_host, "ready");
+        assert!(http_body(&lan_host).contains("Directory listing"));
+        let lan_port = application_port(&state_home, &http_run_host);
+        assert_eq!(
+            TcpStream::connect((Ipv4Addr::new(127, 0, 0, 2), lan_port)).is_ok(),
+            bind == "0.0.0.0"
+        );
+        if tls {
+            assert!(https_body(&http_run_host).contains("Directory listing"));
+        } else {
+            assert!(http_body(&http_run_host).contains("Directory listing"));
+            assert_not_exposed_over_https(&http_run_host, "Directory listing");
+        }
+        // Reconciliation must retain both routes for a live LAN process.
+        assert_success(&nook(&config_home, &state_home, &["prune"]));
+        assert!(http_body(&lan_host).contains("Directory listing"));
+        let status = nook(&config_home, &state_home, &["status"]);
+        assert_success(&status);
+        assert!(String::from_utf8_lossy(&status.stdout).contains("drift\tclean"));
+        if tls && bind == "127.0.0.1" {
+            let failed = nook(
+                &config_home,
+                &state_home,
+                &[
+                    "run",
+                    "--name",
+                    &http_run_host,
+                    "--lan",
+                    "--force",
+                    "--",
+                    "/does/not/exist",
+                ],
+            );
+            assert!(!failed.status.success());
+            assert!(http_body(&lan_host).contains("Directory listing"));
+            assert!(https_body(&http_run_host).contains("Directory listing"));
+            // Replacing a LAN run with a local-only run must withdraw its HTTP companion.
+            assert_success(&nook(
+                &config_home,
+                &state_home,
+                &[
+                    "run",
+                    "--name",
+                    &http_run_host,
+                    "--no-lan",
+                    "--force",
+                    "--",
+                    "/bin/true",
+                ],
+            ));
+            assert!(!fetch_config(&harness).contains(&lan_host));
+        }
+        assert_success(
+            &Command::new("kill")
+                .args(["-TERM", &running.id().to_string()])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(running.wait().unwrap().code(), Some(143));
+        let mut output = String::new();
+        running
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert!(
+            output.contains(&format!("lan_url=http://{lan_host}\n")),
+            "{output}"
+        );
+        assert!(!fetch_config(&harness).contains(&lan_host));
+        assert!(TcpStream::connect((Ipv4Addr::new(127, 0, 0, 2), lan_port)).is_err());
+    }
     assert!(!fetch_config(&harness).contains(&alias_host));
     assert!(!fetch_config(&harness).contains(&run_host));
     assert!(!fetch_config(&harness).contains(&http_alias_host));
@@ -447,6 +538,21 @@ fn wait_for_state(state_home: &Path, hostname: &str, expected: &str) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("{hostname} did not become {expected}");
+}
+
+fn application_port(state_home: &Path, hostname: &str) -> u16 {
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_home.join("nook/state.json")).unwrap()).unwrap();
+    let lease = state["leases"]
+        .as_object()
+        .unwrap()
+        .values()
+        .find(|lease| lease["hostname"] == hostname)
+        .unwrap();
+    url::Url::parse(lease["target"].as_str().unwrap())
+        .unwrap()
+        .port()
+        .unwrap()
 }
 
 fn wait_for_port(port: u16) {
