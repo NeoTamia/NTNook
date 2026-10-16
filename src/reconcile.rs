@@ -13,6 +13,7 @@ use crate::state::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteSpec {
+    pub(crate) lan: bool,
     pub(crate) owner_id: Uuid,
     pub(crate) hostname: String,
     pub(crate) target: String,
@@ -169,6 +170,7 @@ pub(crate) fn set_alias_with<T, E: From<AliasError>>(
         .map_err(|error| AliasError::State(error.to_string()))?;
     routes
         .ensure(&RouteSpec {
+            lan: false,
             owner_id: alias.id,
             hostname: alias.hostname.clone(),
             target: alias.target.clone(),
@@ -455,6 +457,7 @@ fn current_route(registry: &Registry, hostname: &str, owner_id: Uuid) -> Option<
 
 pub(crate) fn route_for_lease(lease: &Lease) -> RouteSpec {
     RouteSpec {
+        lan: lease.lan,
         owner_id: lease.id,
         hostname: lease.hostname.clone(),
         target: lease.target.clone(),
@@ -467,6 +470,7 @@ pub(crate) fn route_for_lease(lease: &Lease) -> RouteSpec {
 
 pub(crate) fn route_for_alias(alias: &Alias) -> RouteSpec {
     RouteSpec {
+        lan: false,
         owner_id: alias.id,
         hostname: alias.hostname.clone(),
         target: alias.target.clone(),
@@ -928,6 +932,7 @@ mod tests {
 
     fn lease(hostname: &str) -> Lease {
         Lease {
+            lan: false,
             id: Uuid::new_v4(),
             hostname: hostname.into(),
             target: "http://127.0.0.1:3001".into(),

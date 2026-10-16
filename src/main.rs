@@ -4,6 +4,7 @@ mod caddy;
 mod cli;
 mod config;
 mod framework;
+mod lan;
 mod platform;
 mod process;
 mod reconcile;

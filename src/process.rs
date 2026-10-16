@@ -127,7 +127,7 @@ impl fmt::Display for Error {
                 formatter,
                 "requested application port {port} is already in use; choose another port or omit --strict-port"
             ),
-            Self::Bind(error) => write!(formatter, "cannot reserve a loopback port: {error}"),
+            Self::Bind(error) => write!(formatter, "cannot reserve an application port: {error}"),
             Self::EmptyCommand => write!(formatter, "child command argv cannot be empty"),
             Self::Spawn(error) => write!(formatter, "cannot launch child process: {error}"),
             Self::ProcessIdentity(pid) => {
@@ -162,7 +162,7 @@ impl ManagedChild {
 
     pub(crate) fn wait(&mut self) -> Result<i32, Error> {
         let mut signals = ForwardedSignals::new().map_err(Error::Spawn)?;
-        self.wait_with_signals(&mut signals)
+        self.wait_with_signals(&mut signals, || {})
     }
 
     fn signal_foreground(&self, signal: ProcessSignal) -> Result<(), Error> {
@@ -177,8 +177,13 @@ impl ManagedChild {
         }
     }
 
-    fn wait_with_signals(&mut self, signals: &mut ForwardedSignals) -> Result<i32, Error> {
+    fn wait_with_signals(
+        &mut self,
+        signals: &mut ForwardedSignals,
+        mut on_tick: impl FnMut(),
+    ) -> Result<i32, Error> {
         loop {
+            on_tick();
             for signal in signals.pending() {
                 #[cfg(unix)]
                 let _ = self.signal(signal);
@@ -212,6 +217,7 @@ pub(crate) enum RunError {
     Process(Error),
     Exposure(Box<dyn std::error::Error + Send + Sync>),
     Conflict(String),
+    LanHostnameConflict { hostname: String, project: String },
 }
 
 impl fmt::Display for RunError {
@@ -225,6 +231,10 @@ impl fmt::Display for RunError {
                 formatter,
                 "hostname `{hostname}` is already managed by Nook; use --force to replace it"
             ),
+            Self::LanHostnameConflict { hostname, project } => write!(
+                formatter,
+                "LAN hostname `{hostname}` is already used by `{project}`; choose another --name (even with --force)"
+            ),
         }
     }
 }
@@ -236,7 +246,7 @@ impl std::error::Error for RunError {
             Self::Route(error) => Some(error),
             Self::Process(error) => Some(error),
             Self::Exposure(error) => Some(error.as_ref()),
-            Self::Conflict(_) => None,
+            Self::Conflict(_) | Self::LanHostnameConflict { .. } => None,
         }
     }
 }
@@ -267,6 +277,7 @@ pub(crate) struct RunningChild {
     bind_address: IpAddr,
     readiness_warn_after: Duration,
     signals: ForwardedSignals,
+    lan: Option<crate::lan::Advertisement>,
 }
 
 /// Additional exposure of a run beyond its local Caddy route.
@@ -329,7 +340,21 @@ fn start_run_with_hook(
 ) -> Result<RunningChild, RunError> {
     let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
     let operations = store.lock_operations()?;
-    let displaced = store.mutate(|registry| {
+    let registry = store.load()?;
+    if config.lan {
+        let hostname = crate::lan::hostname(&config.hostname);
+        if let Some(lease) = registry.leases.values().find(|lease| {
+            lease.lan
+                && lease.hostname != config.hostname
+                && crate::lan::hostname(&lease.hostname) == hostname
+        }) {
+            return Err(RunError::LanHostnameConflict {
+                hostname,
+                project: lease.hostname.clone(),
+            });
+        }
+    }
+    let displaced = {
         let aliases = registry
             .aliases
             .values()
@@ -340,8 +365,8 @@ fn start_run_with_hook(
             .values()
             .filter(|lease| lease.hostname == config.hostname)
             .map(route_for_lease);
-        Ok(aliases.chain(leases).collect::<Vec<_>>())
-    })?;
+        aliases.chain(leases).collect::<Vec<_>>()
+    };
     if !displaced.is_empty() && !config.force {
         return Err(RunError::Conflict(config.hostname.clone()));
     }
@@ -355,6 +380,7 @@ fn start_run_with_hook(
     let operation_id = Uuid::new_v4();
     let target = format!("http://127.0.0.1:{port}");
     let route = RouteSpec {
+        lan: config.lan,
         owner_id,
         hostname: config.hostname.clone(),
         target: target.clone(),
@@ -376,7 +402,10 @@ fn start_run_with_hook(
         });
         Ok(())
     })?;
-    routes.ensure(&route)?;
+    if let Err(error) = routes.ensure(&route) {
+        abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
+        return Err(error.into());
+    }
     let exposed = match exposure.expose(&operations, store, owner_id, &config.hostname, &target) {
         Ok(exposed) => exposed,
         Err(error) => {
@@ -407,9 +436,12 @@ fn start_run_with_hook(
         .and_then(|(_, value)| value.to_str())
         .and_then(|value| url::Url::parse(value).ok())
         .and_then(|url| url.host_str().map(str::to_owned));
-    // Vite-based servers already allow *.localhost. Add the exact tailnet
-    // host for Serve, which preserves the incoming Host header.
-    let allowed_hostname = tailscale_hostname.as_deref().unwrap_or(&config.hostname);
+    // Vite-based servers already allow *.localhost. Add the exposed hostname.
+    let lan_hostname = config.lan.then(|| crate::lan::hostname(&config.hostname));
+    let allowed_hostname = tailscale_hostname
+        .as_deref()
+        .or(lan_hostname.as_deref())
+        .unwrap_or(&config.hostname);
     let argv = match framework {
         Some(framework) => framework.inject_argv(
             argv,
@@ -424,6 +456,23 @@ fn start_run_with_hook(
         child_environment(port, config.bind_address, &config.hostname, config.tls).to_vec();
     if let Some(framework) = framework {
         environment.extend(framework.environment(port, config.bind_address, allowed_hostname));
+    }
+    if let Some(hostname) = &lan_hostname {
+        environment.push(("NOOK_LAN_URL".into(), format!("http://{hostname}").into()));
+        let variable = "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS";
+        if let Some((_, value)) = environment.iter_mut().find(|(name, _)| name == variable) {
+            if value != hostname.as_str() {
+                value.push(",");
+                value.push(hostname);
+            }
+        } else {
+            let mut value = std::env::var_os(variable).unwrap_or_default();
+            if !value.is_empty() {
+                value.push(",");
+            }
+            value.push(hostname);
+            environment.push((variable.into(), value));
+        }
     }
     let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
     if !conflicts.is_empty() {
@@ -483,6 +532,7 @@ fn start_run_with_hook(
         registry.leases.insert(
             owner_id,
             Lease {
+                lan: config.lan,
                 id: owner_id,
                 hostname: config.hostname.clone(),
                 target,
@@ -501,6 +551,17 @@ fn start_run_with_hook(
             warnings.push(format!("cleanup of the previous route is pending: {error}"));
         }
     }
+    let lan = if config.lan {
+        match crate::lan::Advertisement::start(&config.hostname, 80, owner_id) {
+            Ok(advertisement) => Some(advertisement),
+            Err(error) => {
+                warnings.push(format!("cannot announce the LAN hostname: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     Ok(RunningChild {
         child,
@@ -512,6 +573,7 @@ fn start_run_with_hook(
         bind_address: config.bind_address,
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
         signals,
+        lan,
     })
 }
 
@@ -572,6 +634,14 @@ impl RunningChild {
         let started = Instant::now();
         let mut warned = false;
         loop {
+            if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
+                self.lan.take();
+            }
+            if let Some(lan) = &self.lan {
+                for warning in lan.warnings() {
+                    warn(&warning);
+                }
+            }
             for signal in self.signals.pending() {
                 self.child.signal_foreground(signal)?;
             }
@@ -608,7 +678,18 @@ impl RunningChild {
         store: &Store,
         routes: &mut impl RouteBackend,
     ) -> Result<RunOutcome, RunError> {
-        let exit_code = self.child.wait_with_signals(&mut self.signals)?;
+        let exit_code = self.child.wait_with_signals(&mut self.signals, || {
+            use std::io::Write;
+            if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
+                self.lan.take();
+            }
+            if let Some(lan) = &self.lan {
+                for warning in lan.warnings() {
+                    let _ = writeln!(io::stderr(), "warning: {warning}");
+                }
+            }
+        })?;
+        self.lan.take();
         let _operations = store.lock_operations()?;
         let cleanup = routes.remove_if_owned(&self.hostname, self.lease_id, self.tls);
         let mut warnings = Vec::new();
@@ -2110,6 +2191,84 @@ mod tests {
     }
 
     #[test]
+    fn forced_replacement_rejects_a_different_project_with_the_same_lan_name() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let mut config = run_config(vec!["/bin/sleep", "10"], 30);
+        config.lan = true;
+        let mut first = start_run(&config, &store, &mut routes).unwrap();
+        let before = store.load().unwrap();
+        config.hostname = "api.local.localhost".into();
+        config.force = true;
+        let result = start_run(&config, &store, &mut routes);
+        let rejected = result.is_err();
+        let unchanged = store.load().unwrap() == before;
+        if let Ok(mut unexpected) = result {
+            unexpected.child.signal(ProcessSignal::Terminate).unwrap();
+            unexpected.finish(&store, &mut routes).unwrap();
+        }
+        first.child.signal(ProcessSignal::Terminate).unwrap();
+        first.finish(&store, &mut routes).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            rejected,
+            "--force must not steal another project's derived .local name"
+        );
+        assert!(
+            unchanged,
+            "a rejected collision must leave the registry unchanged"
+        );
+    }
+
+    #[test]
+    fn displaced_lan_supervisor_withdraws_mdns_before_its_child_exits() {
+        for waiting_for_readiness in [false, true] {
+            let (store, path) = temporary_store();
+            let mut routes = Routes::default();
+            let mut config = run_config(vec!["/bin/sleep", "2"], 30);
+            config.lan = true;
+            let mut first = start_run(&config, &store, &mut routes).unwrap();
+            let daemon = first
+                .lan
+                .as_ref()
+                .expect("mDNS must start")
+                .daemon_for_test();
+            let other_store = Store::new(path.clone());
+            let replace = thread::spawn(move || {
+                let mut config = run_config(vec!["/bin/true"], 30);
+                config.force = true;
+                let mut routes = Routes::default();
+                let mut replacement = start_run(&config, &other_store, &mut routes).unwrap();
+                replacement.finish(&other_store, &mut routes).unwrap();
+                let deadline = Instant::now() + Duration::from_millis(1200);
+                while Instant::now() < deadline {
+                    if daemon
+                        .status()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                        == mdns_sd::DaemonStatus::Shutdown
+                    {
+                        return true;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                false
+            });
+            if waiting_for_readiness {
+                assert!(!first.wait_for_readiness(&store, |_| {}).unwrap());
+            }
+            assert_eq!(first.finish(&store, &mut routes).unwrap().exit_code, 0);
+            let withdrawn = replace.join().unwrap();
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            assert!(
+                withdrawn,
+                "displaced mDNS remains active (readiness={waiting_for_readiness})"
+            );
+        }
+    }
+
+    #[test]
     fn force_never_bypasses_a_foreign_route_rejection() {
         let (store, path) = temporary_store();
         let mut routes = Routes {
@@ -2311,6 +2470,7 @@ mod tests {
             tls: true,
             tailscale: false,
             funnel: false,
+            lan: false,
             app_port: None,
             strict_port: false,
             force: false,
@@ -2465,6 +2625,7 @@ mod windows_tests {
         let pid = std::process::id();
         let identity = read_process_identity(pid).unwrap();
         let mut lease = Lease {
+            lan: false,
             id: Uuid::new_v4(),
             hostname: "test.localhost".into(),
             target: "http://127.0.0.1:3000".into(),

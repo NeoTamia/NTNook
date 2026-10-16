@@ -691,6 +691,36 @@ pub(crate) struct ManagedCaddyRoutes<'a> {
 }
 
 impl ManagedCaddyRoutes<'_> {
+    pub(crate) fn require_lan_listener(&self) -> Result<(), Error> {
+        let (server, _) = self.server(false)?;
+        let config = self.client.fetch_config()?;
+        let reachable = config["apps"]["http"]["servers"][server]["listen"]
+            .as_array()
+            .is_some_and(|listeners| {
+                listeners.iter().filter_map(Value::as_str).any(|listener| {
+                    let address = listener
+                        .strip_prefix("tcp/")
+                        .or_else(|| listener.strip_prefix("tcp4/"))
+                        .unwrap_or(listener);
+                    let Some(host) = address.strip_suffix(":80") else {
+                        return false;
+                    };
+                    host.is_empty()
+                        || host == "[::]"
+                        || host
+                            .parse::<std::net::Ipv4Addr>()
+                            .is_ok_and(|ip| !ip.is_loopback())
+                })
+            });
+        if reachable {
+            Ok(())
+        } else {
+            Err(Error::InvalidConfig(
+                "LAN mode requires the HTTP server to listen on :80 or a LAN IPv4 address; a loopback-only listener cannot serve other devices",
+            ))
+        }
+    }
+
     fn server(&self, tls: bool) -> Result<(&str, &'static str), Error> {
         if tls {
             self.https_server
@@ -704,19 +734,35 @@ impl ManagedCaddyRoutes<'_> {
     }
 }
 
-impl RouteBackend for ManagedCaddyRoutes<'_> {
-    fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
-        let (server, container_id) = self.server(route.tls).map_err(route_error)?;
+impl ManagedCaddyRoutes<'_> {
+    fn ensure_proxy(
+        &self,
+        route: &RouteSpec,
+        server: &str,
+        container_id: &str,
+        hostname: &str,
+        lan: bool,
+    ) -> Result<(), RouteError> {
         let upstream = normalize_upstream(&route.target).map_err(route_error)?;
         let owner_id = route.owner_id;
-        let hostname = route.hostname.clone();
+        let hostname = hostname.to_owned();
+        let id = if lan {
+            format!("nook_lan_route_v1_{owner_id}")
+        } else {
+            owner_route_id(owner_id)
+        };
+        let lan_ranges = ["0.0.0.0/0".to_owned()];
         let proxy = build_proxy_route_for_network(
-            &owner_route_id(owner_id),
+            &id,
             &hostname,
             &upstream.url,
             route.preserve_host,
             self.loopback_host,
-            self.client_ip_ranges,
+            if lan {
+                &lan_ranges
+            } else {
+                self.client_ip_ranges
+            },
         );
         self.client
             .mutate_server_routes(server, move |mut routes| {
@@ -738,6 +784,23 @@ impl RouteBackend for ManagedCaddyRoutes<'_> {
             })
             .map_err(route_error)
     }
+}
+
+impl RouteBackend for ManagedCaddyRoutes<'_> {
+    fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
+        if route.lan {
+            let (server, _) = self.server(false).map_err(route_error)?;
+            self.ensure_proxy(
+                route,
+                server,
+                LAN_CONTAINER_ID,
+                &crate::lan::hostname(&route.hostname),
+                true,
+            )?;
+        }
+        let (server, container_id) = self.server(route.tls).map_err(route_error)?;
+        self.ensure_proxy(route, server, container_id, &route.hostname, false)
+    }
 
     fn remove_if_owned(
         &mut self,
@@ -749,9 +812,59 @@ impl RouteBackend for ManagedCaddyRoutes<'_> {
         self.client
             .mutate_server_routes(server, move |mut routes| {
                 update_owned_route(&mut routes, container_id, owner_id, None)?;
+                if !tls {
+                    update_owned_route(&mut routes, LAN_CONTAINER_ID, owner_id, None)?;
+                }
                 Ok(routes)
             })
-            .map_err(route_error)
+            .map_err(route_error)?;
+        if tls {
+            // HTTPS-only commands do not select an unrelated HTTP server. Find
+            // only the companion routes owned by the run being removed.
+            let servers = if let Some(server) = self.http_server {
+                vec![server.to_owned()]
+            } else {
+                let config = self.client.fetch_config().map_err(route_error)?;
+                config
+                    .pointer("/apps/http/servers")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, server)| {
+                        server
+                            .get("routes")
+                            .and_then(Value::as_array)
+                            .is_some_and(|routes| {
+                                routes.iter().any(|container| {
+                                    container["@id"] == LAN_CONTAINER_ID
+                                        && container
+                                            .pointer("/handle/0/routes")
+                                            .and_then(Value::as_array)
+                                            .is_some_and(|routes| {
+                                                routes.iter().any(|route| {
+                                                    route
+                                                        .get("@id")
+                                                        .and_then(Value::as_str)
+                                                        .and_then(parse_owner_route_id)
+                                                        == Some(owner_id)
+                                                })
+                                            })
+                                })
+                            })
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            };
+            for server in servers {
+                self.client
+                    .mutate_server_routes(&server, move |mut routes| {
+                        update_owned_route(&mut routes, LAN_CONTAINER_ID, owner_id, None)?;
+                        Ok(routes)
+                    })
+                    .map_err(route_error)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -833,6 +946,7 @@ pub(crate) fn inspect_managed(
     for (server_name, container_id, tls) in [
         (selection.https.as_deref(), HTTPS_CONTAINER_ID, true),
         (selection.http.as_deref(), HTTP_CONTAINER_ID, false),
+        (selection.http.as_deref(), LAN_CONTAINER_ID, false),
     ] {
         let Some(server_name) = server_name else {
             continue;
@@ -854,7 +968,7 @@ pub(crate) fn inspect_managed(
         };
         if tls {
             inspection.https_container = true;
-        } else {
+        } else if container_id == HTTP_CONTAINER_ID {
             inspection.http_container = true;
         }
         for route in container
@@ -979,6 +1093,7 @@ fn listener_port(listener: &str) -> Option<u16> {
 
 pub(crate) const HTTPS_CONTAINER_ID: &str = "nook_https_routes_v1";
 pub(crate) const HTTP_CONTAINER_ID: &str = "nook_http_routes_v1";
+pub(crate) const LAN_CONTAINER_ID: &str = "nook_lan_routes_v1";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedRoute {
@@ -1114,7 +1229,11 @@ pub(crate) fn owner_route_id(owner_id: Uuid) -> String {
 }
 
 pub(crate) fn parse_owner_route_id(id: &str) -> Option<Uuid> {
-    Uuid::parse_str(id.strip_prefix("nook_route_v1_")?).ok()
+    Uuid::parse_str(
+        id.strip_prefix("nook_route_v1_")
+            .or_else(|| id.strip_prefix("nook_lan_route_v1_"))?,
+    )
+    .ok()
 }
 
 pub(crate) fn update_owned_route(
@@ -1123,7 +1242,7 @@ pub(crate) fn update_owned_route(
     owner_id: Uuid,
     replacement: Option<(String, Value)>,
 ) -> Result<(), Error> {
-    let no_tls = container_id == HTTP_CONTAINER_ID;
+    let no_tls = container_id != HTTPS_CONTAINER_ID;
     let replacement_hostname = replacement.as_ref().map(|(hostname, _)| hostname.as_str());
     let mut managed = Vec::new();
     if let Some(container) = server_routes
@@ -1165,12 +1284,8 @@ pub(crate) fn update_owned_route(
             route,
         });
     }
-    let (https, http) = build_containers(&managed);
-    place_container(
-        server_routes,
-        container_id,
-        if no_tls { http } else { https },
-    );
+    let container = build_container(container_id, managed.iter());
+    place_container(server_routes, container_id, container);
     Ok(())
 }
 
@@ -1215,7 +1330,7 @@ pub(crate) fn reject_foreign_hostname_claims(
     for route in server_routes {
         if matches!(
             route.get("@id").and_then(Value::as_str),
-            Some(HTTPS_CONTAINER_ID | HTTP_CONTAINER_ID)
+            Some(HTTPS_CONTAINER_ID | HTTP_CONTAINER_ID | LAN_CONTAINER_ID)
         ) {
             continue;
         }
@@ -1953,6 +2068,7 @@ mod tests {
         };
         backend
             .ensure(&RouteSpec {
+                lan: false,
                 owner_id: owner,
                 hostname: "api.localhost".into(),
                 target: "http://127.0.0.1:3000".into(),

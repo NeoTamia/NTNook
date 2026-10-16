@@ -1,6 +1,6 @@
 //! Command-line parsing, terminal output, and exit-code policy.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -79,6 +79,12 @@ pub(crate) struct InitArgs {
     /// Expose the route over HTTP instead of HTTPS.
     #[arg(long)]
     pub(crate) no_tls: bool,
+    /// Enable LAN access and automatic .local name discovery.
+    #[arg(long, conflicts_with = "no_lan")]
+    pub(crate) lan: bool,
+    /// Disable LAN mode in this configuration.
+    #[arg(long)]
+    pub(crate) no_lan: bool,
     /// Application bind IP address, also injected as HOST.
     #[arg(long, value_name = "IP")]
     pub(crate) run_bind_address: Option<IpAddr>,
@@ -202,9 +208,15 @@ pub(crate) struct RunArgs {
     /// Also expose publicly on the internet with Tailscale Funnel.
     #[arg(long, conflicts_with = "tailscale")]
     pub(crate) funnel: bool,
-    /// Keep the run local even when the project enables Serve or Funnel.
+    /// Disable Tailscale Serve and Funnel even when enabled in the project configuration.
     #[arg(long, conflicts_with_all = ["tailscale", "funnel"])]
     pub(crate) no_tailscale: bool,
+    /// Expose http://<name>.local on the LAN through Caddy.
+    #[arg(long, conflicts_with = "no_lan")]
+    pub(crate) lan: bool,
+    /// Disable LAN mode even when enabled in the project configuration.
+    #[arg(long)]
+    pub(crate) no_lan: bool,
     /// Application bind IP address, also injected as HOST.
     #[arg(long, value_name = "IP")]
     pub(crate) run_bind_address: Option<IpAddr>,
@@ -474,6 +486,17 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
     contents.push_str(
         "# Also expose `nook run` publicly on the internet with Tailscale Funnel.\n# funnel = false\n\n",
     );
+    contents.push_str(
+        "# Serve http://<name>.local through Caddy with automatic name discovery.\n\
+         # Requires Caddy to listen on port 80 on the LAN.\n\
+         # lan = true does NOT set run_bind_address to 0.0.0.0.\n\
+         # With the default 127.0.0.1 bind, LAN access goes through Caddy only.\n",
+    );
+    if arguments.lan || arguments.no_lan {
+        contents.push_str(&format!("lan = {}\n\n", arguments.lan));
+    } else {
+        contents.push_str("# lan = false\n\n");
+    }
     match arguments.app_port {
         Some(port) => contents.push_str(&format!(
             "# Preferred application port.\napp_port = {port}\n\n"
@@ -494,7 +517,12 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
             "# Delay before the readiness warning.\n# readiness_warn_after_seconds = 30\n",
         ),
     }
-    contents.push_str("\n# Interface used to bind the application and injected as HOST.\n");
+    contents.push_str(
+        "\n# Interface used to bind the application and injected as HOST.\n\
+         # If omitted, uses the global run_bind_address (default: 127.0.0.1).\n\
+         # --run-bind-address overrides this value.\n\
+         # Set 0.0.0.0 explicitly to also allow direct LAN access via IP:port.\n",
+    );
     match arguments.run_bind_address {
         Some(address) => contents.push_str(&format!(
             "run_bind_address = {}\n",
@@ -1261,7 +1289,10 @@ fn run_command(
         crate::tailscale::reachable_bind_address(config.bind_address)?;
         client.require_ready()?;
     }
-    with_caddy_routes(global, config.tls, !config.tls, |routes| {
+    with_caddy_routes(global, config.tls, !config.tls || config.lan, |routes| {
+        if config.lan {
+            routes.require_lan_listener()?;
+        }
         let mut exposure = tailscale.as_ref().map(crate::tailscale::ServeExposure::new);
         let mut running = match &mut exposure {
             Some(exposure) => crate::process::start_exposed_run(&config, &store, routes, exposure)?,
@@ -1284,6 +1315,29 @@ fn run_command(
             "nook: domain={} url={scheme}://{} port={}{tailscale_url}",
             running.hostname, running.hostname, running.port
         )?;
+        if config.lan {
+            writeln!(
+                errors,
+                "nook: lan_url=http://{}",
+                crate::lan::hostname(&running.hostname)
+            )?;
+            match crate::lan::addresses() {
+                Ok(addresses) if !addresses.is_empty() => {
+                    for address in addresses {
+                        if config.bind_address == std::net::IpAddr::V4(address)
+                            || config.bind_address == std::net::Ipv4Addr::UNSPECIFIED
+                        {
+                            writeln!(errors, "nook: lan_ip_url=http://{address}:{}", running.port)?;
+                        }
+                    }
+                }
+                Ok(_) => writeln!(
+                    errors,
+                    "warning: no LAN IPv4 address found; connect to a network to use --lan"
+                )?,
+                Err(error) => writeln!(errors, "warning: cannot list LAN addresses: {error}")?,
+            }
+        }
         if let Some(warning) = &running.warning {
             writeln!(errors, "warning: {warning}")?;
         }
@@ -1674,7 +1728,7 @@ fn prune_command(
     let expected = expected_routes(&registry);
     let mut removed_orphans = 0;
     for observed in inspection.routes {
-        if !expected.contains_key(&observed.owner_id) {
+        if !expected.iter().any(|(id, _, _)| *id == observed.owner_id) {
             match routes.remove_if_owned(&observed.hostname, observed.owner_id, observed.tls) {
                 Ok(()) => removed_orphans += 1,
                 Err(error) => writeln!(
@@ -1711,9 +1765,42 @@ fn reconcile_before_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
+    let operations = store.lock_operations()?;
+    let registry = store.load()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let selection = available_servers(global, &config)?;
+    let mut protocols: BTreeSet<_> = expected_routes(&registry)
+        .into_iter()
+        .map(|(_, _, tls)| tls)
+        .collect();
+    for operation in &registry.pending_operations {
+        use crate::state::PendingOperationKind::*;
+        match operation.kind {
+            InstallRoute { tls, .. }
+            | RestoreRoute { tls, .. }
+            | RemoveRoute { tls, .. }
+            | StartProcess { tls, .. } => {
+                protocols.insert(tls);
+            }
+            FinalizeLease { .. } => {}
+        }
+    }
+    let mut selection = crate::caddy::ServerSelection {
+        https: None,
+        http: None,
+    };
+    for tls in protocols {
+        match select_servers(global, &config, tls, !tls) {
+            Ok(selected) => {
+                if tls {
+                    selection.https = selected.https;
+                } else {
+                    selection.http = selected.http;
+                }
+            }
+            Err(error) => writeln!(errors, "warning: route reconciliation is pending: {error}")?,
+        }
+    }
     let mut routes = crate::caddy::ManagedCaddyRoutes {
         client: &client,
         https_server: selection.https.as_deref(),
@@ -1721,7 +1808,6 @@ fn reconcile_before_command(
         loopback_host: &global.caddy_loopback_host,
         client_ip_ranges: &global.caddy_client_ip_ranges,
     };
-    let operations = store.lock_operations()?;
     let report = reconcile_and_record(&store, &mut routes, &selection)?;
     for warning in report.warnings {
         writeln!(errors, "warning: {warning}")?;
@@ -1823,18 +1909,24 @@ fn available_servers(
     )?)
 }
 
-fn expected_routes(registry: &crate::state::Registry) -> BTreeMap<uuid::Uuid, (&str, bool)> {
-    registry
+fn expected_routes(
+    registry: &crate::state::Registry,
+) -> std::collections::BTreeSet<(uuid::Uuid, String, bool)> {
+    let mut routes: std::collections::BTreeSet<_> = registry
         .aliases
         .values()
-        .map(|alias| (alias.id, (alias.hostname.as_str(), alias.tls)))
+        .map(|alias| (alias.id, alias.hostname.clone(), alias.tls))
         .chain(
             registry
                 .leases
                 .values()
-                .map(|lease| (lease.id, (lease.hostname.as_str(), lease.tls))),
+                .map(|lease| (lease.id, lease.hostname.clone(), lease.tls)),
         )
-        .collect()
+        .collect();
+    for lease in registry.leases.values().filter(|lease| lease.lan) {
+        routes.insert((lease.id, crate::lan::hostname(&lease.hostname), false));
+    }
+    routes
 }
 
 fn drift_messages(
@@ -1842,23 +1934,20 @@ fn drift_messages(
     inspection: &crate::caddy::ManagedInspection,
 ) -> Vec<String> {
     let expected = expected_routes(registry);
-    let observed: BTreeMap<_, _> = inspection
+    let observed: std::collections::BTreeSet<_> = inspection
         .routes
         .iter()
-        .map(|route| (route.owner_id, (route.hostname.as_str(), route.tls)))
+        .map(|route| (route.owner_id, route.hostname.clone(), route.tls))
         .collect();
     let mut messages = Vec::new();
-    for (owner, route) in &expected {
-        if observed.get(owner) != Some(route) {
-            messages.push(format!(
-                "route {} is missing or differs from the registry",
-                route.0
-            ));
-        }
+    for (_, hostname, _) in expected.difference(&observed) {
+        messages.push(format!(
+            "route {hostname} is missing or differs from the registry"
+        ));
     }
-    for (owner, route) in observed {
-        if !expected.contains_key(&owner) {
-            messages.push(format!("route {} has no registry owner", route.0));
+    for (owner, hostname, _) in observed.difference(&expected) {
+        if !expected.iter().any(|(id, _, _)| id == owner) {
+            messages.push(format!("route {hostname} has no registry owner"));
         }
     }
     messages
@@ -2016,6 +2105,38 @@ mod tests {
         assert!(run.local);
         assert_eq!(run.readiness_warn_after, Some(12));
         assert_eq!(run.command, ["bun", "dev"]);
+    }
+
+    #[test]
+    fn lan_is_opt_in_and_accepts_an_explicit_bind_address() {
+        for command in ["run", "init"] {
+            assert_eq!(
+                try_parse(&[command, "--lan", "--no-lan"])
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::ArgumentConflict
+            );
+            assert!(try_parse(&[command, "--no-lan"]).is_ok());
+        }
+        for args in [
+            vec!["run", "--lan", "--", "server"],
+            vec!["api", "run", "--lan", "--", "server"],
+        ] {
+            let Command::Run(run) = parse(&args).command else {
+                unreachable!()
+            };
+            assert!(run.lan);
+        }
+        for command in ["run", "init"] {
+            for address in ["127.0.0.1", "0.0.0.0"] {
+                assert!(try_parse(&[command, "--lan", "--run-bind-address", address]).is_ok());
+            }
+        }
+        let Command::Run(run) = parse(&["run", "--", "server", "--lan"]).command else {
+            unreachable!()
+        };
+        assert!(!run.lan);
+        assert_eq!(run.command, ["server", "--lan"]);
     }
 
     #[test]
@@ -2335,6 +2456,7 @@ mod tests {
             registry.leases.insert(
                 id,
                 Lease {
+                    lan: false,
                     id,
                     hostname: hostname.into(),
                     target: "http://127.0.0.1:3000".into(),

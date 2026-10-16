@@ -1329,17 +1329,30 @@ fn failed_forced_spawn_preserves_displaced_owners() {
 
 fn exposed_frameworks_allow_the_tailnet_hostname() {
     let world = World::new("framework-hosts");
-    for framework in ["vite", "nuxt", "astro"] {
+    for (framework, lan, exposure) in ["vite", "nuxt", "astro"]
+        .into_iter()
+        .flat_map(|framework| [(framework, false), (framework, true)])
+        .flat_map(|(framework, lan)| {
+            ["--tailscale", "--funnel"].map(|exposure| (framework, lan, exposure))
+        })
+    {
         let program = world
             .root
             .join(format!("{framework}{}", env::consts::EXE_SUFFIX));
         fs::copy(env::current_exe().unwrap(), &program).unwrap();
-        let marker = world.root.join(format!("{framework}.json"));
+        let marker = world
+            .root
+            .join(format!("{framework}-{lan}-{exposure}.json"));
         let mut arguments = world.child_arguments(&marker, 0, None);
         arguments[0] = program.display().to_string();
         arguments.push("dev".into());
+        let mut run_arguments = vec!["run", exposure, "--name", "web"];
+        if lan {
+            run_arguments.push("--lan");
+        }
+        run_arguments.push("--");
         let run = world
-            .nook_command(&["run", "--tailscale", "--name", "web", "--"])
+            .nook_command(&run_arguments)
             .args(arguments)
             .env_remove("__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS")
             .output()
@@ -1347,7 +1360,12 @@ fn exposed_frameworks_allow_the_tailnet_hostname() {
         assert!(run.status.success(), "{}", describe(&run));
         let observed = read_json(&marker);
         assert_eq!(
-            observed["allowed_hosts"], DNS_NAME,
+            observed["allowed_hosts"],
+            if lan {
+                format!("{DNS_NAME},web.local")
+            } else {
+                DNS_NAME.to_owned()
+            },
             "{framework}: {observed}"
         );
         assert_eq!(observed["local_url"], "https://web.localhost");
@@ -1814,6 +1832,7 @@ fn describe(output: &Output) -> String {
 }
 
 fn serve_caddy(listener: TcpListener, routes: Arc<Mutex<Vec<Value>>>) {
+    let mut http_routes: Vec<Value> = Vec::new();
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         let Some(request) = read_request(&mut stream) else {
@@ -1831,9 +1850,14 @@ fn serve_caddy(listener: TcpListener, routes: Arc<Mutex<Vec<Value>>>) {
             respond(
                 &mut stream,
                 "200 OK",
-                &json!({"apps":{"http":{"servers":{"https":{"listen":[":443"],"routes":current}}}}}),
+                &json!({"apps":{"http":{"servers":{"https":{"listen":[":443"],"routes":current},"http":{"listen":[":80"],"routes":http_routes}}}}}),
                 None,
             );
+        } else if first_line.starts_with("GET /config/apps/http/servers/http/routes ") {
+            respond(&mut stream, "200 OK", &json!(http_routes), Some("\"v1\""));
+        } else if first_line.starts_with("PATCH /config/apps/http/servers/http/routes ") {
+            http_routes = serde_json::from_slice(&request[header_end..]).unwrap();
+            respond(&mut stream, "200 OK", &json!({}), None);
         } else if first_line.starts_with("GET /config/apps/http/servers/https/routes ") {
             let current = json!(*routes.lock().unwrap());
             respond(&mut stream, "200 OK", &current, Some("\"v1\""));

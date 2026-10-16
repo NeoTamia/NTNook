@@ -135,6 +135,7 @@ struct ProjectConfig {
     tls: Option<bool>,
     tailscale: Option<bool>,
     funnel: Option<bool>,
+    lan: Option<bool>,
     app_port: Option<u16>,
     strict_port: Option<bool>,
     readiness_warn_after_seconds: Option<u64>,
@@ -206,6 +207,7 @@ pub(crate) struct ResolvedRunConfig {
     pub(crate) tls: bool,
     pub(crate) tailscale: bool,
     pub(crate) funnel: bool,
+    pub(crate) lan: bool,
     pub(crate) app_port: Option<u16>,
     pub(crate) strict_port: bool,
     pub(crate) force: bool,
@@ -422,6 +424,7 @@ fn merge_project(
         tls: local.tls.or(base.tls),
         tailscale: local.tailscale.or(base.tailscale),
         funnel: local.funnel.or(base.funnel),
+        lan: local.lan.or(base.lan),
         app_port: local.app_port.or(base.app_port),
         strict_port: local.strict_port.or(base.strict_port),
         readiness_warn_after_seconds: local
@@ -446,12 +449,14 @@ fn merge_run(
         tls: None,
         tailscale: None,
         funnel: None,
+        lan: None,
         app_port: None,
         strict_port: None,
         readiness_warn_after_seconds: None,
         run_bind_address: None,
         framework: None,
     });
+    let lan = arguments.lan || (!arguments.no_lan && project.lan.unwrap_or(false));
     let hostname = resolve_hostname(
         arguments.name.as_deref(),
         project.name.as_deref(),
@@ -484,6 +489,7 @@ fn merge_run(
         },
         funnel,
         app_port: arguments.app_port.or(project.app_port),
+        lan,
         strict_port: arguments.strict_port || project.strict_port.unwrap_or(false),
         force: arguments.force,
         readiness_warn_after_seconds: arguments
@@ -849,6 +855,89 @@ mod tests {
     }
 
     #[test]
+    fn lan_preserves_configured_bind_address_and_the_local_route() {
+        let mut project = project();
+        project.run_bind_address = Some("::1".parse().unwrap());
+        let resolved = merge_run(
+            &run_args(&["run", "--lan"]),
+            Some(project),
+            None,
+            Path::new("/cwd"),
+            "127.0.0.2".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(resolved.lan);
+        assert_eq!(resolved.bind_address.to_string(), "::1");
+        assert_eq!(resolved.hostname, "project.localhost");
+        assert!(resolved.tls);
+    }
+
+    #[test]
+    fn lan_file_and_cli_precedence_preserves_explicit_false() {
+        let directory = temporary_directory();
+        for (base, local, flag, expected) in [
+            (None, None, None, false),
+            (Some(true), None, None, true),
+            (Some(false), Some(true), None, true),
+            (Some(true), Some(false), None, false),
+            (Some(false), Some(false), Some("--lan"), true),
+            (Some(true), Some(true), Some("--no-lan"), false),
+            (Some(true), Some(false), Some("--lan"), true),
+            (Some(false), Some(true), Some("--no-lan"), false),
+        ] {
+            let setting = |value: Option<bool>| {
+                value
+                    .map(|value| format!("lan = {value}\n"))
+                    .unwrap_or_default()
+            };
+            fs::write(directory.join("nook.toml"), format!(
+                "format_version = 1\ncommand = [\"server\"]\nrun_bind_address = \"127.0.0.2\"\n{}", setting(base)
+            )).unwrap();
+            fs::write(
+                directory.join("nook.local.toml"),
+                format!("format_version = 1\n{}", setting(local)),
+            )
+            .unwrap();
+            let arguments = match flag {
+                Some(flag) => run_args(&["run", flag]),
+                None => run_args(&["run"]),
+            };
+            let resolved = resolve_run(&arguments, &directory).unwrap();
+            assert_eq!(
+                resolved.lan, expected,
+                "base={base:?}, local={local:?}, flag={flag:?}"
+            );
+            assert_eq!(resolved.bind_address.to_string(), "127.0.0.2");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lan_bind_defaults_to_loopback_and_accepts_direct_access_overrides() {
+        for address in [None, Some("127.0.0.1"), Some("0.0.0.0")] {
+            let mut project = project();
+            project.lan = Some(true);
+            let args = match address {
+                Some(value) => run_args(&["run", "--run-bind-address", value]),
+                None => run_args(&["run"]),
+            };
+            let resolved = merge_run(
+                &args,
+                Some(project),
+                None,
+                Path::new("/cwd"),
+                default_run_bind_address(),
+            )
+            .unwrap();
+            assert!(resolved.lan);
+            assert_eq!(
+                resolved.bind_address.to_string(),
+                address.unwrap_or("127.0.0.1")
+            );
+        }
+    }
+
+    #[test]
     fn bind_address_precedence_is_cli_then_project_then_global() {
         for (cli, project_address, expected) in [
             (Some("::1"), Some("127.0.0.2"), "::1"),
@@ -871,6 +960,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(resolved.bind_address.to_string(), expected);
+            assert!(!resolved.lan);
         }
     }
 
@@ -938,6 +1028,27 @@ mod tests {
                 (exposure, public),
                 "{flag:?}, funnel={configured:?}, tailscale={private:?}"
             );
+        }
+    }
+
+    #[test]
+    fn lan_and_funnel_can_be_disabled_independently() {
+        for (flag, lan, funnel) in [("--no-lan", false, true), ("--no-tailscale", true, false)] {
+            let mut project = project();
+            project.lan = Some(true);
+            project.funnel = Some(true);
+            let resolved = merge_run(
+                &run_args(&["run", flag]),
+                Some(project),
+                None,
+                Path::new("/cwd"),
+                default_run_bind_address(),
+            )
+            .unwrap();
+            assert_eq!(resolved.lan, lan, "{flag}");
+            assert_eq!(resolved.funnel, funnel, "{flag}");
+            assert_eq!(resolved.tailscale, funnel, "{flag}");
+            assert!(resolved.bind_address.is_loopback(), "{flag}");
         }
     }
 
@@ -1029,13 +1140,14 @@ mod tests {
         let directory = temporary_directory();
         fs::write(
             directory.join("nook.local.toml"),
-            "format_version = 1\nname = \"local-only\"\ncommand = [\"server\"]\n",
+            "format_version = 1\nname = \"local-only\"\ncommand = [\"server\"]\nlan = true\n",
         )
         .unwrap();
 
         let resolved = resolve_run(&run_args(&["run"]), &directory).unwrap();
         assert_eq!(resolved.hostname, "local-only.localhost");
         assert_eq!(resolved.command, ["server"]);
+        assert!(resolved.lan);
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1050,11 +1162,12 @@ mod tests {
             "format_version = 1\nname = \"base\"\ncommand = [\"server\"]\n",
         )
         .unwrap();
-        fs::write(&local, "format_version = 1\nname = \"local\"\n").unwrap();
+        fs::write(&local, "format_version = 1\nname = \"local\"\nlan = true\n").unwrap();
 
         let base_path = base.to_str().unwrap();
         let ignored = resolve_run(&run_args(&["run", "--config", base_path]), &directory).unwrap();
         assert_eq!(ignored.hostname, "base.localhost");
+        assert!(!ignored.lan);
         assert_eq!(
             ignored.ignored_local_config.as_deref(),
             Some(local.as_path())
@@ -1066,6 +1179,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied.hostname, "local.localhost");
+        assert!(applied.lan);
         assert!(applied.ignored_local_config.is_none());
 
         fs::remove_file(&local).unwrap();
@@ -1254,6 +1368,7 @@ mod tests {
             tls: Some(true),
             tailscale: None,
             funnel: None,
+            lan: None,
             app_port: Some(8000),
             strict_port: Some(false),
             readiness_warn_after_seconds: Some(20),

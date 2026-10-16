@@ -94,6 +94,8 @@ pub(crate) struct Alias {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Lease {
+    #[serde(default)]
+    pub(crate) lan: bool,
     pub(crate) id: Uuid,
     pub(crate) hostname: String,
     pub(crate) target: String,
