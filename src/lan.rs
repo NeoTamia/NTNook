@@ -2,7 +2,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceInfo};
 use uuid::Uuid;
@@ -32,11 +32,32 @@ pub(crate) struct Advertisement {
     events: Receiver<DaemonEvent>,
     hostname: String,
     port: u16,
+    owner: Uuid,
+    last_owner_check: Instant,
 }
 
 impl Advertisement {
+    #[cfg(all(test, unix))]
+    pub(crate) fn daemon_for_test(&self) -> ServiceDaemon {
+        self.daemon.clone()
+    }
+
     pub(crate) fn start(localhost: &str, port: u16, owner: Uuid) -> mdns_sd::Result<Self> {
         Self::register(ServiceDaemon::new()?, localhost, port, owner)
+    }
+
+    pub(crate) fn is_displaced(&mut self, store: &crate::state::Store) -> bool {
+        if self.last_owner_check.elapsed() < Duration::from_millis(250) {
+            return false;
+        }
+        self.last_owner_check = Instant::now();
+        // A transient read failure does not prove that ownership was revoked.
+        store.load().is_ok_and(|registry| {
+            !registry
+                .leases
+                .get(&self.owner)
+                .is_some_and(|lease| lease.lan)
+        })
     }
 
     fn register(
@@ -58,6 +79,8 @@ impl Advertisement {
             events,
             hostname: format!("{}.", hostname(localhost)),
             port,
+            owner,
+            last_owner_check: Instant::now(),
         };
         // The LAN Caddy route accepts IPv4 clients.
         advertisement.daemon.disable_interface(IfKind::IPv6)?;

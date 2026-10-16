@@ -217,6 +217,7 @@ pub(crate) enum RunError {
     Process(Error),
     Exposure(Box<dyn std::error::Error + Send + Sync>),
     Conflict(String),
+    LanHostnameConflict { hostname: String, project: String },
 }
 
 impl fmt::Display for RunError {
@@ -230,6 +231,10 @@ impl fmt::Display for RunError {
                 formatter,
                 "hostname `{hostname}` is already managed by Nook; use --force to replace it"
             ),
+            Self::LanHostnameConflict { hostname, project } => write!(
+                formatter,
+                "LAN hostname `{hostname}` is already used by `{project}`; choose another --name (even with --force)"
+            ),
         }
     }
 }
@@ -241,7 +246,7 @@ impl std::error::Error for RunError {
             Self::Route(error) => Some(error),
             Self::Process(error) => Some(error),
             Self::Exposure(error) => Some(error.as_ref()),
-            Self::Conflict(_) => None,
+            Self::Conflict(_) | Self::LanHostnameConflict { .. } => None,
         }
     }
 }
@@ -335,7 +340,21 @@ fn start_run_with_hook(
 ) -> Result<RunningChild, RunError> {
     let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
     let operations = store.lock_operations()?;
-    let displaced = store.mutate(|registry| {
+    let registry = store.load()?;
+    if config.lan {
+        let hostname = crate::lan::hostname(&config.hostname);
+        if let Some(lease) = registry.leases.values().find(|lease| {
+            lease.lan
+                && lease.hostname != config.hostname
+                && crate::lan::hostname(&lease.hostname) == hostname
+        }) {
+            return Err(RunError::LanHostnameConflict {
+                hostname,
+                project: lease.hostname.clone(),
+            });
+        }
+    }
+    let displaced = {
         let aliases = registry
             .aliases
             .values()
@@ -346,8 +365,8 @@ fn start_run_with_hook(
             .values()
             .filter(|lease| lease.hostname == config.hostname)
             .map(route_for_lease);
-        Ok(aliases.chain(leases).collect::<Vec<_>>())
-    })?;
+        aliases.chain(leases).collect::<Vec<_>>()
+    };
     if !displaced.is_empty() && !config.force {
         return Err(RunError::Conflict(config.hostname.clone()));
     }
@@ -615,6 +634,9 @@ impl RunningChild {
         let started = Instant::now();
         let mut warned = false;
         loop {
+            if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
+                self.lan.take();
+            }
             if let Some(lan) = &self.lan {
                 for warning in lan.warnings() {
                     warn(&warning);
@@ -658,6 +680,9 @@ impl RunningChild {
     ) -> Result<RunOutcome, RunError> {
         let exit_code = self.child.wait_with_signals(&mut self.signals, || {
             use std::io::Write;
+            if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
+                self.lan.take();
+            }
             if let Some(lan) = &self.lan {
                 for warning in lan.warnings() {
                     let _ = writeln!(io::stderr(), "warning: {warning}");
@@ -2163,6 +2188,84 @@ mod tests {
         replacement.child.signal(ProcessSignal::Terminate).unwrap();
         replacement.finish(&store, &mut routes).unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn forced_replacement_rejects_a_different_project_with_the_same_lan_name() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let mut config = run_config(vec!["/bin/sleep", "10"], 30);
+        config.lan = true;
+        let mut first = start_run(&config, &store, &mut routes).unwrap();
+        let before = store.load().unwrap();
+        config.hostname = "api.local.localhost".into();
+        config.force = true;
+        let result = start_run(&config, &store, &mut routes);
+        let rejected = result.is_err();
+        let unchanged = store.load().unwrap() == before;
+        if let Ok(mut unexpected) = result {
+            unexpected.child.signal(ProcessSignal::Terminate).unwrap();
+            unexpected.finish(&store, &mut routes).unwrap();
+        }
+        first.child.signal(ProcessSignal::Terminate).unwrap();
+        first.finish(&store, &mut routes).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            rejected,
+            "--force must not steal another project's derived .local name"
+        );
+        assert!(
+            unchanged,
+            "a rejected collision must leave the registry unchanged"
+        );
+    }
+
+    #[test]
+    fn displaced_lan_supervisor_withdraws_mdns_before_its_child_exits() {
+        for waiting_for_readiness in [false, true] {
+            let (store, path) = temporary_store();
+            let mut routes = Routes::default();
+            let mut config = run_config(vec!["/bin/sleep", "2"], 30);
+            config.lan = true;
+            let mut first = start_run(&config, &store, &mut routes).unwrap();
+            let daemon = first
+                .lan
+                .as_ref()
+                .expect("mDNS must start")
+                .daemon_for_test();
+            let other_store = Store::new(path.clone());
+            let replace = thread::spawn(move || {
+                let mut config = run_config(vec!["/bin/true"], 30);
+                config.force = true;
+                let mut routes = Routes::default();
+                let mut replacement = start_run(&config, &other_store, &mut routes).unwrap();
+                replacement.finish(&other_store, &mut routes).unwrap();
+                let deadline = Instant::now() + Duration::from_millis(1200);
+                while Instant::now() < deadline {
+                    if daemon
+                        .status()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap()
+                        == mdns_sd::DaemonStatus::Shutdown
+                    {
+                        return true;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                false
+            });
+            if waiting_for_readiness {
+                assert!(!first.wait_for_readiness(&store, |_| {}).unwrap());
+            }
+            assert_eq!(first.finish(&store, &mut routes).unwrap().exit_code, 0);
+            let withdrawn = replace.join().unwrap();
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            assert!(
+                withdrawn,
+                "displaced mDNS remains active (readiness={waiting_for_readiness})"
+            );
+        }
     }
 
     #[test]

@@ -1765,9 +1765,42 @@ fn reconcile_before_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
+    let operations = store.lock_operations()?;
+    let registry = store.load()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let selection = available_servers(global, &config)?;
+    let mut protocols: BTreeSet<_> = expected_routes(&registry)
+        .into_iter()
+        .map(|(_, _, tls)| tls)
+        .collect();
+    for operation in &registry.pending_operations {
+        use crate::state::PendingOperationKind::*;
+        match operation.kind {
+            InstallRoute { tls, .. }
+            | RestoreRoute { tls, .. }
+            | RemoveRoute { tls, .. }
+            | StartProcess { tls, .. } => {
+                protocols.insert(tls);
+            }
+            FinalizeLease { .. } => {}
+        }
+    }
+    let mut selection = crate::caddy::ServerSelection {
+        https: None,
+        http: None,
+    };
+    for tls in protocols {
+        match select_servers(global, &config, tls, !tls) {
+            Ok(selected) => {
+                if tls {
+                    selection.https = selected.https;
+                } else {
+                    selection.http = selected.http;
+                }
+            }
+            Err(error) => writeln!(errors, "warning: route reconciliation is pending: {error}")?,
+        }
+    }
     let mut routes = crate::caddy::ManagedCaddyRoutes {
         client: &client,
         https_server: selection.https.as_deref(),
@@ -1775,7 +1808,6 @@ fn reconcile_before_command(
         loopback_host: &global.caddy_loopback_host,
         client_ip_ranges: &global.caddy_client_ip_ranges,
     };
-    let operations = store.lock_operations()?;
     let report = reconcile_and_record(&store, &mut routes, &selection)?;
     for warning in report.warnings {
         writeln!(errors, "warning: {warning}")?;
@@ -1929,11 +1961,7 @@ fn with_caddy_routes<T>(
 ) -> crate::Result<T> {
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
-    let mut selection = select_servers(global, &config, need_https, need_http)?;
-    // A replaced HTTPS run may also own a LAN route on the HTTP server.
-    if selection.http.is_none() {
-        selection.http = available_servers(global, &config)?.http;
-    }
+    let selection = select_servers(global, &config, need_https, need_http)?;
     let mut routes = crate::caddy::ManagedCaddyRoutes {
         client: &client,
         https_server: selection.https.as_deref(),

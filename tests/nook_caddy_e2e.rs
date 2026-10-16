@@ -455,6 +455,33 @@ https://localhost:443 {{
     );
     assert_eq!(http_only_running.wait().unwrap().code(), Some(143));
     assert!(!fetch_config(&harness).contains(&http_only_run_host));
+    harness.reload_sites(
+        "http://one.localhost:80 {\n bind 127.0.0.1\n respond 404\n}\n\
+         http://two.localhost:80 {\n bind 127.0.0.2\n respond 404\n}\n\
+         https://localhost:443 {\n tls internal\n respond 404\n}",
+    );
+    assert_success(&nook(
+        &config_home,
+        &state_home,
+        &["run", "--name", "https-only", "--", "/bin/true"],
+    ));
+    assert_success(&nook(
+        &config_home,
+        &state_home,
+        &["alias", "https-only", "3000"],
+    ));
+    assert_success(&nook(
+        &config_home,
+        &state_home,
+        &["alias", "remove", "https-only"],
+    ));
+    let ambiguous_lan = nook(
+        &config_home,
+        &state_home,
+        &["run", "--name", "lan", "--lan", "--", "/bin/true"],
+    );
+    assert!(!ambiguous_lan.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous_lan.stderr).contains("exactly one HTTP server"));
     assert_eq!(
         fs::metadata(harness.admin_socket().unwrap())
             .unwrap()

@@ -818,13 +818,51 @@ impl RouteBackend for ManagedCaddyRoutes<'_> {
                 Ok(routes)
             })
             .map_err(route_error)?;
-        if tls && let Some(server) = self.http_server {
-            self.client
-                .mutate_server_routes(server, move |mut routes| {
-                    update_owned_route(&mut routes, LAN_CONTAINER_ID, owner_id, None)?;
-                    Ok(routes)
-                })
-                .map_err(route_error)?;
+        if tls {
+            // HTTPS-only commands do not select an unrelated HTTP server. Find
+            // only the companion routes owned by the run being removed.
+            let servers = if let Some(server) = self.http_server {
+                vec![server.to_owned()]
+            } else {
+                let config = self.client.fetch_config().map_err(route_error)?;
+                config
+                    .pointer("/apps/http/servers")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, server)| {
+                        server
+                            .get("routes")
+                            .and_then(Value::as_array)
+                            .is_some_and(|routes| {
+                                routes.iter().any(|container| {
+                                    container["@id"] == LAN_CONTAINER_ID
+                                        && container
+                                            .pointer("/handle/0/routes")
+                                            .and_then(Value::as_array)
+                                            .is_some_and(|routes| {
+                                                routes.iter().any(|route| {
+                                                    route
+                                                        .get("@id")
+                                                        .and_then(Value::as_str)
+                                                        .and_then(parse_owner_route_id)
+                                                        == Some(owner_id)
+                                                })
+                                            })
+                                })
+                            })
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            };
+            for server in servers {
+                self.client
+                    .mutate_server_routes(&server, move |mut routes| {
+                        update_owned_route(&mut routes, LAN_CONTAINER_ID, owner_id, None)?;
+                        Ok(routes)
+                    })
+                    .map_err(route_error)?;
+            }
         }
         Ok(())
     }
