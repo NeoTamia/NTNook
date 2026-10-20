@@ -143,7 +143,11 @@ Official references:
 
 The normal Rust test suite covers configuration, interpolation, native launches
 and cleanup. The explicit runner gate exercises real Turbo and Lerna with two
-HTTP apps using the repository's Node wrapper and one non-HTTP package:
+HTTP apps using the repository's Node wrapper and one non-HTTP package.
+
+It also covers member restarts with detached server descendants, preservation
+of sibling apps, and recovery after supervisor loss when `prune` runs with a
+different temporary directory setting.
 
 ```sh
 cargo build --locked

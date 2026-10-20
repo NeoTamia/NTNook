@@ -256,7 +256,23 @@ impl SessionOwner {
         root: PathBuf,
         group_id: Uuid,
         state_path: PathBuf,
+        apps: Vec<SessionApp>,
+    ) -> crate::Result<Self> {
+        Self::create_at(
+            root,
+            group_id,
+            state_path,
+            apps,
+            std::path::absolute(session_path(group_id))?,
+        )
+    }
+
+    fn create_at(
+        root: PathBuf,
+        group_id: Uuid,
+        state_path: PathBuf,
         mut apps: Vec<SessionApp>,
+        path: PathBuf,
     ) -> crate::Result<Self> {
         let root = fs::canonicalize(root)?;
         if !state_path.is_absolute() {
@@ -285,13 +301,10 @@ impl SessionOwner {
         let supervisor = identity_lease(std::process::id(), group_id, group_id)?;
         // The directory can contain app environment. Journal its owner before
         // creating even the directory, so SIGKILL at any later write is recoverable.
-        journal_group(&Store::new(state_path.clone()), group_id)?;
-        let directory = session_directory(group_id);
+        let path = journal_group_at(&Store::new(state_path.clone()), group_id, path)?;
+        let directory = path.parent().expect("absolute session path").to_owned();
         create_private_directory(&directory)?;
-        let owner = Self {
-            path: directory.join("context.json"),
-            directory,
-        };
+        let owner = Self { path, directory };
         let context = Context {
             version: VERSION,
             closing: false,
@@ -466,7 +479,15 @@ pub(crate) fn session_path(group_id: Uuid) -> PathBuf {
 }
 
 /// Native and external workspaces share the same durable root ownership.
-pub(crate) fn journal_group(store: &Store, group_id: Uuid) -> crate::Result<()> {
+pub(crate) fn journal_group(store: &Store, group_id: Uuid) -> crate::Result<PathBuf> {
+    journal_group_at(
+        store,
+        group_id,
+        std::path::absolute(session_path(group_id))?,
+    )
+}
+
+fn journal_group_at(store: &Store, group_id: Uuid, path: PathBuf) -> crate::Result<PathBuf> {
     let identity = process::read_process_identity(std::process::id())
         .ok_or_else(|| invalid("cannot identify workspace supervisor"))?;
     store.mutate(|registry| {
@@ -487,11 +508,38 @@ pub(crate) fn journal_group(store: &Store, group_id: Uuid) -> crate::Result<()> 
                     process_start_time_ticks: identity.start_time_ticks,
                 },
                 runner: None,
+                session_path: Some(path.as_os_str().to_owned()),
             },
         );
         Ok(())
     })?;
-    Ok(())
+    Ok(path)
+}
+
+/// The journal is the authority, never the pruning process's TMPDIR.
+pub(crate) fn recovery_path(group_id: Uuid, group: &WorkspaceGroup) -> io::Result<&Path> {
+    let path = group
+        .session_path
+        .as_deref()
+        .map(Path::new)
+        .ok_or_else(|| {
+            io::Error::other("original workspace session path is unknown; cleanup remains pending")
+        })?;
+    if !path.is_absolute()
+        || path.file_name() != Some("context.json".as_ref())
+        || path.parent().and_then(Path::file_name)
+            != Some(format!("nook-session-{group_id}").as_ref())
+    {
+        return Err(io::Error::other("invalid journaled workspace session path"));
+    }
+    Ok(path)
+}
+
+pub(crate) fn member_process_marker(path: &Path, token: Uuid) -> OsString {
+    let mut marker = path.as_os_str().to_owned();
+    marker.push("/");
+    marker.push(token.to_string());
+    marker
 }
 
 fn remove_session_directory(directory: &Path) -> crate::Result<()> {
@@ -504,9 +552,10 @@ fn remove_session_directory(directory: &Path) -> crate::Result<()> {
 /// Remove crash-left environment only after the caller has cleaned every
 /// process in this workspace group. Never erase a live, unverifiable, or
 /// mismatched context, even if a stale registry entry names its group UUID.
-pub(crate) fn cleanup_stale(group_id: Uuid, supervisor: &WorkspaceSupervisor) -> crate::Result<()> {
-    let directory = session_directory(group_id);
-    let path = directory.join("context.json");
+pub(crate) fn cleanup_stale(group_id: Uuid, group: &WorkspaceGroup) -> crate::Result<()> {
+    let path = recovery_path(group_id, group)?;
+    let directory = path.parent().expect("verified session path");
+    let supervisor = &group.supervisor;
     if process::workspace_supervisor_liveness(supervisor) != Liveness::Dead {
         return Err(invalid(
             "refusing to clean a live or unverifiable supervisor context",
@@ -514,7 +563,7 @@ pub(crate) fn cleanup_stale(group_id: Uuid, supervisor: &WorkspaceSupervisor) ->
     }
     // A crash can precede either the lock file or the first atomic snapshot.
     // The durable journal authorizes only this exact private directory.
-    match fs::symlink_metadata(&directory) {
+    match fs::symlink_metadata(directory) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
         Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
@@ -536,16 +585,16 @@ pub(crate) fn cleanup_stale(group_id: Uuid, supervisor: &WorkspaceSupervisor) ->
             let _ = metadata;
         }
     }
-    match fs::symlink_metadata(&path) {
+    match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return remove_session_directory(&directory);
+            return remove_session_directory(directory);
         }
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
     // Reconciliation holds the store lock. Members hold the session lock
     // before entering the store: never wait for them here.
-    let locked = LockedContext::open_with(&path, true)?;
+    let locked = LockedContext::open_with(path, true)?;
     if locked.context.group_id != group_id
         || locked.context.supervisor.pid != supervisor.pid
         || locked.context.supervisor.process_start_time_ticks != supervisor.process_start_time_ticks
@@ -583,7 +632,7 @@ pub(crate) fn cleanup_stale(group_id: Uuid, supervisor: &WorkspaceSupervisor) ->
         thread::sleep(Duration::from_millis(10));
     }
     drop(locked); // Windows cannot unlink the context while its lock is open.
-    remove_session_directory(&directory)
+    remove_session_directory(directory)
 }
 
 impl SessionMember {
@@ -625,6 +674,14 @@ impl SessionMember {
                     app.id
                 )));
             }
+            // Dead wrapper/leader does not imply a detached server is gone.
+            // Clean exactly the old claim before publishing its replacement.
+            process::cleanup_workspace_member_processes(
+                path,
+                member.token,
+                context.supervisor.process_start_time_ticks,
+                member.child.as_ref(),
+            )?;
         }
         let token = Uuid::new_v4();
         let group_id = context.group_id;
@@ -664,6 +721,10 @@ impl SessionMember {
         self.group_id
     }
 
+    pub(crate) fn process_marker(&self) -> OsString {
+        member_process_marker(&self.path, self.token)
+    }
+
     /// Finish this app's tree before releasing its claim for a runner restart,
     /// including descendants whose server leader has already been reaped.
     pub(crate) fn cleanup_child(&self, child: &ManagedChild) -> crate::Result<()> {
@@ -677,7 +738,12 @@ impl SessionMember {
         lease.pgid = child.pgid;
         lease.process_start_time_ticks = child.start_time_ticks;
         lease.workspace_supervisor = Some(supervisor.clone());
-        process::cleanup_workspace_member_processes(self.group_id, &lease)?;
+        process::cleanup_workspace_member_processes(
+            &self.path,
+            self.token,
+            self.supervisor.process_start_time_ticks,
+            Some(&lease),
+        )?;
         Ok(())
     }
 
@@ -753,6 +819,7 @@ impl SessionMember {
         if let Err(error) = self.register_locked(&mut locked, &child, associate) {
             let _ = child.signal(process::ProcessSignal::Kill);
             let _ = child.wait();
+            self.cleanup_child(&child)?;
             child.join_output();
             return Err(error);
         }
@@ -844,7 +911,13 @@ impl SessionMember {
     /// clear a claim is conservative: a live child must not be joined twice.
     pub(crate) fn finish(&mut self) -> crate::Result<()> {
         let mut locked = LockedContext::open(&self.path)?;
-        self.claim_in(&locked.context)?;
+        let claim = self.claim_in(&locked.context)?;
+        process::cleanup_workspace_member_processes(
+            &self.path,
+            self.token,
+            self.supervisor.process_start_time_ticks,
+            claim.child.as_ref(),
+        )?;
         locked
             .context
             .members
@@ -868,6 +941,13 @@ impl Drop for SessionMember {
                 .members
                 .iter()
                 .any(|claim| claim.token == self.token && claim.child.is_none())
+            && process::cleanup_workspace_member_processes(
+                &self.path,
+                self.token,
+                self.supervisor.process_start_time_ticks,
+                None,
+            )
+            .is_ok()
         {
             locked
                 .context
@@ -1164,15 +1244,69 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn member_cleanup_reaps_marked_descendants_before_a_restart_claim_is_released() {
+    fn stale_unassociated_claim_cleans_its_token_before_replacement() {
+        let fixture = Fixture::new();
+        let old = fixture.claim(&[]).unwrap();
+        let mut detached = process::spawn_managed_child_in(
+            &["/bin/sleep".into(), "30".into()],
+            &[(PROCESS_VARIABLE.into(), old.process_marker())],
+            old.app.lease_id,
+            None,
+            None,
+        )
+        .unwrap();
+        // The wrapper crashed in the spawn -> association window; there is no
+        // child lease to tell recovery which process group to inspect.
+        fixture.change(|context| context.members[0].wrapper.process_start_time_ticks += 1);
+        let mut replacement = fixture.claim(&[]).unwrap();
+        assert_ne!(replacement.token, old.token);
+        assert_eq!(detached.wait().unwrap(), 128 + libc::SIGKILL);
+
+        let mut current = process::spawn_managed_child_in(
+            &["/bin/sleep".into(), "30".into()],
+            &[(PROCESS_VARIABLE.into(), replacement.process_marker())],
+            replacement.app.lease_id,
+            None,
+            None,
+        )
+        .unwrap();
+        old.cleanup_child(&detached).unwrap();
+        assert!(
+            current.try_wait().unwrap().is_none(),
+            "old token killed its replacement"
+        );
+        drop(old);
+        replacement.check_live().unwrap();
+        // finish itself verifies cleanup, including an unassociated child.
+        replacement.finish().unwrap();
+        assert_eq!(current.wait().unwrap(), 128 + libc::SIGKILL);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn member_cleanup_reaps_detached_grandchildren_before_same_port_restart_and_preserves_siblings()
+    {
         let fixture = Fixture::new();
         let mut member = fixture.claim(&[]).unwrap();
         fixture.owner.poll_joins(|_, _| Ok(())).unwrap();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
         let mut child = member.spawn_child(|| {
             process::spawn_managed_child_in(
                 &["/usr/bin/python3".into(), "-c".into(),
-                    "import subprocess,time; p=subprocess.Popen(['/bin/sleep','30']); open('watcher.pid','w').write(str(p.pid)); time.sleep(.05)".into()],
-                &[(PROCESS_VARIABLE.into(), fixture.owner.path().as_os_str().to_owned())],
+                    r#"import os,subprocess,time
+subprocess.run(['/usr/bin/python3','-c',"import os,subprocess; subprocess.Popen(['/usr/bin/python3','-c',os.environ['LISTENER']],start_new_session=True)"] ,check=True)
+deadline=time.monotonic()+5
+while not os.path.exists('watcher.pid'):
+    assert time.monotonic()<deadline, 'detached listener did not bind'
+    time.sleep(.01)
+"#.into()],
+                &[
+                    (PROCESS_VARIABLE.into(), member.process_marker()),
+                    ("TEST_PORT".into(), port.to_string().into()),
+                    ("LISTENER".into(), "import os,socket,time; s=socket.socket(); s.bind(('127.0.0.1',int(os.environ['TEST_PORT']))); s.listen(); open('watcher.pid','w').write(str(os.getpid())); time.sleep(30)".into()),
+                ],
                 member.app.lease_id, Some(&member.app.directory), None,
             ).map_err(process::RunError::from).map_err(crate::Error::from)
         }, |_, _, _, _| Ok(())).unwrap();
@@ -1188,7 +1322,7 @@ mod tests {
             &["/bin/sleep".into(), "30".into()],
             &[(
                 PROCESS_VARIABLE.into(),
-                fixture.owner.path().as_os_str().to_owned(),
+                member_process_marker(fixture.owner.path(), Uuid::new_v4()),
             )],
             Uuid::new_v4(),
             None,
@@ -1211,30 +1345,41 @@ mod tests {
         assert!(fixture.owner.path().exists());
         assert_eq!(fixture.owner.members().unwrap().len(), 1);
         member.finish().unwrap();
-        fixture.claim(&[]).unwrap().finish().unwrap();
+        let mut replacement = fixture.claim(&[]).unwrap();
+        let restarted = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        // A stale wrapper cannot remove or kill a newly issued token.
+        assert_ne!(member.process_marker(), replacement.process_marker());
+        drop(member);
+        replacement.check_live().unwrap();
+        replacement.finish().unwrap();
+        drop(restarted);
     }
 
     #[test]
     fn stale_cleanup_requires_matching_group_supervisor_and_definite_death() {
         let fixture = Fixture::new();
         let context = LockedContext::open(fixture.owner.path()).unwrap().context;
-        let mut supervisor = WorkspaceSupervisor {
-            pid: context.supervisor.pid,
-            process_start_time_ticks: context.supervisor.process_start_time_ticks,
+        let mut group = WorkspaceGroup {
+            supervisor: WorkspaceSupervisor {
+                pid: context.supervisor.pid,
+                process_start_time_ticks: context.supervisor.process_start_time_ticks,
+            },
+            runner: None,
+            session_path: Some(fixture.owner.path().as_os_str().to_owned()),
         };
         error(
-            cleanup_stale(context.group_id, &supervisor),
+            cleanup_stale(context.group_id, &group),
             "live or unverifiable",
         );
-        supervisor.process_start_time_ticks += 1;
+        group.supervisor.process_start_time_ticks += 1;
         error(
-            cleanup_stale(context.group_id, &supervisor),
+            cleanup_stale(context.group_id, &group),
             "mismatched group or supervisor",
         );
         fixture.change(|context| context.supervisor.process_start_time_ticks += 1);
-        cleanup_stale(context.group_id, &supervisor).unwrap();
+        cleanup_stale(context.group_id, &group).unwrap();
         assert!(!fixture.owner.path().exists());
-        cleanup_stale(context.group_id, &supervisor).unwrap();
+        cleanup_stale(context.group_id, &group).unwrap();
     }
 
     #[test]
@@ -1243,22 +1388,90 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let store = Store::new(root.join("state.json"));
         let group_id = Uuid::new_v4();
-        let directory = session_directory(group_id);
+        let directory = root.join(format!("nook-session-{group_id}"));
         create_private_directory(&directory).unwrap();
         // Force failure before even context.lock can be created. Ownership must
         // already be discoverable without an app lease or a readable context.
         assert!(
-            SessionOwner::create(root.clone(), group_id, store.path().to_owned(), Vec::new())
-                .is_err()
+            SessionOwner::create_at(
+                root.clone(),
+                group_id,
+                store.path().to_owned(),
+                Vec::new(),
+                directory.join("context.json")
+            )
+            .is_err()
         );
         let mut registry = store.load().unwrap();
         assert!(registry.leases.is_empty());
         let group = registry.workspace_groups.get_mut(&group_id).unwrap();
+        assert_eq!(
+            recovery_path(group_id, group).unwrap(),
+            directory.join("context.json")
+        );
+        assert!(!directory.join("context.lock").exists());
         assert!(group.runner.is_none());
         group.supervisor.process_start_time_ticks += 1;
-        cleanup_stale(group_id, &group.supervisor).unwrap();
+        cleanup_stale(group_id, group).unwrap();
         assert!(!directory.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn durable_non_unicode_session_path_is_used_instead_of_prune_temp_environment() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(format!("nook-path-test-{}", Uuid::new_v4()));
+        let custom_temp = root.join(OsString::from_vec(b"custom-temp-\xff".to_vec()));
+        fs::create_dir_all(&custom_temp).unwrap();
+        let group_id = Uuid::new_v4();
+        let path = custom_temp.join(format!("nook-session-{group_id}/context.json"));
+        let store = Store::new(root.join("state.json"));
+        let owner = SessionOwner::create_at(
+            root.clone(),
+            group_id,
+            store.path().to_owned(),
+            Vec::new(),
+            path.clone(),
+        )
+        .unwrap();
+        let mut group = store
+            .load()
+            .unwrap()
+            .workspace_groups
+            .remove(&group_id)
+            .unwrap();
+        assert_eq!(recovery_path(group_id, &group).unwrap(), path);
+        assert_ne!(
+            path,
+            session_path(group_id),
+            "test must use another temp root"
+        );
+        assert!(owner.path().exists());
+        group.supervisor.process_start_time_ticks += 1;
+        let mut locked = LockedContext::open(owner.path()).unwrap();
+        locked.context.supervisor.process_start_time_ticks += 1;
+        locked.save().unwrap();
+        drop(locked);
+        process::cleanup_workspace_processes(group_id, &group).unwrap();
+        cleanup_stale(group_id, &group).unwrap();
+        assert!(!path.parent().unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_group_without_original_path_stays_pending() {
+        let group: WorkspaceGroup = serde_json::from_value(serde_json::json!({
+            "supervisor": { "pid": 4294967295_u32, "process_start_time_ticks": 0 },
+            "runner": null,
+        }))
+        .unwrap();
+        let group_id = Uuid::new_v4();
+        error(
+            cleanup_stale(group_id, &group),
+            "original workspace session path is unknown",
+        );
+        assert!(process::cleanup_workspace_processes(group_id, &group).is_err());
     }
 
     #[test]

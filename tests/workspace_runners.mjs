@@ -105,7 +105,7 @@ import path from 'node:path';
 const id = path.basename(process.cwd());
 const info = {id, pid:process.pid, cwd:process.cwd(), port:process.env.PORT,
   host:process.env.HOST, url:process.env.NOOK_URL, api:process.env.API_UPSTREAM,
-  session:process.env.NOOK_WORKSPACE_SESSION ?? null};
+  session:process.env.NOOK_WORKSPACE_SESSION ?? null, recovery:process.env.NOOK_WORKSPACE_PROCESS ?? null};
 const server = http.createServer((req,res) => res.end(JSON.stringify(info)));
 server.listen(Number(info.port), info.host, () => {
   fs.writeFileSync(path.join(process.cwd(), 'started.json'), JSON.stringify(info));
@@ -261,6 +261,66 @@ fs.writeFileSync(${JSON.stringify(path.join(root, "restarted.json"))}, JSON.stri
       assert.equal(ports.length, 2);
       assert.equal(ports[0], ports[1], "restart retains its allocated port");
 
+      // A detached server must be gone before its wrapper releases the claim.
+      // Keep a sibling live throughout cleanup to catch group-wide signaling.
+      const detachedPath = path.join(root, "detached.mjs");
+      await writeFile(detachedPath, `
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+const child = spawn(process.execPath, [${JSON.stringify(path.join(root, "server.mjs"))}], {
+  detached:true, stdio:'ignore', env:process.env
+});
+child.unref();
+const deadline = Date.now()+5000;
+while (!fs.existsSync('started.json')) {
+  if (Date.now()>deadline) process.exit(1);
+  await new Promise(resolve=>setTimeout(resolve,10));
+}
+`);
+      const detachedRestart = path.join(root, "detached-restart.mjs");
+      await writeFile(detachedRestart, `
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import fs from 'node:fs';
+const root=${JSON.stringify(root)}, wrapper=${JSON.stringify(wrapper)};
+const server=${JSON.stringify(path.join(root, "server.mjs"))};
+const sibling=spawn(process.execPath,[wrapper,'--',process.execPath,server], {
+  cwd:root+'/apps/web',env:process.env,stdio:'inherit'
+});
+const siblingExit=once(sibling,'exit');
+try {
+  const deadline=Date.now()+5000;
+  while (!fs.existsSync(root+'/apps/web/started.json')) {
+    if (Date.now()>deadline) throw new Error('sibling did not start');
+    await new Promise(resolve=>setTimeout(resolve,10));
+  }
+  const first=spawnSync(process.execPath,[wrapper,'--',process.execPath,${JSON.stringify(detachedPath)}], {
+    cwd:root+'/apps/api',env:process.env,stdio:'inherit'
+  });
+  if (first.status!==0) throw new Error('detached member failed: '+first.status);
+  const firstInfo=JSON.parse(fs.readFileSync(root+'/apps/api/started.json'));
+  const stat=fs.existsSync('/proc/'+firstInfo.pid+'/stat') ? fs.readFileSync('/proc/'+firstInfo.pid+'/stat','utf8') : '';
+  if (stat && !/\\) [ZX] /.test(stat)) throw new Error('detached server survived member cleanup: '+JSON.stringify(firstInfo)+' stat='+stat);
+  const siblingInfo=JSON.parse(fs.readFileSync(root+'/apps/web/started.json'));
+  process.kill(siblingInfo.pid,0);
+  const second=spawnSync(process.execPath,[wrapper,'--',process.execPath,server], {
+    cwd:root+'/apps/api',env:{...process.env,NOOK_TEST_EXIT_AFTER:'100'},stdio:'inherit'
+  });
+  if (second.status!==0) throw new Error('member restart failed: '+second.status);
+  const secondInfo=JSON.parse(fs.readFileSync(root+'/apps/api/started.json'));
+  if (firstInfo.port!==secondInfo.port) throw new Error('member port changed');
+  process.kill(siblingInfo.pid,0);
+  fs.writeFileSync(root+'/detached-restarted','ok');
+} finally {
+  sibling.kill('SIGTERM');
+  await siblingExit;
+}
+`);
+      for (const id of ["api", "web"]) await rm(path.join(root, "apps", id, "started.json"), { force: true });
+      running = launch(nook, ["run", "--runner", "--", process.execPath, detachedRestart], { cwd: root, env: environment });
+      assert.equal((await running.ended)[0], 0, running.log());
+      assert.equal(await readFile(path.join(root, "detached-restarted"), "utf8"), "ok");
+
       // Abrupt loss of the root is recoverable through the durable registry.
       for (const id of ["api", "web"]) await rm(path.join(root, "apps", id, "started.json"), { force: true });
       // This runner intentionally has no signal forwarding of its own. The
@@ -272,11 +332,15 @@ for (const id of ['api','web']) spawn(process.execPath, [${JSON.stringify(wrappe
   cwd:${JSON.stringify(root)}+'/apps/'+id, env:process.env, stdio:'inherit'
 });
 spawn(process.execPath, ['-e', "require('node:fs').writeFileSync('watcher-ran',String(process.pid));setInterval(()=>{},1000)"], {
-  cwd:${JSON.stringify(path.join(root, "apps/watcher"))}, env:process.env, stdio:'inherit'
+  cwd:${JSON.stringify(path.join(root, "apps/watcher"))}, env:process.env, detached:true, stdio:'ignore'
 });
 setInterval(()=>{},1000);
 `);
-      running = launch(nook, ["run", "--runner", "--", process.execPath, crashRunner], { cwd: root, env: environment });
+      const sessionTemp = path.join(root, "session-temp");
+      await mkdir(sessionTemp);
+      running = launch(nook, ["run", "--runner", "--", process.execPath, crashRunner], {
+        cwd: root, env: { ...environment, TMPDIR: sessionTemp },
+      });
       const crashInfos = await waitFor(() => Promise.all(["api", "web"].map(async (id) => JSON.parse(await readFile(path.join(root, "apps", id, "started.json"), "utf8")))), "apps before root crash");
       const crashWatcherPid = await waitFor(async () => {
         const pid = Number(await readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"));
@@ -284,13 +348,14 @@ setInterval(()=>{},1000);
       }, "non-HTTP watcher before root crash");
       const beforeCrash = JSON.parse(await readFile(registryPath, "utf8"));
       const groupId = Object.values(beforeCrash.leases)[0].group_id;
-      const contextPath = path.join(tmpdir(), `nook-session-${groupId}`, "context.json");
+      const contextPath = path.join(sessionTemp, `nook-session-${groupId}`, "context.json");
       await readFile(contextPath);
       running.child.kill("SIGKILL");
       await running.ended;
       const prune = spawnSync(nook, ["prune"], { cwd: root, env: environment, encoding: "utf8" });
       assert.equal(prune.status, 0, prune.stdout + prune.stderr);
       assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).leases).length, 0);
+      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).workspace_groups ?? {}).length, 0);
       await assert.rejects(readFile(contextPath), { code: "ENOENT" });
       for (const info of [...crashInfos, { pid: crashWatcherPid }]) {
         await waitFor(async () => {
@@ -308,14 +373,17 @@ setInterval(()=>{},1000);
       throw error;
     } finally {
       await running?.stop();
-      // Failed crash recovery assertions must not leave the fixture's watcher.
-      try {
-        const pid = Number(await readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"));
-        if (await readlink(`/proc/${pid}/cwd`) === path.join(root, "apps/watcher")) {
-          process.kill(pid, "SIGKILL");
+      // A failing regression must not leave the fixture's detached processes.
+      for (const id of ["watcher", "api", "web"]) {
+        try {
+          const content = await readFile(path.join(root, "apps", id, id === "watcher" ? "watcher-ran" : "started.json"), "utf8");
+          const pid = id === "watcher" ? Number(content) : JSON.parse(content).pid;
+          if (await readlink(`/proc/${pid}/cwd`) === path.join(root, "apps", id)) {
+            process.kill(pid, "SIGKILL");
+          }
+        } catch (error) {
+          if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error;
         }
-      } catch (error) {
-        if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error;
       }
       await caddy?.stop();
       await rm(root, { recursive: true, force: true });

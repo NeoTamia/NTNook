@@ -127,6 +127,10 @@ pub(crate) struct WorkspaceSupervisor {
 pub(crate) struct WorkspaceGroup {
     pub(crate) supervisor: WorkspaceSupervisor,
     pub(crate) runner: Option<Lease>,
+    // OsString serde preserves Unix bytes and Windows code units. Older journals
+    // remain readable, but an unknown original path cannot authorize recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_path: Option<OsString>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -135,7 +135,10 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
     environment.retain(|(key, _)| {
         key != SESSION_VARIABLE && key != crate::workspace_session::PROCESS_VARIABLE
     });
-    environment.push((crate::workspace_session::PROCESS_VARIABLE.into(), marker));
+    environment.push((
+        crate::workspace_session::PROCESS_VARIABLE.into(),
+        member.process_marker(),
+    ));
     environment.extend(process::child_environment(
         port,
         config.bind_address,
@@ -368,11 +371,9 @@ impl RunnerTree {
                 if let Some(group) = registry.workspace_groups.get(&self.group_id) {
                     if group.supervisor != self.supervisor {
                         warnings.push("workspace group ownership was replaced".into());
-                    } else if let Err(error) = process::cleanup_workspace_processes(
-                        self.group_id,
-                        group,
-                        &children.into_values().collect::<Vec<_>>(),
-                    ) {
+                    } else if let Err(error) =
+                        process::cleanup_workspace_processes(self.group_id, group)
+                    {
                         warnings.push(format!("workspace runner cleanup is pending: {error}"));
                     }
                 } else {
@@ -709,7 +710,7 @@ impl PreparedWorkspace {
         store: &Store,
         routes: &mut impl RouteBackend,
     ) -> crate::Result<RunningWorkspace> {
-        crate::workspace_session::journal_group(store, self.group_id)?;
+        let session_path = crate::workspace_session::journal_group(store, self.group_id)?;
         let operations = store.lock_operations()?;
         let mut prepared_runs = Vec::new();
         let mut running = Vec::new();
@@ -737,7 +738,7 @@ impl PreparedWorkspace {
                 }
                 prepared.environment.push((
                     crate::workspace_session::PROCESS_VARIABLE.into(),
-                    crate::workspace_session::session_path(self.group_id).into_os_string(),
+                    session_path.as_os_str().to_owned(),
                 ));
                 let child = process::spawn_prepared_run(
                     &prepared.app.config,
@@ -928,13 +929,7 @@ fn cleanup_group_processes(store: &Store, group_id: Uuid) -> crate::Result<()> {
         .workspace_groups
         .get(&group_id)
         .ok_or_else(|| invalid("workspace group ownership is missing"))?;
-    let members: Vec<_> = registry
-        .leases
-        .values()
-        .filter(|lease| lease.group_id == Some(group_id))
-        .cloned()
-        .collect();
-    process::cleanup_workspace_processes(group_id, group, &members)?;
+    process::cleanup_workspace_processes(group_id, group)?;
     Ok(())
 }
 

@@ -1971,7 +1971,6 @@ pub(crate) fn kill_owned_lease(lease: &Lease) -> Result<(), Error> {
 pub(crate) fn cleanup_workspace_processes(
     group_id: Uuid,
     group: &crate::state::WorkspaceGroup,
-    members: &[Lease],
 ) -> io::Result<()> {
     if let Some(runner) = &group.runner {
         if runner.id != group_id
@@ -1984,56 +1983,86 @@ pub(crate) fn cleanup_workspace_processes(
         }
         kill_owned_lease(runner).map_err(io::Error::other)?;
     }
-    cleanup_marked_workspace_processes(group_id, group, members, true)
+    cleanup_marked_workspace_processes(
+        crate::workspace_session::recovery_path(group_id, group)?,
+        None,
+        group.supervisor.process_start_time_ticks,
+    )
 }
 
-pub(crate) fn cleanup_workspace_member_processes(group_id: Uuid, member: &Lease) -> io::Result<()> {
-    let supervisor = member
-        .workspace_supervisor
-        .clone()
-        .ok_or_else(|| io::Error::other("workspace member supervisor is missing"))?;
-    cleanup_marked_workspace_processes(
-        group_id,
-        &crate::state::WorkspaceGroup {
-            supervisor,
-            runner: None,
-        },
-        std::slice::from_ref(member),
-        false,
-    )
+pub(crate) fn cleanup_workspace_member_processes(
+    path: &std::path::Path,
+    token: Uuid,
+    started_after: u64,
+    child: Option<&Lease>,
+) -> io::Result<()> {
+    if let Some(child) = child {
+        kill_owned_lease(child).map_err(io::Error::other)?;
+    }
+    cleanup_marked_workspace_processes(path, Some(token), started_after)
+}
+
+#[cfg(target_os = "linux")]
+struct RecoveryMarkers {
+    exact: Vec<Vec<u8>>,
+    claim_prefix: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "linux")]
+impl RecoveryMarkers {
+    fn new(path: &std::path::Path, claim: Option<Uuid>) -> Self {
+        let marker = |key: &str, value: &std::ffi::OsStr| {
+            let mut marker = key.as_bytes().to_vec();
+            marker.push(b'=');
+            marker.extend_from_slice(value.as_bytes());
+            marker
+        };
+        if let Some(token) = claim {
+            Self {
+                exact: vec![marker(
+                    crate::workspace_session::PROCESS_VARIABLE,
+                    &crate::workspace_session::member_process_marker(path, token),
+                )],
+                claim_prefix: None,
+            }
+        } else {
+            let process = marker(crate::workspace_session::PROCESS_VARIABLE, path.as_os_str());
+            let mut prefix = process.clone();
+            prefix.push(b'/');
+            Self {
+                exact: vec![
+                    marker(crate::workspace_session::SESSION_VARIABLE, path.as_os_str()),
+                    process,
+                ],
+                claim_prefix: Some(prefix),
+            }
+        }
+    }
+
+    fn matches(&self, environment: &[u8]) -> bool {
+        environment.split(|byte| *byte == 0).any(|value| {
+            self.exact.iter().any(|marker| value == marker)
+                || self.claim_prefix.as_ref().is_some_and(|prefix| {
+                    value
+                        .strip_prefix(prefix.as_slice())
+                        .and_then(|token| std::str::from_utf8(token).ok())
+                        .is_some_and(|token| Uuid::parse_str(token).is_ok())
+                })
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn cleanup_marked_workspace_processes(
-    group_id: Uuid,
-    group: &crate::state::WorkspaceGroup,
-    members: &[Lease],
-    recover_unrecorded: bool,
+    path: &std::path::Path,
+    claim: Option<Uuid>,
+    started_after: u64,
 ) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let path = crate::workspace_session::session_path(group_id);
-    let markers: Vec<_> = [
-        crate::workspace_session::SESSION_VARIABLE,
-        crate::workspace_session::PROCESS_VARIABLE,
-    ]
-    .iter()
-    .map(|key| {
-        let mut marker = key.as_bytes().to_vec();
-        marker.push(b'=');
-        marker.extend_from_slice(path.as_os_str().as_bytes());
-        marker
-    })
-    .collect();
+    let markers = RecoveryMarkers::new(path, claim);
     let uid = fs::metadata("/proc/self")?.uid();
     let namespace = fs::read_link("/proc/self/ns/user")?;
     let uid_map = fs::read("/proc/self/uid_map")?;
-    let known_groups: std::collections::BTreeSet<_> = group
-        .runner
-        .iter()
-        .chain(members)
-        .filter(|lease| lease.group_id == Some(group_id))
-        .map(|lease| lease.pgid)
-        .collect();
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let mut found = false;
@@ -2068,12 +2097,9 @@ fn cleanup_marked_workspace_processes(
             if matches!(identity.state, b'Z' | b'X') {
                 continue;
             }
-            // Known groups cover committed children. Newly started groups can
-            // also belong to a member killed between spawn and association.
-            if !known_groups.contains(&identity.pgid)
-                && (!recover_unrecorded
-                    || identity.start_time_ticks < group.supervisor.process_start_time_ticks)
-            {
+            // Exact inherited ownership also covers setsid descendants and
+            // processes launched before their lease association was persisted.
+            if identity.start_time_ticks < started_after {
                 continue;
             }
             // Host processes mapped into a test's user namespace are not
@@ -2092,10 +2118,7 @@ fn cleanup_marked_workspace_processes(
             }
             match fs::read(entry.path().join("environ")) {
                 Ok(environment) => {
-                    if !environment
-                        .split(|byte| *byte == 0)
-                        .any(|value| markers.iter().any(|marker| value == marker))
-                    {
+                    if !markers.matches(&environment) {
                         continue;
                     }
                 }
@@ -2119,7 +2142,11 @@ fn cleanup_marked_workspace_processes(
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn kill_marked_process(pid: u32, expected: ProcIdentity, markers: &[Vec<u8>]) -> io::Result<bool> {
+fn kill_marked_process(
+    pid: u32,
+    expected: ProcIdentity,
+    markers: &RecoveryMarkers,
+) -> io::Result<bool> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // Open before re-reading /proc. Even if the numeric PID is reused during
     // validation, the signal can only reach the process pinned by this fd.
@@ -2146,10 +2173,7 @@ fn kill_marked_process(pid: u32, expected: ProcIdentity, markers: &[Vec<u8>]) ->
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
         Err(error) => return Err(error),
     };
-    if !environment
-        .split(|byte| *byte == 0)
-        .any(|value| markers.iter().any(|marker| value == marker))
-    {
+    if !markers.matches(&environment) {
         return Ok(false);
     }
     let result = unsafe {
@@ -2169,10 +2193,9 @@ fn kill_marked_process(pid: u32, expected: ProcIdentity, markers: &[Vec<u8>]) ->
 
 #[cfg(windows)]
 fn cleanup_marked_workspace_processes(
-    _group_id: Uuid,
-    _group: &crate::state::WorkspaceGroup,
-    _members: &[Lease],
-    _recover_unrecorded: bool,
+    _path: &std::path::Path,
+    _claim: Option<Uuid>,
+    _started_after: u64,
 ) -> io::Result<()> {
     // Every runner is assigned to a non-inherited KILL_ON_JOB_CLOSE job before
     // it is resumed. Root death closes the last handle, including the window
@@ -2182,10 +2205,9 @@ fn cleanup_marked_workspace_processes(
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn cleanup_marked_workspace_processes(
-    _group_id: Uuid,
-    _group: &crate::state::WorkspaceGroup,
-    _members: &[Lease],
-    _recover_unrecorded: bool,
+    _path: &std::path::Path,
+    _claim: Option<Uuid>,
+    _started_after: u64,
 ) -> io::Result<()> {
     Err(io::Error::other(
         "workspace descendant recovery requires Linux /proc",
@@ -2536,7 +2558,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn workspace_recovery_finds_non_http_descendants_after_runner_reaping_or_unjournaled_spawn() {
-        for (persisted_runner, unassociated_member) in [(false, false), (true, false), (true, true)]
+        for (persisted_runner, unassociated_member) in
+            [(false, false), (true, false), (false, true), (true, true)]
         {
             let (store, state_path) = temporary_store();
             let root = state_path.parent().unwrap();
@@ -2550,17 +2573,37 @@ mod tests {
                 .workspace_groups
                 .remove(&group_id)
                 .unwrap();
+            let actual_path = root
+                .join("custom-temp")
+                .join(format!("nook-session-{group_id}/context.json"));
+            assert_ne!(
+                actual_path,
+                crate::workspace_session::session_path(group_id)
+            );
+            group.session_path = Some(actual_path.clone().into_os_string());
+            store
+                .mutate(|registry| {
+                    registry.workspace_groups.insert(group_id, group.clone());
+                    Ok(())
+                })
+                .unwrap();
+            group = store
+                .load()
+                .unwrap()
+                .workspace_groups
+                .remove(&group_id)
+                .unwrap();
             let code = if unassociated_member {
-                "import os,subprocess,time; env=os.environ.copy(); env['NOOK_WORKSPACE_PROCESS']=env.pop('NOOK_WORKSPACE_SESSION'); p=subprocess.Popen(['/bin/sleep','30'],start_new_session=True,env=env); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
+                "import os,subprocess,time,uuid; env=os.environ.copy(); env['NOOK_WORKSPACE_PROCESS']=env.pop('NOOK_WORKSPACE_SESSION')+'/'+str(uuid.uuid4()); p=subprocess.Popen(['/bin/sleep','30'],start_new_session=True,env=env); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
             } else {
-                "import os,subprocess,time; p=subprocess.Popen(['/bin/sleep','30']); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
+                "import os,subprocess,time; p=subprocess.Popen(['/bin/sleep','30'],start_new_session=True); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
             };
             let mut leader = super::spawn_managed_child_in(
                 &["/usr/bin/python3".into(), "-c".into(), code.into()],
                 &[
                     (
                         crate::workspace_session::SESSION_VARIABLE.into(),
-                        crate::workspace_session::session_path(group_id).into_os_string(),
+                        actual_path.into_os_string(),
                     ),
                     ("WATCHER_PID".into(), marker_file.into_os_string()),
                 ],
@@ -2593,14 +2636,10 @@ mod tests {
             assert!(read_process_identity(leader.pid).is_none());
             assert!(
                 read_process_identity(watcher).is_some_and(|identity| identity.pgid
-                    == if unassociated_member {
-                        watcher as i32
-                    } else {
-                        leader.pgid
-                    }
+                    == watcher as i32
                     && identity.state != b'Z')
             );
-            super::cleanup_workspace_processes(group_id, &group, &[]).unwrap();
+            super::cleanup_workspace_processes(group_id, &group).unwrap();
             assert!(
                 read_process_identity(watcher)
                     .is_none_or(|identity| matches!(identity.state, b'Z' | b'X'))
@@ -2613,11 +2652,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn workspace_marker_kill_rejects_reused_identity_and_foreign_marker() {
         let group_id = Uuid::new_v4();
-        let marker = format!(
-            "NOOK_WORKSPACE_SESSION={}",
-            crate::workspace_session::session_path(group_id).display()
-        )
-        .into_bytes();
+        let marker =
+            super::RecoveryMarkers::new(&crate::workspace_session::session_path(group_id), None);
         let mut child = super::spawn_managed_child_in(
             &["/bin/sleep".into(), "30".into()],
             &[(
@@ -2634,14 +2670,12 @@ mod tests {
             start_time_ticks: identity.start_time_ticks + 1,
             ..identity
         };
-        assert!(
-            !super::kill_marked_process(child.pid, reused, std::slice::from_ref(&marker)).unwrap()
-        );
+        assert!(!super::kill_marked_process(child.pid, reused, &marker).unwrap());
         assert!(
             !super::kill_marked_process(
                 child.pid,
                 identity,
-                &[b"NOOK_WORKSPACE_SESSION=foreign".to_vec()]
+                &super::RecoveryMarkers::new(std::path::Path::new("/foreign/context.json"), None)
             )
             .unwrap()
         );
@@ -2652,7 +2686,7 @@ mod tests {
             state: b'R',
             ..read_process_identity(child.pid).unwrap()
         };
-        assert!(super::kill_marked_process(child.pid, changed_state, &[marker]).unwrap());
+        assert!(super::kill_marked_process(child.pid, changed_state, &marker).unwrap());
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
     }
 

@@ -397,7 +397,7 @@ fn reconcile_with_supervisors(
             Liveness::Alive => {}
         }
     }
-    for (group_id, supervisor) in dead_groups {
+    for (group_id, _) in dead_groups {
         if registry
             .leases
             .values()
@@ -407,15 +407,14 @@ fn reconcile_with_supervisors(
         }
         let cleanup = (|| -> crate::Result<()> {
             if let Some(group) = registry.workspace_groups.get(&group_id) {
-                let members: Vec<_> = registry
-                    .leases
-                    .values()
-                    .filter(|lease| lease.group_id == Some(group_id))
-                    .cloned()
-                    .collect();
-                crate::process::cleanup_workspace_processes(group_id, group, &members)?;
+                crate::process::cleanup_workspace_processes(group_id, group)?;
+                crate::workspace_session::cleanup_stale(group_id, group)
+            } else {
+                Err(std::io::Error::other(
+                    "original workspace session path is unknown; cleanup remains pending",
+                )
+                .into())
             }
-            crate::workspace_session::cleanup_stale(group_id, &supervisor)
         })();
         if let Err(error) = cleanup {
             report
@@ -1059,7 +1058,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .process_start_time_ticks += 1;
-        let mut registry = Registry::empty();
+        let mut registry = store.load().unwrap();
+        registry
+            .workspace_groups
+            .get_mut(&group_id)
+            .unwrap()
+            .supervisor = lease.workspace_supervisor.clone().unwrap();
         registry.leases.insert(lease.id, lease.clone());
         let mut routes = Routes::default();
         super::reconcile_with_supervisors(
@@ -1098,6 +1102,46 @@ mod tests {
         assert!(!session.path().exists());
         assert!(registry.leases.is_empty());
         std::fs::remove_dir_all(state_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_workspace_without_original_path_keeps_its_cleanup_journal() {
+        let group_id = Uuid::new_v4();
+        let supervisor = crate::state::WorkspaceSupervisor {
+            pid: u32::MAX,
+            process_start_time_ticks: 0,
+        };
+        let mut member = lease("legacy.localhost");
+        member.pid = u32::MAX;
+        member.group_id = Some(group_id);
+        member.workspace_supervisor = Some(supervisor.clone());
+        let mut registry = Registry::empty();
+        registry.workspace_groups.insert(
+            group_id,
+            crate::state::WorkspaceGroup {
+                supervisor,
+                runner: None,
+                session_path: None,
+            },
+        );
+        registry.leases.insert(member.id, member.clone());
+        let mut routes = Routes::default();
+        let report = super::reconcile_with_supervisors(
+            &mut registry,
+            &mut routes,
+            |_| Liveness::Dead,
+            |_| Liveness::Dead,
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("original workspace session path is unknown"))
+        );
+        assert!(registry.workspace_groups.contains_key(&group_id));
+        assert!(registry.leases.contains_key(&member.id));
+        assert_eq!(report.removed_dead_leases, 0);
+        assert!(routes.owners.is_empty());
     }
 
     #[test]
