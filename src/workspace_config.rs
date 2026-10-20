@@ -260,7 +260,7 @@ fn load_inner(
         resolved.ignored_local_config = ignored_root_local.clone().or_else(|| {
             (!use_local && member_local.exists() && member_local != path).then_some(member_local)
         });
-        if resolved.command.is_empty() {
+        if resolved.command.is_empty() && !arguments.runner {
             return Err(invalid(
                 &path,
                 format!("app `{}` requires a nonempty command argv", member.id),
@@ -541,6 +541,16 @@ mod tests {
         directory.error("invalid type");
         directory.workspace(&format!("{API}format_version = 1\n"));
         directory.error("must not set format_version");
+    }
+
+    #[test]
+    fn runner_members_need_no_duplicate_command_in_the_manifest() {
+        let directory = Directory::new();
+        directory.workspace("[[apps]]\nid = \"api\"\ndir = \"apps/api\"\n");
+        let workspace = directory.load(&["--runner"]).unwrap().unwrap();
+        assert_eq!(workspace.apps[0].id, "api");
+        assert!(workspace.apps[0].config.command.is_empty());
+        directory.error("a child command is required");
     }
 
     #[test]

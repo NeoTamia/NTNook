@@ -20,6 +20,10 @@ const CHILD: &str = r#"
 import os, pathlib
 pathlib.Path('spawned').write_text(str(os.getpid()))
 import http.client, http.server, json, socket, sys, time
+if os.environ.get('SPAWN_DESCENDANT'):
+    import subprocess
+    descendant = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
+    pathlib.Path('descendant').write_text(str(descendant.pid))
 # Capture Caddy before opening our listener: both sibling routes must exist now.
 admin = http.client.HTTPConnection('localhost', timeout=3)
 admin.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -285,7 +289,7 @@ fn workspace_supervisor_sigkill_then_prune_leaves_no_children_or_routes() {
         return;
     }
     let fixture = Workspace::new();
-    fixture.configure(true, None, "");
+    fixture.configure(true, None, "SPAWN_DESCENDANT = '1'\n");
     let mut running = fixture.start(&["run"]);
     let reports = fixture.wait_ready(&mut running, &["api", "web"]);
     running.signal(libc::SIGKILL);
@@ -467,6 +471,12 @@ impl Workspace {
         let state = self.state();
         assert!(state["leases"].as_object().unwrap().is_empty(), "{state}");
         assert!(
+            state
+                .get("workspace_groups")
+                .is_none_or(|groups| groups.as_object().unwrap().is_empty()),
+            "{state}"
+        );
+        assert!(
             state["pending_operations"].as_array().unwrap().is_empty(),
             "{state}"
         );
@@ -489,8 +499,11 @@ impl Workspace {
     fn spawned_pids(&self) -> Vec<i32> {
         ["api", "web"]
             .iter()
-            .filter_map(|id| {
-                fs::read_to_string(self.root.join(format!("apps/{id}/spawned")))
+            .flat_map(|id| {
+                ["spawned", "descendant"].map(|file| self.root.join(format!("apps/{id}/{file}")))
+            })
+            .filter_map(|path| {
+                fs::read_to_string(path)
                     .ok()
                     .map(|pid| pid.parse().unwrap())
             })

@@ -19,9 +19,11 @@ use crate::cli::RunArgs;
 use crate::config::ResolvedRunConfig;
 use crate::framework::FrameworkChoice;
 use crate::process::{self, Liveness, ManagedChild};
-use crate::state::{Lease, LeaseState, Scheme, Store, WorkspaceSupervisor};
+use crate::state::{Lease, LeaseState, Scheme, Store, WorkspaceGroup, WorkspaceSupervisor};
 
 pub(crate) const SESSION_VARIABLE: &str = "NOOK_WORKSPACE_SESSION";
+// App subprocesses inherit recovery ownership without inheriting member claims.
+pub(crate) const PROCESS_VARIABLE: &str = "NOOK_WORKSPACE_PROCESS";
 const VERSION: u32 = 1;
 const MAX_CONTEXT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -194,6 +196,10 @@ fn open_private_file(path: &Path, create_new: bool) -> crate::Result<File> {
 
 impl LockedContext {
     fn open(path: &Path) -> crate::Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: &Path, nonblocking: bool) -> crate::Result<Self> {
         if !path.is_absolute() || path.file_name() != Some("context.json".as_ref()) {
             return Err(invalid(
                 "marker must name an absolute session context.json path",
@@ -201,7 +207,12 @@ impl LockedContext {
         }
         // Open rather than create: invalid or removed contexts never resurrect.
         let lock = open_private_file(&path.with_file_name("context.lock"), false)?;
-        lock.lock()?;
+        if nonblocking {
+            lock.try_lock()
+                .map_err(|error| invalid(format!("session is busy: {error}")))?;
+        } else {
+            lock.lock()?;
+        }
         let file = open_private_file(path, false)?;
         if file.metadata()?.len() > MAX_CONTEXT_BYTES {
             return Err(invalid("context is too large"));
@@ -271,6 +282,10 @@ impl SessionOwner {
                 ));
             }
         }
+        let supervisor = identity_lease(std::process::id(), group_id, group_id)?;
+        // The directory can contain app environment. Journal its owner before
+        // creating even the directory, so SIGKILL at any later write is recoverable.
+        journal_group(&Store::new(state_path.clone()), group_id)?;
         let directory = session_directory(group_id);
         create_private_directory(&directory)?;
         let owner = Self {
@@ -283,7 +298,7 @@ impl SessionOwner {
             root,
             group_id,
             state_path,
-            supervisor: identity_lease(std::process::id(), group_id, group_id)?,
+            supervisor,
             apps,
             members: Vec::new(),
         };
@@ -346,6 +361,11 @@ impl SessionOwner {
         locked.context.closing = true;
         locked.save()?;
         Ok(locked.context.members.clone())
+    }
+
+    /// Called only once process cleanup has been verified. Errors retain the journal.
+    pub(crate) fn remove(&self) -> crate::Result<()> {
+        remove_session_directory(&self.directory)
     }
 }
 
@@ -429,12 +449,6 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     result
 }
 
-impl Drop for SessionOwner {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
-}
-
 fn framework_choice(value: &str) -> crate::Result<FrameworkChoice> {
     if value == "auto" {
         Ok(FrameworkChoice::Auto)
@@ -447,18 +461,91 @@ fn session_directory(group_id: Uuid) -> PathBuf {
     std::env::temp_dir().join(format!("nook-session-{group_id}"))
 }
 
+pub(crate) fn session_path(group_id: Uuid) -> PathBuf {
+    session_directory(group_id).join("context.json")
+}
+
+/// Native and external workspaces share the same durable root ownership.
+pub(crate) fn journal_group(store: &Store, group_id: Uuid) -> crate::Result<()> {
+    let identity = process::read_process_identity(std::process::id())
+        .ok_or_else(|| invalid("cannot identify workspace supervisor"))?;
+    store.mutate(|registry| {
+        if registry.workspace_groups.contains_key(&group_id) {
+            return Err(crate::state::Error::Io {
+                path: store.path().to_owned(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "workspace group already exists",
+                ),
+            });
+        }
+        registry.workspace_groups.insert(
+            group_id,
+            WorkspaceGroup {
+                supervisor: WorkspaceSupervisor {
+                    pid: std::process::id(),
+                    process_start_time_ticks: identity.start_time_ticks,
+                },
+                runner: None,
+            },
+        );
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn remove_session_directory(directory: &Path) -> crate::Result<()> {
+    match fs::remove_dir_all(directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => Ok(result?),
+    }
+}
+
 /// Remove crash-left environment only after the caller has cleaned every
 /// process in this workspace group. Never erase a live, unverifiable, or
 /// mismatched context, even if a stale registry entry names its group UUID.
 pub(crate) fn cleanup_stale(group_id: Uuid, supervisor: &WorkspaceSupervisor) -> crate::Result<()> {
     let directory = session_directory(group_id);
     let path = directory.join("context.json");
-    match fs::symlink_metadata(&path) {
+    if process::workspace_supervisor_liveness(supervisor) != Liveness::Dead {
+        return Err(invalid(
+            "refusing to clean a live or unverifiable supervisor context",
+        ));
+    }
+    // A crash can precede either the lock file or the first atomic snapshot.
+    // The durable journal authorizes only this exact private directory.
+    match fs::symlink_metadata(&directory) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(invalid("session directory must not be a symlink"));
+        }
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != fs::metadata("/proc/self")?.uid()
+                    || metadata.mode() & 0o077 != 0
+                {
+                    return Err(invalid(
+                        "session directory must be private and owned by this user",
+                    ));
+                }
+            }
+            #[cfg(windows)]
+            let _ = metadata;
+        }
+    }
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return remove_session_directory(&directory);
+        }
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
-    let locked = LockedContext::open(&path)?;
+    // Reconciliation holds the store lock. Members hold the session lock
+    // before entering the store: never wait for them here.
+    let locked = LockedContext::open_with(&path, true)?;
     if locked.context.group_id != group_id
         || locked.context.supervisor.pid != supervisor.pid
         || locked.context.supervisor.process_start_time_ticks != supervisor.process_start_time_ticks
@@ -467,17 +554,36 @@ pub(crate) fn cleanup_stale(group_id: Uuid, supervisor: &WorkspaceSupervisor) ->
             "refusing to clean a context with mismatched group or supervisor identity",
         ));
     }
-    if process::workspace_supervisor_liveness(supervisor) != Liveness::Dead {
-        return Err(invalid(
-            "refusing to clean a live or unverifiable supervisor context",
-        ));
+    for member in &locked.context.members {
+        if let Some(child) = &member.child {
+            process::kill_owned_lease(child).map_err(process::RunError::from)?;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut alive = false;
+        for child in locked
+            .context
+            .members
+            .iter()
+            .filter_map(|member| member.child.as_ref())
+        {
+            match process::lease_liveness(child) {
+                Liveness::Alive => alive = true,
+                Liveness::Dead => {}
+                Liveness::Indeterminate => return Err(invalid("member identity is indeterminate")),
+            }
+        }
+        if !alive {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid("workspace members have not exited; retry prune"));
+        }
+        thread::sleep(Duration::from_millis(10));
     }
     drop(locked); // Windows cannot unlink the context while its lock is open.
-    match fs::remove_dir_all(&directory) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        result => result?,
-    }
-    Ok(())
+    remove_session_directory(&directory)
 }
 
 impl SessionMember {
@@ -556,6 +662,23 @@ impl SessionMember {
     }
     pub(crate) fn group_id(&self) -> Uuid {
         self.group_id
+    }
+
+    /// Finish this app's tree before releasing its claim for a runner restart,
+    /// including descendants whose server leader has already been reaped.
+    pub(crate) fn cleanup_child(&self, child: &ManagedChild) -> crate::Result<()> {
+        let supervisor = WorkspaceSupervisor {
+            pid: self.supervisor.pid,
+            process_start_time_ticks: self.supervisor.process_start_time_ticks,
+        };
+        let mut lease = self.supervisor.clone();
+        lease.id = self.app.lease_id;
+        lease.pid = child.pid;
+        lease.pgid = child.pgid;
+        lease.process_start_time_ticks = child.start_time_ticks;
+        lease.workspace_supervisor = Some(supervisor.clone());
+        process::cleanup_workspace_member_processes(self.group_id, &lease)?;
+        Ok(())
     }
 
     pub(crate) fn config(&self, args: &RunArgs) -> crate::Result<ResolvedRunConfig> {
@@ -639,7 +762,7 @@ impl SessionMember {
     /// The callback MUST durably replace this app's placeholder with `child`,
     /// including its supervisor identity, before returning. Parent polling is
     /// deliberately not the durability boundary for a newly spawned process.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn register_child(
         &self,
         child: &ManagedChild,
@@ -837,6 +960,7 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
+            let _ = self.owner.remove();
             let _ = fs::remove_dir_all(&self.root);
         }
     }
@@ -1039,6 +1163,58 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn member_cleanup_reaps_marked_descendants_before_a_restart_claim_is_released() {
+        let fixture = Fixture::new();
+        let mut member = fixture.claim(&[]).unwrap();
+        fixture.owner.poll_joins(|_, _| Ok(())).unwrap();
+        let mut child = member.spawn_child(|| {
+            process::spawn_managed_child_in(
+                &["/usr/bin/python3".into(), "-c".into(),
+                    "import subprocess,time; p=subprocess.Popen(['/bin/sleep','30']); open('watcher.pid','w').write(str(p.pid)); time.sleep(.05)".into()],
+                &[(PROCESS_VARIABLE.into(), fixture.owner.path().as_os_str().to_owned())],
+                member.app.lease_id, Some(&member.app.directory), None,
+            ).map_err(process::RunError::from).map_err(crate::Error::from)
+        }, |_, _, _, _| Ok(())).unwrap();
+        assert_eq!(child.wait().unwrap(), 0);
+        let watcher: u32 = fs::read_to_string(member.app.directory.join("watcher.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            process::read_process_identity(watcher).is_some_and(|identity| identity.state != b'Z')
+        );
+        let mut sibling = process::spawn_managed_child_in(
+            &["/bin/sleep".into(), "30".into()],
+            &[(
+                PROCESS_VARIABLE.into(),
+                fixture.owner.path().as_os_str().to_owned(),
+            )],
+            Uuid::new_v4(),
+            None,
+            None,
+        )
+        .unwrap();
+        let cleanup = member.cleanup_child(&child);
+        let sibling_survived = sibling.try_wait().unwrap().is_none();
+        sibling.signal(process::ProcessSignal::Kill).unwrap();
+        sibling.wait().unwrap();
+        cleanup.unwrap();
+        assert!(
+            sibling_survived,
+            "member cleanup must preserve sibling app groups"
+        );
+        assert!(
+            process::read_process_identity(watcher)
+                .is_none_or(|identity| matches!(identity.state, b'Z' | b'X'))
+        );
+        assert!(fixture.owner.path().exists());
+        assert_eq!(fixture.owner.members().unwrap().len(), 1);
+        member.finish().unwrap();
+        fixture.claim(&[]).unwrap().finish().unwrap();
+    }
+
+    #[test]
     fn stale_cleanup_requires_matching_group_supervisor_and_definite_death() {
         let fixture = Fixture::new();
         let context = LockedContext::open(fixture.owner.path()).unwrap().context;
@@ -1059,6 +1235,93 @@ mod tests {
         cleanup_stale(context.group_id, &supervisor).unwrap();
         assert!(!fixture.owner.path().exists());
         cleanup_stale(context.group_id, &supervisor).unwrap();
+    }
+
+    #[test]
+    fn group_journal_precedes_the_first_context_write_and_cleans_partial_startup() {
+        let root = std::env::temp_dir().join(format!("nook-journal-test-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let store = Store::new(root.join("state.json"));
+        let group_id = Uuid::new_v4();
+        let directory = session_directory(group_id);
+        create_private_directory(&directory).unwrap();
+        // Force failure before even context.lock can be created. Ownership must
+        // already be discoverable without an app lease or a readable context.
+        assert!(
+            SessionOwner::create(root.clone(), group_id, store.path().to_owned(), Vec::new())
+                .is_err()
+        );
+        let mut registry = store.load().unwrap();
+        assert!(registry.leases.is_empty());
+        let group = registry.workspace_groups.get_mut(&group_id).unwrap();
+        assert!(group.runner.is_none());
+        group.supervisor.process_start_time_ticks += 1;
+        cleanup_stale(group_id, &group.supervisor).unwrap();
+        assert!(!directory.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_cleanup_with_a_busy_member_preserves_the_journal_without_waiting() {
+        let fixture = Fixture::new();
+        let context = LockedContext::open(fixture.owner.path()).unwrap().context;
+        let group_id = context.group_id;
+        fixture.change(|context| context.supervisor.process_start_time_ticks += 1);
+        let store = Store::new(fixture.root.join("state.json"));
+        store
+            .mutate(|registry| {
+                registry
+                    .workspace_groups
+                    .get_mut(&group_id)
+                    .unwrap()
+                    .supervisor
+                    .process_start_time_ticks += 1;
+                Ok(())
+            })
+            .unwrap();
+        let locked = LockedContext::open(fixture.owner.path()).unwrap();
+        // Reproduce CLI operations -> store -> session versus the member's
+        // session -> operations -> store ordering with the session held here.
+        let _operations = store.lock_operations().unwrap();
+        struct NoRoutes;
+        impl crate::reconcile::RouteBackend for NoRoutes {
+            fn ensure(
+                &mut self,
+                _: &crate::reconcile::RouteSpec,
+            ) -> Result<(), crate::reconcile::RouteError> {
+                panic!("early startup has no routes to restore")
+            }
+            fn remove_if_owned(
+                &mut self,
+                _: &str,
+                _: Uuid,
+                _: bool,
+            ) -> Result<(), crate::reconcile::RouteError> {
+                panic!("early startup has no routes to remove")
+            }
+        }
+        let mut routes = NoRoutes;
+        let report =
+            crate::reconcile::reconcile_store(&store, &mut routes, process::lease_liveness)
+                .unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("session is busy"))
+        );
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .workspace_groups
+                .contains_key(&group_id)
+        );
+        assert!(fixture.owner.path().exists());
+        drop(locked);
+        crate::reconcile::reconcile_store(&store, &mut routes, process::lease_liveness).unwrap();
+        assert!(store.load().unwrap().workspace_groups.is_empty());
+        assert!(!fixture.owner.path().exists());
     }
 
     #[test]

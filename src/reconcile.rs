@@ -376,7 +376,7 @@ fn reconcile_with_supervisors(
             (lease.id, live)
         })
         .collect();
-    let dead_groups: BTreeMap<_, _> = registry
+    let mut dead_groups: BTreeMap<_, _> = registry
         .leases
         .values()
         .filter_map(|lease| {
@@ -386,6 +386,17 @@ fn reconcile_with_supervisors(
             ))
         })
         .collect();
+    for (id, group) in &registry.workspace_groups {
+        match supervisor_liveness(&group.supervisor) {
+            Liveness::Dead => {
+                dead_groups.insert(*id, group.supervisor.clone());
+            }
+            Liveness::Indeterminate => report.warnings.push(format!(
+                "workspace group {id} supervisor identity is temporarily indeterminate"
+            )),
+            Liveness::Alive => {}
+        }
+    }
     for (group_id, supervisor) in dead_groups {
         if registry
             .leases
@@ -394,7 +405,19 @@ fn reconcile_with_supervisors(
         {
             continue;
         }
-        if let Err(error) = crate::workspace_session::cleanup_stale(group_id, &supervisor) {
+        let cleanup = (|| -> crate::Result<()> {
+            if let Some(group) = registry.workspace_groups.get(&group_id) {
+                let members: Vec<_> = registry
+                    .leases
+                    .values()
+                    .filter(|lease| lease.group_id == Some(group_id))
+                    .cloned()
+                    .collect();
+                crate::process::cleanup_workspace_processes(group_id, group, &members)?;
+            }
+            crate::workspace_session::cleanup_stale(group_id, &supervisor)
+        })();
+        if let Err(error) = cleanup {
             report
                 .warnings
                 .push(format!("workspace session cleanup is pending: {error}"));
@@ -406,6 +429,8 @@ fn reconcile_with_supervisors(
             {
                 live.insert(lease.id, Liveness::Indeterminate);
             }
+        } else {
+            registry.workspace_groups.remove(&group_id);
         }
     }
     let mut liveness = |lease: &Lease| live[&lease.id];

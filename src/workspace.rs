@@ -10,11 +10,9 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::process::{self, ForwardedSignals, ProcessSignal, RunExposure, RunOutcome};
+use crate::process::{self, ForwardedSignals, ProcessSignal, RunOutcome};
 use crate::reconcile::RouteBackend;
-use crate::state::{
-    Lease, LeaseState, PendingOperation, PendingOperationKind, Store, WorkspaceSupervisor,
-};
+use crate::state::{Lease, LeaseState, Store, WorkspaceSupervisor};
 use crate::workspace_config::{ResolvedWorkspaceConfig, WorkspaceApp};
 use crate::workspace_session::{SESSION_VARIABLE, SessionApp, SessionMember, SessionOwner};
 
@@ -134,7 +132,10 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
         None => argv,
     };
     let mut environment = member.app().environment.clone();
-    environment.retain(|(key, _)| key != SESSION_VARIABLE);
+    environment.retain(|(key, _)| {
+        key != SESSION_VARIABLE && key != crate::workspace_session::PROCESS_VARIABLE
+    });
+    environment.push((crate::workspace_session::PROCESS_VARIABLE.into(), marker));
     environment.extend(process::child_environment(
         port,
         config.bind_address,
@@ -191,10 +192,15 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
             thread::sleep(Duration::from_millis(20));
         }
     })();
+    child.stop();
+    let cleanup = member.cleanup_child(&child.0);
     drop(child);
     // Root teardown may already have removed the context. Child cleanup is the
     // important ordering boundary; a missing context cannot retain a live app.
-    let _ = member.finish();
+    if cleanup.is_ok() {
+        let _ = member.finish();
+    }
+    cleanup?;
     result
 }
 
@@ -288,8 +294,9 @@ fn interpolate(value: &OsStr, values: &BTreeMap<String, String>) -> crate::Resul
 }
 
 pub(crate) struct RunningWorkspace {
+    group_id: Uuid,
+    store: Store,
     pub(crate) apps: Vec<(String, process::RunningChild)>,
-    clients: Vec<Option<crate::tailscale::Client>>,
     readiness: Vec<(Duration, bool, bool)>,
     signals: ForwardedSignals,
     terminated: bool,
@@ -356,6 +363,40 @@ impl RunnerTree {
             thread::sleep(Duration::from_millis(10));
         }
         self.child.stop();
+        match self.store.load() {
+            Ok(registry) => {
+                if let Some(group) = registry.workspace_groups.get(&self.group_id) {
+                    if group.supervisor != self.supervisor {
+                        warnings.push("workspace group ownership was replaced".into());
+                    } else if let Err(error) = process::cleanup_workspace_processes(
+                        self.group_id,
+                        group,
+                        &children.into_values().collect::<Vec<_>>(),
+                    ) {
+                        warnings.push(format!("workspace runner cleanup is pending: {error}"));
+                    }
+                } else {
+                    warnings.push("workspace group ownership is missing".into());
+                }
+            }
+            Err(error) => warnings.push(format!("cannot read workspace group: {error}")),
+        }
+        if warnings.is_empty() {
+            if let Err(error) = self.owner.remove() {
+                warnings.push(format!("workspace session cleanup is pending: {error}"));
+            } else if let Err(error) = self.store.mutate(|registry| {
+                if registry
+                    .workspace_groups
+                    .get(&self.group_id)
+                    .is_some_and(|group| group.supervisor == self.supervisor)
+                {
+                    registry.workspace_groups.remove(&self.group_id);
+                }
+                Ok(())
+            }) {
+                warnings.push(format!("workspace journal cleanup is pending: {error}"));
+            }
+        }
         self.stopped = true;
         warnings
     }
@@ -365,40 +406,6 @@ impl Drop for RunnerTree {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-fn cleanup_runner_app(
-    store: &Store,
-    routes: &mut impl RouteBackend,
-    config: &crate::config::ResolvedRunConfig,
-    owner_id: Uuid,
-) -> crate::Result<Vec<String>> {
-    let _operations = store.lock_operations()?;
-    let cleanup = routes.remove_if_owned(&config.hostname, owner_id, config.tls);
-    store.mutate(|registry| {
-        registry.leases.remove(&owner_id);
-        if cleanup.is_err() {
-            registry.pending_operations.push(PendingOperation {
-                id: Uuid::new_v4(),
-                kind: PendingOperationKind::RemoveRoute {
-                    hostname: config.hostname.clone(),
-                    owner_id,
-                    tls: config.tls,
-                },
-            });
-        }
-        Ok(())
-    })?;
-    Ok(cleanup
-        .err()
-        .map(|error| {
-            format!(
-                "cleanup of {} is pending: {error}; run `nook prune` to retry",
-                config.hostname
-            )
-        })
-        .into_iter()
-        .collect())
 }
 
 impl PreparedWorkspace {
@@ -421,6 +428,7 @@ impl PreparedWorkspace {
         let operations = store.lock_operations()?;
         let mut prepared_runs = Vec::new();
         let mut runner = None;
+        let mut unstarted_owner = None;
         let mut committed = false;
         let startup = (|| -> crate::Result<Vec<String>> {
             for app in &mut self.apps {
@@ -472,12 +480,13 @@ impl PreparedWorkspace {
                     }
                 })
                 .collect();
-            let owner = SessionOwner::create(
+            unstarted_owner = Some(SessionOwner::create(
                 self.root.clone(),
                 self.group_id,
                 store.path().to_owned(),
                 apps,
-            )?;
+            )?);
+            let owner = unstarted_owner.as_ref().expect("created");
             if !self.signals.pending().is_empty() {
                 return Err(invalid("workspace startup interrupted"));
             }
@@ -492,13 +501,38 @@ impl PreparedWorkspace {
                 .map_err(process::RunError::from)?,
             );
             runner = Some(RunnerTree {
-                owner,
+                owner: unstarted_owner.take().expect("created"),
                 child,
                 store: Store::new(store.path().to_owned()),
                 group_id: self.group_id,
                 supervisor: root_supervisor.clone(),
                 stopped: false,
             });
+            // Persist the runner independently before any app placeholder can
+            // be replaced. The earlier group journal and marker cover a crash
+            // between spawn and this write.
+            store.mutate(|registry| {
+                let child = &runner.as_ref().expect("spawned").child.0;
+                registry
+                    .workspace_groups
+                    .get_mut(&self.group_id)
+                    .expect("journaled")
+                    .runner = Some(Lease {
+                    id: self.group_id,
+                    group_id: Some(self.group_id),
+                    workspace_supervisor: Some(root_supervisor.clone()),
+                    lan: false,
+                    hostname: String::new(),
+                    target: String::new(),
+                    scheme: crate::state::Scheme::Http,
+                    tls: false,
+                    pid: child.pid,
+                    pgid: child.pgid,
+                    process_start_time_ticks: child.start_time_ticks,
+                    state: LeaseState::Starting,
+                });
+                Ok(())
+            })?;
             let entries: Vec<_> = self
                 .apps
                 .iter()
@@ -514,14 +548,6 @@ impl PreparedWorkspace {
             let mut warnings =
                 process::commit_prepared_runs(&entries, Some(self.group_id), store, routes)?;
             committed = true;
-            store.mutate(|registry| {
-                for run in &prepared_runs {
-                    if let Some(lease) = registry.leases.get_mut(&run.owner_id) {
-                        lease.workspace_supervisor = Some(root_supervisor.clone());
-                    }
-                }
-                Ok(())
-            })?;
             warnings.extend(
                 prepared_runs
                     .iter()
@@ -530,7 +556,19 @@ impl PreparedWorkspace {
             Ok(warnings)
         })();
         if !committed {
+            // Even rollback must respect session -> operations -> store order.
+            drop(operations);
             drop(runner);
+            if let Some(owner) = unstarted_owner
+                && cleanup_group_processes(store, self.group_id).is_ok()
+                && owner.remove().is_ok()
+            {
+                let _ = store.mutate(|registry| {
+                    registry.workspace_groups.remove(&self.group_id);
+                    Ok(())
+                });
+            }
+            let _operations = store.lock_operations()?;
             for (app, run) in self.apps.iter().zip(&prepared_runs).rev() {
                 let _ = process::abandon_prepared_run(&app.app.config, run, store, routes);
             }
@@ -643,10 +681,16 @@ impl PreparedWorkspace {
         let mut warnings = runner.stop();
         let mut cleanup_error = None;
         for (app, run) in self.apps.iter().zip(&prepared_runs) {
-            match cleanup_runner_app(store, routes, &app.app.config, run.owner_id) {
+            match process::cleanup_run_route(
+                &app.app.config.hostname,
+                run.owner_id,
+                app.app.config.tls,
+                store,
+                routes,
+            ) {
                 Ok(pending) => warnings.extend(pending),
                 Err(error) => {
-                    cleanup_error.get_or_insert(error);
+                    cleanup_error.get_or_insert(crate::Error::from(error));
                 }
             }
         }
@@ -665,47 +709,25 @@ impl PreparedWorkspace {
         store: &Store,
         routes: &mut impl RouteBackend,
     ) -> crate::Result<RunningWorkspace> {
-        let mut clients = Vec::new();
-        for prepared in &self.apps {
-            let config = &prepared.app.config;
-            let client = config
-                .tailscale
-                .then(|| crate::tailscale::Client::from_environment().with_funnel(config.funnel));
-            if let Some(client) = &client {
-                crate::tailscale::reachable_bind_address(config.bind_address)?;
-                client.require_ready()?;
-            }
-            clients.push(client);
-        }
+        crate::workspace_session::journal_group(store, self.group_id)?;
         let operations = store.lock_operations()?;
         let mut prepared_runs = Vec::new();
         let mut running = Vec::new();
         let result = (|| -> crate::Result<()> {
-            for (index, prepared) in self.apps.iter_mut().enumerate() {
+            for prepared in &mut self.apps {
                 let config = &prepared.app.config;
                 let reservation = prepared.reservation.take().expect("reserved once");
-                let run = if let Some(client) = &clients[index] {
-                    process::prepare_run(
-                        config,
-                        reservation,
-                        store,
-                        routes,
-                        &operations,
-                        &mut crate::tailscale::ServeExposure::new(client),
-                    )?
-                } else {
-                    process::prepare_run(
-                        config,
-                        reservation,
-                        store,
-                        routes,
-                        &operations,
-                        &mut process::LocalOnly,
-                    )?
-                };
+                let run = process::prepare_run(
+                    config,
+                    reservation,
+                    store,
+                    routes,
+                    &operations,
+                    &mut process::LocalOnly,
+                )?;
                 prepared_runs.push(run);
             }
-            for (prepared, run) in self.apps.iter().zip(&mut prepared_runs) {
+            for (prepared, run) in self.apps.iter_mut().zip(&mut prepared_runs) {
                 if !self.signals.pending().is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
@@ -713,6 +735,10 @@ impl PreparedWorkspace {
                     )
                     .into());
                 }
+                prepared.environment.push((
+                    crate::workspace_session::PROCESS_VARIABLE.into(),
+                    crate::workspace_session::session_path(self.group_id).into_os_string(),
+                ));
                 let child = process::spawn_prepared_run(
                     &prepared.app.config,
                     run,
@@ -747,16 +773,17 @@ impl PreparedWorkspace {
             for (_, running) in &mut running {
                 let _ = running.child.signal(ProcessSignal::Kill);
                 let _ = running.child.wait();
-                running.child.join_output();
+            }
+            if cleanup_group_processes(store, self.group_id).is_ok() {
+                for (_, running) in &mut running {
+                    running.child.join_output();
+                }
+                let _ = store.mutate(|registry| {
+                    registry.workspace_groups.remove(&self.group_id);
+                    Ok(())
+                });
             }
             for (index, run) in prepared_runs.iter().enumerate().rev() {
-                if let Some(client) = &clients[index] {
-                    crate::tailscale::ServeExposure::new(client).withdraw(
-                        &operations,
-                        store,
-                        run.owner_id,
-                    );
-                }
                 let _ =
                     process::abandon_prepared_run(&self.apps[index].app.config, run, store, routes);
             }
@@ -774,8 +801,9 @@ impl PreparedWorkspace {
             })
             .collect();
         Ok(RunningWorkspace {
+            group_id: self.group_id,
+            store: store.clone(),
             apps: running,
-            clients,
             readiness,
             signals: self.signals,
             terminated: false,
@@ -824,8 +852,8 @@ impl RunningWorkspace {
                 thread::sleep(Duration::from_millis(20));
             }
         })();
-        self.terminate();
-        let mut warnings = Vec::new();
+        let mut warnings = self.terminate();
+        let processes_clean = warnings.is_empty();
         let mut cleanup_error = None;
         for (_, running) in &mut self.apps {
             match running.cleanup(store, routes) {
@@ -835,21 +863,14 @@ impl RunningWorkspace {
                 }
             }
         }
-        // Also withdraw Serve registrations on error, without needing a daemon.
-        if self.clients.iter().any(Option::is_some) {
-            let operations = store.lock_operations()?;
-            for (client, (_, running)) in self.clients.iter().zip(&self.apps) {
-                if let Some(client) = client {
-                    crate::tailscale::ServeExposure::new(client).withdraw(
-                        &operations,
-                        store,
-                        running.lease_id,
-                    );
-                }
-            }
-        }
         if let Some(error) = cleanup_error {
             return Err(error);
+        }
+        if processes_clean {
+            store.mutate(|registry| {
+                registry.workspace_groups.remove(&self.group_id);
+                Ok(())
+            })?;
         }
         Ok(RunOutcome {
             exit_code: result?,
@@ -857,9 +878,9 @@ impl RunningWorkspace {
         })
     }
 
-    fn terminate(&mut self) {
+    fn terminate(&mut self) -> Vec<String> {
         if self.terminated {
-            return;
+            return Vec::new();
         }
         self.terminated = true;
         for (_, running) in &self.apps {
@@ -883,23 +904,38 @@ impl RunningWorkspace {
         for (_, running) in &mut self.apps {
             let _ = running.child.signal(ProcessSignal::Kill);
             let _ = running.child.wait();
+        }
+        if let Err(error) = cleanup_group_processes(&self.store, self.group_id) {
+            return vec![format!("workspace process cleanup is pending: {error}")];
+        }
+        for (_, running) in &mut self.apps {
             running.child.join_output();
         }
+        Vec::new()
     }
 }
 
 impl Drop for RunningWorkspace {
     fn drop(&mut self) {
         // Errors in terminal output or readiness must never orphan a process tree.
-        if self.terminated {
-            return;
-        }
-        for (_, running) in &mut self.apps {
-            let _ = running.child.signal(ProcessSignal::Kill);
-            let _ = running.child.wait();
-            running.child.join_output();
-        }
+        self.terminate();
     }
+}
+
+fn cleanup_group_processes(store: &Store, group_id: Uuid) -> crate::Result<()> {
+    let registry = store.load()?;
+    let group = registry
+        .workspace_groups
+        .get(&group_id)
+        .ok_or_else(|| invalid("workspace group ownership is missing"))?;
+    let members: Vec<_> = registry
+        .leases
+        .values()
+        .filter(|lease| lease.group_id == Some(group_id))
+        .cloned()
+        .collect();
+    process::cleanup_workspace_processes(group_id, group, &members)?;
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -1271,7 +1307,11 @@ mod tests {
                 .all(|warning| warning.contains("waiting for the runner"))
         );
         let context = fs::read_to_string(marker).unwrap();
-        assert!(!std::path::Path::new(&context).exists());
+        assert!(
+            !std::path::Path::new(&context).exists(),
+            "{:?}",
+            outcome.warnings
+        );
         assert!(fixture.store.load().unwrap().leases.is_empty());
         assert!(routes.owners.is_empty());
         assert!(

@@ -75,6 +75,11 @@ the workspace:
 nook run --runner -- pnpm dev
 ```
 
+In runner mode the `command` fields in `[[apps]]` may be omitted: the existing
+package scripts supply the commands. Declare only each app's `id`, `dir` and
+Nook settings, plus any environment references. Native `nook run` still requires
+a command for every member.
+
 In this mode Nook prepares the declared apps, then starts the root command once.
 The runner owns its task graph, package scripts, output and non-HTTP tasks.
 Nook does not start the app commands a second time. Each package's `nook-run`

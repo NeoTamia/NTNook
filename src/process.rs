@@ -152,6 +152,8 @@ pub(crate) struct ManagedChild {
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) start_time_ticks: u64,
+    #[cfg(unix)]
+    workspace_owned: bool,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -686,7 +688,12 @@ pub(crate) fn commit_prepared_runs(
                 prepared.owner_id,
                 Lease {
                     group_id,
-                    workspace_supervisor: None,
+                    workspace_supervisor: group_id.and_then(|id| {
+                        registry
+                            .workspace_groups
+                            .get(&id)
+                            .map(|group| group.supervisor.clone())
+                    }),
                     lan: config.lan,
                     id: prepared.owner_id,
                     hostname: config.hostname.clone(),
@@ -847,28 +854,7 @@ impl RunningChild {
         routes: &mut impl RouteBackend,
     ) -> Result<Vec<String>, RunError> {
         self.lan.take();
-        let _operations = store.lock_operations()?;
-        let cleanup = routes.remove_if_owned(&self.hostname, self.lease_id, self.tls);
-        let mut warnings = Vec::new();
-        store.mutate(|registry| {
-            registry.leases.remove(&self.lease_id);
-            if let Err(error) = &cleanup {
-                registry.pending_operations.push(PendingOperation {
-                    id: Uuid::new_v4(),
-                    kind: PendingOperationKind::RemoveRoute {
-                        hostname: self.hostname.clone(),
-                        owner_id: self.lease_id,
-                        tls: self.tls,
-                    },
-                });
-                warnings.push(format!(
-                    "cleanup of {} is pending: {error}; run `nook prune` to retry",
-                    self.hostname
-                ));
-            }
-            Ok(())
-        })?;
-        Ok(warnings)
+        cleanup_run_route(&self.hostname, self.lease_id, self.tls, store, routes)
     }
 
     pub(crate) fn poll_readiness(&mut self, store: &Store) -> Result<bool, RunError> {
@@ -891,6 +877,37 @@ impl RunningChild {
         })?;
         Ok(true)
     }
+}
+
+/// Both direct children and runner members use the same ownership transaction.
+pub(crate) fn cleanup_run_route(
+    hostname: &str,
+    owner_id: Uuid,
+    tls: bool,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+) -> Result<Vec<String>, RunError> {
+    let _operations = store.lock_operations()?;
+    let cleanup = routes.remove_if_owned(hostname, owner_id, tls);
+    let mut warnings = Vec::new();
+    store.mutate(|registry| {
+        registry.leases.remove(&owner_id);
+        if let Err(error) = &cleanup {
+            registry.pending_operations.push(PendingOperation {
+                id: Uuid::new_v4(),
+                kind: PendingOperationKind::RemoveRoute {
+                    hostname: hostname.to_owned(),
+                    owner_id,
+                    tls,
+                },
+            });
+            warnings.push(format!(
+                "cleanup of {hostname} is pending: {error}; run `nook prune` to retry"
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(warnings)
 }
 
 pub(crate) fn readiness_probe_address(bind_address: IpAddr) -> IpAddr {
@@ -1049,13 +1066,14 @@ pub(crate) fn spawn_managed_child_in(
         arguments,
         raw_argument,
         internal_environment,
-    } = prepare_windows_command(program, arguments, environment, lease_id)?;
+    } = prepare_windows_command(program, arguments, environment, lease_id, directory)?;
     let mut command = Command::new(program);
     // A run started from an exposed run must not inherit its tailnet URL;
     // an exposed child gets its own value back from `environment`.
     command
         .env_remove(crate::tailscale::URL_VARIABLE)
         .env_remove("NOOK_WORKSPACE_SESSION")
+        .env_remove(crate::workspace_session::PROCESS_VARIABLE)
         .args(arguments)
         .envs(environment.iter().cloned());
     #[cfg(windows)]
@@ -1118,6 +1136,11 @@ pub(crate) fn spawn_managed_child_in(
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
+        #[cfg(unix)]
+        workspace_owned: environment.iter().any(|(key, _)| {
+            key == crate::workspace_session::SESSION_VARIABLE
+                || key == crate::workspace_session::PROCESS_VARIABLE
+        }),
         #[cfg(windows)]
         job,
     })
@@ -1208,8 +1231,9 @@ fn prepare_windows_command(
     arguments: Vec<OsString>,
     environment: &[(OsString, OsString)],
     lease_id: Uuid,
+    directory: Option<&std::path::Path>,
 ) -> Result<PreparedWindowsCommand, Error> {
-    let Some(resolved) = resolve_windows_program(&program, environment) else {
+    let Some(resolved) = resolve_windows_program(&program, environment, directory) else {
         return Ok(PreparedWindowsCommand {
             program,
             arguments,
@@ -1313,20 +1337,25 @@ fn windows_batch_command_line(
 fn resolve_windows_program(
     program: &std::ffi::OsStr,
     environment: &[(OsString, OsString)],
+    directory: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
 
     let program = Path::new(program);
+    let current_directory = match directory {
+        Some(directory) => directory.to_path_buf(),
+        None => env::current_dir().ok()?,
+    };
     let has_directory = program.is_absolute()
         || program
             .parent()
             .is_some_and(|parent| !parent.as_os_str().is_empty());
     let directories = if has_directory {
-        vec![PathBuf::new()]
+        vec![current_directory.clone()]
     } else {
-        let mut directories = vec![env::current_dir().ok()?];
+        let mut directories = vec![current_directory.clone()];
         if let Some(path) = effective_windows_env(environment, "PATH") {
-            directories.extend(env::split_paths(&path));
+            directories.extend(env::split_paths(&path).map(|entry| current_directory.join(entry)));
         }
         directories
     };
@@ -1395,6 +1424,15 @@ fn send_group_signal(pgid: i32, signal: i32) -> io::Result<()> {
 
 #[cfg(unix)]
 fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Result<()> {
+    // A reaped leader's numeric PGID may already belong to another process.
+    // Runner recovery separately finds marked descendants when this is absent.
+    if child.workspace_owned
+        && !read_process_identity(child.pid).is_some_and(|identity| {
+            identity.pgid == child.pgid && identity.start_time_ticks == child.start_time_ticks
+        })
+    {
+        return Ok(());
+    }
     let signal = match signal {
         ProcessSignal::Interrupt => libc::SIGINT,
         ProcessSignal::Terminate => libc::SIGTERM,
@@ -1927,6 +1965,233 @@ pub(crate) fn kill_owned_lease(lease: &Lease) -> Result<(), Error> {
     }
 }
 
+/// Recover the independent runner tree even after its leader has been reaped.
+/// No environment is persisted or reported; only an exact inherited marker is
+/// compared in memory. pidfds pin each verified process across PID reuse.
+pub(crate) fn cleanup_workspace_processes(
+    group_id: Uuid,
+    group: &crate::state::WorkspaceGroup,
+    members: &[Lease],
+) -> io::Result<()> {
+    if let Some(runner) = &group.runner {
+        if runner.id != group_id
+            || runner.group_id != Some(group_id)
+            || runner.workspace_supervisor.as_ref() != Some(&group.supervisor)
+        {
+            return Err(io::Error::other(
+                "workspace runner identity does not match its group",
+            ));
+        }
+        kill_owned_lease(runner).map_err(io::Error::other)?;
+    }
+    cleanup_marked_workspace_processes(group_id, group, members, true)
+}
+
+pub(crate) fn cleanup_workspace_member_processes(group_id: Uuid, member: &Lease) -> io::Result<()> {
+    let supervisor = member
+        .workspace_supervisor
+        .clone()
+        .ok_or_else(|| io::Error::other("workspace member supervisor is missing"))?;
+    cleanup_marked_workspace_processes(
+        group_id,
+        &crate::state::WorkspaceGroup {
+            supervisor,
+            runner: None,
+        },
+        std::slice::from_ref(member),
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_marked_workspace_processes(
+    group_id: Uuid,
+    group: &crate::state::WorkspaceGroup,
+    members: &[Lease],
+    recover_unrecorded: bool,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let path = crate::workspace_session::session_path(group_id);
+    let markers: Vec<_> = [
+        crate::workspace_session::SESSION_VARIABLE,
+        crate::workspace_session::PROCESS_VARIABLE,
+    ]
+    .iter()
+    .map(|key| {
+        let mut marker = key.as_bytes().to_vec();
+        marker.push(b'=');
+        marker.extend_from_slice(path.as_os_str().as_bytes());
+        marker
+    })
+    .collect();
+    let uid = fs::metadata("/proc/self")?.uid();
+    let namespace = fs::read_link("/proc/self/ns/user")?;
+    let uid_map = fs::read("/proc/self/uid_map")?;
+    let known_groups: std::collections::BTreeSet<_> = group
+        .runner
+        .iter()
+        .chain(members)
+        .filter(|lease| lease.group_id == Some(group_id))
+        .map(|lease| lease.pgid)
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut found = false;
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if metadata.uid() != uid {
+                continue;
+            }
+            let Some(identity) = read_process_identity(pid) else {
+                if entry.path().exists() {
+                    return Err(io::Error::other(
+                        "cannot verify workspace candidate identity",
+                    ));
+                }
+                continue;
+            };
+            if matches!(identity.state, b'Z' | b'X') {
+                continue;
+            }
+            // Known groups cover committed children. Newly started groups can
+            // also belong to a member killed between spawn and association.
+            if !known_groups.contains(&identity.pgid)
+                && (!recover_unrecorded
+                    || identity.start_time_ticks < group.supervisor.process_start_time_ticks)
+            {
+                continue;
+            }
+            // Host processes mapped into a test's user namespace are not
+            // candidates, even when their displayed uid happens to match.
+            match fs::read(entry.path().join("uid_map")) {
+                Ok(candidate_map) if candidate_map != uid_map => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
+            match fs::read_link(entry.path().join("ns/user")) {
+                Ok(candidate_namespace) if candidate_namespace != namespace => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
+            match fs::read(entry.path().join("environ")) {
+                Ok(environment) => {
+                    if !environment
+                        .split(|byte| *byte == 0)
+                        .any(|value| markers.iter().any(|marker| value == marker))
+                    {
+                        continue;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+                Err(error) => return Err(error),
+            }
+            found |= kill_marked_process(pid, identity, &markers)?;
+        }
+        if !found {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "workspace descendants have not exited; retry prune",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn kill_marked_process(pid: u32, expected: ProcIdentity, markers: &[Vec<u8>]) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Open before re-reading /proc. Even if the numeric PID is reused during
+    // validation, the signal can only reach the process pinned by this fd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    if !read_process_identity(pid).is_some_and(|identity| {
+        !matches!(identity.state, b'Z' | b'X')
+            && identity.pgid == expected.pgid
+            && identity.start_time_ticks == expected.start_time_ticks
+    }) {
+        return Ok(false);
+    }
+    let environment = match fs::read(format!("/proc/{pid}/environ")) {
+        Ok(environment) => environment,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !environment
+        .split(|byte| *byte == 0)
+        .any(|value| markers.iter().any(|marker| value == marker))
+    {
+        return Ok(false);
+    }
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn cleanup_marked_workspace_processes(
+    _group_id: Uuid,
+    _group: &crate::state::WorkspaceGroup,
+    _members: &[Lease],
+    _recover_unrecorded: bool,
+) -> io::Result<()> {
+    // Every runner is assigned to a non-inherited KILL_ON_JOB_CLOSE job before
+    // it is resumed. Root death closes the last handle, including the window
+    // before its process identity could be persisted in the registry.
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn cleanup_marked_workspace_processes(
+    _group_id: Uuid,
+    _group: &crate::state::WorkspaceGroup,
+    _members: &[Lease],
+    _recover_unrecorded: bool,
+) -> io::Result<()> {
+    Err(io::Error::other(
+        "workspace descendant recovery requires Linux /proc",
+    ))
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn kill_owned_job(lease: &Lease) -> io::Result<()> {
@@ -2266,6 +2531,129 @@ mod tests {
     fn malformed_or_truncated_proc_data_is_indeterminate() {
         assert_eq!(parse_stat("42 (worker) S 1"), None);
         assert_eq!(parse_stat("not proc stat"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_recovery_finds_non_http_descendants_after_runner_reaping_or_unjournaled_spawn() {
+        for (persisted_runner, unassociated_member) in [(false, false), (true, false), (true, true)]
+        {
+            let (store, state_path) = temporary_store();
+            let root = state_path.parent().unwrap();
+            std::fs::create_dir_all(root).unwrap();
+            let marker_file = root.join("watcher.pid");
+            let group_id = Uuid::new_v4();
+            crate::workspace_session::journal_group(&store, group_id).unwrap();
+            let mut group = store
+                .load()
+                .unwrap()
+                .workspace_groups
+                .remove(&group_id)
+                .unwrap();
+            let code = if unassociated_member {
+                "import os,subprocess,time; env=os.environ.copy(); env['NOOK_WORKSPACE_PROCESS']=env.pop('NOOK_WORKSPACE_SESSION'); p=subprocess.Popen(['/bin/sleep','30'],start_new_session=True,env=env); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
+            } else {
+                "import os,subprocess,time; p=subprocess.Popen(['/bin/sleep','30']); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
+            };
+            let mut leader = super::spawn_managed_child_in(
+                &["/usr/bin/python3".into(), "-c".into(), code.into()],
+                &[
+                    (
+                        crate::workspace_session::SESSION_VARIABLE.into(),
+                        crate::workspace_session::session_path(group_id).into_os_string(),
+                    ),
+                    ("WATCHER_PID".into(), marker_file.into_os_string()),
+                ],
+                group_id,
+                None,
+                None,
+            )
+            .unwrap();
+            if persisted_runner {
+                group.runner = Some(crate::state::Lease {
+                    group_id: Some(group_id),
+                    workspace_supervisor: Some(group.supervisor.clone()),
+                    lan: false,
+                    id: group_id,
+                    hostname: String::new(),
+                    target: String::new(),
+                    scheme: Scheme::Http,
+                    tls: false,
+                    pid: leader.pid,
+                    pgid: leader.pgid,
+                    process_start_time_ticks: leader.start_time_ticks,
+                    state: LeaseState::Starting,
+                });
+            }
+            assert_eq!(leader.wait().unwrap(), 0);
+            let watcher: u32 = std::fs::read_to_string(root.join("watcher.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(read_process_identity(leader.pid).is_none());
+            assert!(
+                read_process_identity(watcher).is_some_and(|identity| identity.pgid
+                    == if unassociated_member {
+                        watcher as i32
+                    } else {
+                        leader.pgid
+                    }
+                    && identity.state != b'Z')
+            );
+            super::cleanup_workspace_processes(group_id, &group, &[]).unwrap();
+            assert!(
+                read_process_identity(watcher)
+                    .is_none_or(|identity| matches!(identity.state, b'Z' | b'X'))
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_marker_kill_rejects_reused_identity_and_foreign_marker() {
+        let group_id = Uuid::new_v4();
+        let marker = format!(
+            "NOOK_WORKSPACE_SESSION={}",
+            crate::workspace_session::session_path(group_id).display()
+        )
+        .into_bytes();
+        let mut child = super::spawn_managed_child_in(
+            &["/bin/sleep".into(), "30".into()],
+            &[(
+                crate::workspace_session::SESSION_VARIABLE.into(),
+                crate::workspace_session::session_path(group_id).into_os_string(),
+            )],
+            group_id,
+            None,
+            None,
+        )
+        .unwrap();
+        let identity = read_process_identity(child.pid).unwrap();
+        let reused = ProcIdentity {
+            start_time_ticks: identity.start_time_ticks + 1,
+            ..identity
+        };
+        assert!(
+            !super::kill_marked_process(child.pid, reused, std::slice::from_ref(&marker)).unwrap()
+        );
+        assert!(
+            !super::kill_marked_process(
+                child.pid,
+                identity,
+                &[b"NOOK_WORKSPACE_SESSION=foreign".to_vec()]
+            )
+            .unwrap()
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        // Scheduling state is transient; an otherwise valid sleeping/running
+        // identity must still authorize the pinned process.
+        let changed_state = ProcIdentity {
+            state: b'R',
+            ..read_process_identity(child.pid).unwrap()
+        };
+        assert!(super::kill_marked_process(child.pid, changed_state, &[marker]).unwrap());
+        assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
     }
 
     #[test]
@@ -3132,6 +3520,39 @@ mod windows_tests {
         .unwrap();
         assert_eq!(child.wait().unwrap(), 7);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn member_directory_wins_over_root_executables_and_relative_path_entries() {
+        let root = std::env::temp_dir().join(format!("nook member shim {}", Uuid::new_v4()));
+        let member = root.join("apps/api");
+        std::fs::create_dir_all(member.join("bin")).unwrap();
+        std::fs::write(root.join("dev.cmd"), "@exit /b 9\r\n").unwrap();
+        std::fs::write(member.join("dev.cmd"), "@exit /b 7\r\n").unwrap();
+        std::fs::write(member.join("bin/tool.cmd"), "@exit /b 8\r\n").unwrap();
+        let environment = [
+            (OsString::from("PATH"), root.as_os_str().to_owned()),
+            (OsString::from("PATHEXT"), OsString::from(".CMD")),
+        ];
+        for program in ["dev.cmd", "./dev.cmd"] {
+            let mut child = super::spawn_managed_child_in(
+                &[program.into()],
+                &environment,
+                Uuid::new_v4(),
+                Some(&member),
+                None,
+            )
+            .unwrap();
+            assert_eq!(child.wait().unwrap(), 7);
+        }
+        let resolved = super::resolve_windows_program(
+            std::ffi::OsStr::new("tool"),
+            &[(OsString::from("PATH"), OsString::from("bin"))],
+            Some(&member),
+        )
+        .unwrap();
+        assert_eq!(resolved, member.join("bin/tool.CMD"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

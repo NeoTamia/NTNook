@@ -489,6 +489,7 @@ pub(crate) fn merge_run(
         project
             .command
             .map(|values| values.into_iter().map(OsString::from).collect())
+            .or_else(|| arguments.runner.then(Vec::new))
             .ok_or(Error::MissingCommand)?
     } else {
         arguments.command.clone()

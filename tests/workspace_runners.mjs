@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readlink, writeFile, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:net";
 import { get } from "node:http";
 import { tmpdir } from "node:os";
@@ -169,7 +169,7 @@ for (const runner of ["turbo", "lerna"]) {
         await writeFile(path.join(dir, "package.json"), JSON.stringify({
           name: `@fixture/${id}`, version: "1.0.0", private: true,
           scripts: { dev: id === "watcher"
-            ? `node -e "require('node:fs').writeFileSync('watcher-ran','ok')"`
+            ? `node -e "require('node:fs').writeFileSync('watcher-ran',String(process.pid));setInterval(()=>{},1000)"`
             : `node ${JSON.stringify(wrapper)} -- node ${JSON.stringify(path.join(root, "server.mjs"))}` },
         }));
         if (id !== "watcher") {
@@ -182,11 +182,9 @@ name = "runner"
 [[apps]]
 id = "api"
 dir = "apps/api"
-command = ["node", "../../server.mjs"]
 [[apps]]
 id = "web"
 dir = "apps/web"
-command = ["node", "../../server.mjs"]
 [apps.env]
 API_UPSTREAM = "\${api.upstream}"
 `);
@@ -211,13 +209,15 @@ API_UPSTREAM = "\${api.upstream}"
       assert.equal(api.session, null, "application subprocesses must not inherit session claims");
       assert.equal(web.session, null);
       assert.equal((await (await fetch(web.api)).json()).id, "api");
-      assert.equal(await readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"), "ok");
+      const watcherPid = Number(await readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"));
+      assert.ok(watcherPid > 0);
       const registryPath = path.join(root, "state/nook/state.json");
       const registry = JSON.parse(await readFile(registryPath, "utf8"));
       assert.equal(Object.keys(registry.leases).length, 2, "exactly one lease per app");
       await running.stop();
       const final = JSON.parse(await readFile(registryPath, "utf8"));
       assert.equal(Object.keys(final.leases).length, 0, running.log());
+      assert.equal(Object.keys(final.workspace_groups ?? {}).length, 0, running.log());
       const config = JSON.stringify(await adminConfig(`${admin}/config/`));
       assert.ok(!config.includes("api.runner.localhost") && !config.includes("web.runner.localhost"), config);
       for (const info of infos) {
@@ -234,6 +234,7 @@ API_UPSTREAM = "\${api.upstream}"
       await assert.rejects(readFile(path.join(root, "apps/web/started.json")), { code: "ENOENT" });
       await running.stop();
       assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).leases).length, 0);
+      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).workspace_groups ?? {}).length, 0);
 
       // A runner may restart the same package script. Reconcile between starts
       // must keep its route and port owned by the still-live workspace.
@@ -262,8 +263,25 @@ fs.writeFileSync(${JSON.stringify(path.join(root, "restarted.json"))}, JSON.stri
 
       // Abrupt loss of the root is recoverable through the durable registry.
       for (const id of ["api", "web"]) await rm(path.join(root, "apps", id, "started.json"), { force: true });
-      running = launch(nook, ["run", "--runner", "--", "npm", "run", "dev"], { cwd: root, env: environment });
+      // This runner intentionally has no signal forwarding of its own. The
+      // library watcher outlives its leader unless Nook records runner ownership.
+      const crashRunner = path.join(root, "crash-runner.mjs");
+      await writeFile(crashRunner, `
+import { spawn } from 'node:child_process';
+for (const id of ['api','web']) spawn(process.execPath, [${JSON.stringify(wrapper)}, '--', process.execPath, ${JSON.stringify(path.join(root, "server.mjs"))}], {
+  cwd:${JSON.stringify(root)}+'/apps/'+id, env:process.env, stdio:'inherit'
+});
+spawn(process.execPath, ['-e', "require('node:fs').writeFileSync('watcher-ran',String(process.pid));setInterval(()=>{},1000)"], {
+  cwd:${JSON.stringify(path.join(root, "apps/watcher"))}, env:process.env, stdio:'inherit'
+});
+setInterval(()=>{},1000);
+`);
+      running = launch(nook, ["run", "--runner", "--", process.execPath, crashRunner], { cwd: root, env: environment });
       const crashInfos = await waitFor(() => Promise.all(["api", "web"].map(async (id) => JSON.parse(await readFile(path.join(root, "apps", id, "started.json"), "utf8")))), "apps before root crash");
+      const crashWatcherPid = await waitFor(async () => {
+        const pid = Number(await readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"));
+        return pid !== watcherPid && pid;
+      }, "non-HTTP watcher before root crash");
       const beforeCrash = JSON.parse(await readFile(registryPath, "utf8"));
       const groupId = Object.values(beforeCrash.leases)[0].group_id;
       const contextPath = path.join(tmpdir(), `nook-session-${groupId}`, "context.json");
@@ -274,7 +292,7 @@ fs.writeFileSync(${JSON.stringify(path.join(root, "restarted.json"))}, JSON.stri
       assert.equal(prune.status, 0, prune.stdout + prune.stderr);
       assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).leases).length, 0);
       await assert.rejects(readFile(contextPath), { code: "ENOENT" });
-      for (const info of crashInfos) {
+      for (const info of [...crashInfos, { pid: crashWatcherPid }]) {
         await waitFor(async () => {
           try {
             const stat = await readFile(`/proc/${info.pid}/stat`, "utf8");
@@ -290,6 +308,15 @@ fs.writeFileSync(${JSON.stringify(path.join(root, "restarted.json"))}, JSON.stri
       throw error;
     } finally {
       await running?.stop();
+      // Failed crash recovery assertions must not leave the fixture's watcher.
+      try {
+        const pid = Number(await readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"));
+        if (await readlink(`/proc/${pid}/cwd`) === path.join(root, "apps/watcher")) {
+          process.kill(pid, "SIGKILL");
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error;
+      }
       await caddy?.stop();
       await rm(root, { recursive: true, force: true });
     }

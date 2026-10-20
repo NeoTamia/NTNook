@@ -60,6 +60,8 @@ pub(crate) struct Registry {
     pub(crate) aliases: BTreeMap<String, Alias>,
     #[serde(default)]
     pub(crate) leases: BTreeMap<Uuid, Lease>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) workspace_groups: BTreeMap<Uuid, WorkspaceGroup>,
     #[serde(default)]
     pub(crate) tailscale: TailscaleState,
     #[serde(default)]
@@ -117,6 +119,14 @@ pub(crate) struct Lease {
 pub(crate) struct WorkspaceSupervisor {
     pub(crate) pid: u32,
     pub(crate) process_start_time_ticks: u64,
+}
+
+/// Independent of app leases, which are replaced whenever a member restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceGroup {
+    pub(crate) supervisor: WorkspaceSupervisor,
+    pub(crate) runner: Option<Lease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +468,15 @@ mod tests {
         let json = serde_json::to_vec(&registry).unwrap();
         assert!(!String::from_utf8_lossy(&json).contains("argv"));
         assert_eq!(decode(&json).unwrap(), registry);
+    }
+
+    #[test]
+    fn old_v2_registries_default_to_no_workspace_groups_and_keep_the_idle_shape() {
+        let registry =
+            decode(br#"{"format_version":2,"last_synchronized_at_unix_ms":null}"#).unwrap();
+        assert!(registry.workspace_groups.is_empty());
+        let json = serde_json::to_value(&registry).unwrap();
+        assert!(json.get("workspace_groups").is_none());
     }
 
     #[test]
