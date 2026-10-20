@@ -94,6 +94,8 @@ pub(crate) struct Alias {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Lease {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) group_id: Option<Uuid>,
     #[serde(default)]
     pub(crate) lan: bool,
     pub(crate) id: Uuid,
@@ -500,6 +502,7 @@ mod tests {
         assert!(registry.aliases["api.localhost"].preserve_host);
         assert_eq!(registry.aliases["api.localhost"].id, alias_id);
         assert_eq!(registry.leases[&lease_id].pid, 42);
+        assert_eq!(registry.leases[&lease_id].group_id, None);
         assert!(!registry.leases[&lease_id].tls);
         assert_eq!(registry.selected_servers.https.as_deref(), Some("srv0"));
         assert_eq!(registry.last_synchronized_at_unix_ms, Some(9));

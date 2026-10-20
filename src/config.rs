@@ -1,5 +1,6 @@
 //! Global/project configuration and canonical application-name resolution.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -52,6 +53,10 @@ pub(crate) enum Error {
         path: PathBuf,
         version: u32,
     },
+    InvalidWorkspace {
+        path: PathBuf,
+        reason: String,
+    },
     MissingCommand,
     MissingName,
     InvalidName {
@@ -91,6 +96,11 @@ impl fmt::Display for Error {
                 "unsupported format_version {version} in {}; expected {FORMAT_VERSION}",
                 path.display()
             ),
+            Self::InvalidWorkspace { path, reason } => write!(
+                formatter,
+                "invalid workspace configuration {}: {reason}",
+                path.display()
+            ),
             Self::MissingCommand => write!(
                 formatter,
                 "a child command is required after `--` or in nook.toml"
@@ -128,9 +138,9 @@ impl std::error::Error for Error {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProjectConfig {
+pub(crate) struct ProjectConfig {
     format_version: u32,
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     command: Option<Vec<String>>,
     tls: Option<bool>,
     tailscale: Option<bool>,
@@ -141,6 +151,7 @@ struct ProjectConfig {
     readiness_warn_after_seconds: Option<u64>,
     run_bind_address: Option<IpAddr>,
     framework: Option<String>,
+    pub(crate) env: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,7 +210,7 @@ impl Default for GlobalConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct ResolvedRunConfig {
     pub(crate) hostname: String,
@@ -393,7 +404,10 @@ fn load_project(
     Ok((merge_project(base, local), None))
 }
 
-fn load_project_file(path: &Path, required: bool) -> Result<Option<ProjectConfig>, Error> {
+pub(crate) fn load_project_file(
+    path: &Path,
+    required: bool,
+) -> Result<Option<ProjectConfig>, Error> {
     let contents = if required {
         Some(read_required(path)?)
     } else {
@@ -407,7 +421,7 @@ fn load_project_file(path: &Path, required: bool) -> Result<Option<ProjectConfig
     Ok(Some(config))
 }
 
-fn merge_project(
+pub(crate) fn merge_project(
     base: Option<ProjectConfig>,
     local: Option<ProjectConfig>,
 ) -> Option<ProjectConfig> {
@@ -432,10 +446,17 @@ fn merge_project(
             .or(base.readiness_warn_after_seconds),
         run_bind_address: local.run_bind_address.or(base.run_bind_address),
         framework: local.framework.or(base.framework),
+        env: match (base.env, local.env) {
+            (Some(mut base), Some(local)) => {
+                base.extend(local);
+                Some(base)
+            }
+            (base, local) => local.or(base),
+        },
     })
 }
 
-fn merge_run(
+pub(crate) fn merge_run(
     arguments: &RunArgs,
     project: Option<ProjectConfig>,
     git_root: Option<&Path>,
@@ -455,6 +476,7 @@ fn merge_run(
         readiness_warn_after_seconds: None,
         run_bind_address: None,
         framework: None,
+        env: None,
     });
     let lan = arguments.lan || (!arguments.no_lan && project.lan.unwrap_or(false));
     let hostname = resolve_hostname(
@@ -673,14 +695,14 @@ fn global_config_path_with(get: impl Fn(&str) -> Option<OsString>) -> Result<Pat
         .ok_or(Error::MissingHome)
 }
 
-fn read_required(path: &Path) -> Result<String, Error> {
+pub(crate) fn read_required(path: &Path) -> Result<String, Error> {
     fs::read_to_string(path).map_err(|source| Error::Read {
         path: path.to_path_buf(),
         source,
     })
 }
 
-fn read_optional(path: &Path) -> Result<Option<String>, Error> {
+pub(crate) fn read_optional(path: &Path) -> Result<Option<String>, Error> {
     match fs::read_to_string(path) {
         Ok(contents) => Ok(Some(contents)),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -691,7 +713,7 @@ fn read_optional(path: &Path) -> Result<Option<String>, Error> {
     }
 }
 
-fn parse<T: for<'de> Deserialize<'de>>(path: &Path, contents: &str) -> Result<T, Error> {
+pub(crate) fn parse<T: for<'de> Deserialize<'de>>(path: &Path, contents: &str) -> Result<T, Error> {
     toml::from_str(contents).map_err(|source| Error::Parse {
         path: path.to_path_buf(),
         source,
@@ -1231,6 +1253,27 @@ mod tests {
     }
 
     #[test]
+    fn project_environment_overrides_individual_keys_and_v1_rejects_apps() {
+        let base: ProjectConfig =
+            toml::from_str("format_version = 1\n[env]\nKEEP = \"base\"\nOVERRIDE = \"base\"\n")
+                .unwrap();
+        let local: ProjectConfig =
+            toml::from_str("format_version = 1\n[env]\nOVERRIDE = \"local\"\nADDED = \"local\"\n")
+                .unwrap();
+        let merged = super::merge_project(Some(base), Some(local)).unwrap();
+        let environment = merged.env.unwrap();
+        assert_eq!(environment["KEEP"], "base");
+        assert_eq!(environment["OVERRIDE"], "local");
+        assert_eq!(environment["ADDED"], "local");
+        assert!(
+            toml::from_str::<ProjectConfig>(
+                "format_version = 1\n[[apps]]\nid = \"api\"\ndir = \".\"\n",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn command_must_be_a_toml_array() {
         assert!(
             toml::from_str::<ProjectConfig>("format_version = 1\ncommand = \"bun dev\"\n").is_err()
@@ -1374,6 +1417,7 @@ mod tests {
             readiness_warn_after_seconds: Some(20),
             run_bind_address: None,
             framework: None,
+            env: None,
         }
     }
 

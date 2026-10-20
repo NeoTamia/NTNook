@@ -1,0 +1,612 @@
+//! Real-binary workspace tests. Unix hosts need Python 3 and Caddy 2.11.x;
+//! Linux uses an isolated network namespace unless NOOK_E2E_DIRECT is set,
+//! matching nook_caddy_e2e. Windows needs a native child fixture before enabling.
+#![cfg(unix)]
+
+mod support;
+
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use support::caddy::CaddyHarness;
+
+const CHILD: &str = r#"
+import os, pathlib
+pathlib.Path('spawned').write_text(str(os.getpid()))
+import http.client, http.server, json, socket, sys, time
+# Capture Caddy before opening our listener: both sibling routes must exist now.
+admin = http.client.HTTPConnection('localhost', timeout=3)
+admin.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+admin.sock.settimeout(3)
+admin.sock.connect(os.environ['TEST_CADDY_SOCKET'])
+admin.request('GET', '/config/')
+routes = json.load(admin.getresponse())
+admin.close()
+server = http.server.HTTPServer((os.environ['HOST'], int(os.environ['PORT'])), http.server.SimpleHTTPRequestHandler)
+report = dict(pid=os.getpid(), cwd=os.getcwd(), argv=sys.argv[1:], env=dict(os.environ), routes=routes)
+pathlib.Path('started.tmp').write_text(json.dumps(report))
+pathlib.Path('started.tmp').rename('started.json')
+print('child-stdout', flush=True)
+print('child-stderr', file=sys.stderr, flush=True)
+if os.environ.get('FAIL_AFTER_SIBLING'):
+    deadline = time.monotonic() + 5
+    while not pathlib.Path('../api/started.json').exists():
+        assert time.monotonic() < deadline, 'sibling never started'
+        time.sleep(.01)
+    sys.exit(23)
+server.serve_forever()
+"#;
+
+#[test]
+fn workspace_init_writes_a_v2_skeleton_without_overwriting() {
+    let root = std::env::temp_dir().join(format!("nook-workspace-init-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let init = || {
+        Command::new(env!("CARGO_BIN_EXE_nook"))
+            .current_dir(&root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+            .args(["init", "--workspace", "--name", "project"])
+            .output()
+            .unwrap()
+    };
+    let output = init();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let original = fs::read_to_string(root.join("nook.toml")).unwrap();
+    let config: toml::Value = toml::from_str(&original).unwrap();
+    assert_eq!(config["format_version"].as_integer(), Some(2));
+    assert_eq!(config["name"].as_str(), Some("project"));
+    let apps = config["apps"].as_array().unwrap();
+    assert!(!apps.is_empty());
+    for app in apps {
+        assert!(!app["id"].as_str().unwrap().is_empty());
+        assert!(app["dir"].as_str().is_some());
+        assert!(!app["command"].as_array().unwrap().is_empty());
+    }
+    assert!(!init().status.success());
+    assert_eq!(
+        fs::read_to_string(root.join("nook.toml")).unwrap(),
+        original
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn workspace_prepares_siblings_before_spawn_and_cleans_up_on_ctrl_c() {
+    if in_network_namespace("workspace_prepares_siblings_before_spawn_and_cleans_up_on_ctrl_c") {
+        return;
+    }
+    let fixture = Workspace::new();
+    fixture.configure(true, None, "");
+    let mut running = fixture.start(&["run"]);
+    let reports = fixture.wait_ready(&mut running, &["api", "web"]);
+    let ports: Vec<_> = reports
+        .iter()
+        .map(|report| report["env"]["PORT"].as_str().unwrap())
+        .collect();
+    assert_ne!(ports[0], ports[1]);
+    for (index, id) in ["api", "web"].iter().enumerate() {
+        let peer = 1 - index;
+        let report = &reports[index];
+        assert_eq!(
+            report["cwd"],
+            fixture.root.join(format!("apps/{id}")).to_str().unwrap()
+        );
+        assert_eq!(report["argv"], json!(["literal with spaces", "$PORT", ";"]));
+        assert_eq!(report["env"]["APP_ID"], *id);
+        // A forward reference must work even though api is first in the manifest.
+        if *id == "api" {
+            assert_eq!(report["env"]["PEER_PORT"], ports[peer]);
+            assert_eq!(report["env"]["PEER_HOST"], reports[peer]["env"]["HOST"]);
+            assert_eq!(
+                report["env"]["PEER_URL"],
+                format!("http://{}", fixture.host("web"))
+            );
+            assert_eq!(
+                report["env"]["PEER_UPSTREAM"]
+                    .as_str()
+                    .unwrap()
+                    .trim_end_matches('/'),
+                format!("http://127.0.0.1:{}", ports[peer])
+            );
+        }
+        let routes = report["routes"].to_string();
+        for (sibling, port) in ["api", "web"].iter().zip(&ports) {
+            assert!(
+                routes.contains(&fixture.host(sibling)),
+                "{id} spawned before {sibling}'s route existed"
+            );
+            assert!(
+                routes.contains(&format!("127.0.0.1:{port}")),
+                "{id} saw an unprepared upstream"
+            );
+        }
+        assert!(fixture.http(id).contains("child.py"));
+    }
+    let state = fixture.state();
+    let leases: Vec<_> = state["leases"].as_object().unwrap().values().collect();
+    assert_eq!(leases.len(), 2);
+    assert!(
+        leases[0]["group_id"].as_str().is_some(),
+        "workspace leases need a group_id"
+    );
+    assert_eq!(leases[0]["group_id"], leases[1]["group_id"]);
+    assert_ne!(leases[0]["id"], leases[1]["id"]);
+    for lease in leases {
+        assert!(!lease["tls"].as_bool().unwrap());
+        assert!(reports.iter().any(|report| report["pid"] == lease["pid"]));
+    }
+    // Reconciliation must preserve both live members.
+    assert!(fixture.run(&["prune"]).success());
+    assert_eq!(fixture.state()["leases"].as_object().unwrap().len(), 2);
+    running.signal(libc::SIGINT);
+    assert_eq!(running.wait().code(), Some(130), "{}", running.logs());
+    for id in ["api", "web"] {
+        assert!(
+            running.stdout().contains(&format!("[{id}] child-stdout")),
+            "{}",
+            running.logs()
+        );
+        assert!(
+            running.stderr().contains(&format!("[{id}] child-stderr")),
+            "{}",
+            running.logs()
+        );
+    }
+    fixture.assert_clean(&reports);
+}
+
+#[test]
+fn workspace_only_and_standalone_member_keep_their_own_scope() {
+    if in_network_namespace("workspace_only_and_standalone_member_keep_their_own_scope") {
+        return;
+    }
+    let fixture = Workspace::new();
+    fixture.configure(false, None, "");
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let path = fixture.root.join("nook.toml");
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["apps"][0]
+        .as_table_mut()
+        .unwrap()
+        .insert("app_port".into(), toml::Value::Integer(port.into()));
+    fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+    let mut running = fixture.start(&["run", "--only", "api"]);
+    let reports = fixture.wait_ready(&mut running, &["api"]);
+    assert_eq!(reports[0]["env"]["PORT"], port.to_string());
+    assert!(!fixture.root.join("apps/web/spawned").exists());
+    assert_eq!(fixture.state()["leases"].as_object().unwrap().len(), 1);
+    assert!(!fixture.caddy.config_json().contains(&fixture.host("web")));
+    running.signal(libc::SIGINT);
+    running.wait();
+    fixture.assert_clean(&reports);
+
+    fs::remove_file(fixture.report_path("api")).unwrap();
+    let name = fixture.host("api");
+    fs::write(
+        fixture.root.join("apps/api/nook.toml"),
+        format!(
+            "format_version = 1\nname = {name:?}\ntls = false\ncommand = {}\n",
+            fixture.command()
+        ),
+    )
+    .unwrap();
+    let mut command = fixture.nook();
+    command
+        .current_dir(fixture.root.join("apps/api"))
+        .arg("run");
+    let mut standalone = Running::start(command, &fixture.root, "standalone");
+    let reports = fixture.wait_ready(&mut standalone, &["api"]);
+    assert!(!fixture.root.join("apps/web/spawned").exists());
+    assert_eq!(fixture.state()["leases"].as_object().unwrap().len(), 1);
+    standalone.signal(libc::SIGINT);
+    assert_eq!(standalone.wait().code(), Some(130), "{}", standalone.logs());
+    fixture.assert_clean(&reports);
+}
+
+#[test]
+fn workspace_invalid_config_or_selection_never_spawns_a_member() {
+    if in_network_namespace("workspace_invalid_config_or_selection_never_spawns_a_member") {
+        return;
+    }
+    let fixture = Workspace::new();
+    let original = fixture.caddy.config_json();
+    for (web_command, extra, arguments) in [
+        (None, "BAD = '${missing.upstream}'\n", vec!["run"]),
+        (Some("[]"), "", vec!["run"]),
+        (None, "", vec!["run", "--only", "missing"]),
+    ] {
+        fixture.configure(false, web_command, extra);
+        let mut running = fixture.start(&arguments);
+        assert!(!running.wait().success(), "{}", running.logs());
+        for id in ["api", "web"] {
+            assert!(
+                !fixture.root.join(format!("apps/{id}/spawned")).exists(),
+                "{id} spawned before validation finished"
+            );
+        }
+        assert_eq!(
+            fixture.caddy.config_json(),
+            original,
+            "invalid input changed Caddy routes"
+        );
+        fixture.assert_clean(&[]);
+    }
+}
+
+#[test]
+fn workspace_child_exit_and_spawn_failure_roll_back_the_group() {
+    if in_network_namespace("workspace_child_exit_and_spawn_failure_roll_back_the_group") {
+        return;
+    }
+    let fixture = Workspace::new();
+    fixture.configure(false, None, "FAIL_AFTER_SIBLING = '1'\n");
+    let mut running = fixture.start(&["run"]);
+    assert!(!running.wait().success(), "{}", running.logs());
+    let reports = [
+        fixture.report("api").unwrap(),
+        fixture.report("web").unwrap(),
+    ];
+    fixture.assert_clean(&reports);
+    for id in ["api", "web"] {
+        fs::remove_file(fixture.report_path(id)).unwrap();
+        fs::remove_file(fixture.root.join(format!("apps/{id}/spawned"))).unwrap();
+    }
+
+    fixture.configure(false, Some("['/does/not/exist/nook-workspace-child']"), "");
+    let mut failed = fixture.start(&["run"]);
+    assert!(!failed.wait().success(), "{}", failed.logs());
+    let started: Vec<_> = ["api", "web"]
+        .iter()
+        .filter_map(|id| fixture.report(id))
+        .collect();
+    fixture.assert_clean(&started);
+}
+
+#[test]
+fn workspace_supervisor_sigkill_then_prune_leaves_no_children_or_routes() {
+    if in_network_namespace("workspace_supervisor_sigkill_then_prune_leaves_no_children_or_routes")
+    {
+        return;
+    }
+    let fixture = Workspace::new();
+    fixture.configure(true, None, "");
+    let mut running = fixture.start(&["run"]);
+    let reports = fixture.wait_ready(&mut running, &["api", "web"]);
+    running.signal(libc::SIGKILL);
+    assert!(!running.wait().success());
+    assert!(fixture.run(&["prune"]).success());
+    fixture.assert_clean(&reports);
+}
+
+struct Workspace {
+    root: PathBuf,
+    caddy: CaddyHarness,
+}
+
+impl Workspace {
+    fn new() -> Self {
+        let caddy = CaddyHarness::start_on_standard_ports();
+        let root = caddy.root().join("workspace");
+        fs::create_dir_all(root.join("config/nook")).unwrap();
+        for id in ["api", "web"] {
+            fs::create_dir_all(root.join(format!("apps/{id}"))).unwrap();
+            fs::write(root.join(format!("apps/{id}/child.py")), CHILD).unwrap();
+        }
+        fs::write(
+            root.join("config/nook/config.toml"),
+            format!(
+                "format_version = 1\ncaddy_admin = {:?}\n",
+                caddy.admin_url()
+            ),
+        )
+        .unwrap();
+        Self { root, caddy }
+    }
+
+    fn host(&self, id: &str) -> String {
+        format!(
+            "{}.project.localhost",
+            if id == "web" { "frontend" } else { id }
+        )
+    }
+
+    fn command(&self) -> String {
+        json!([
+            "python3",
+            "-u",
+            "child.py",
+            "literal with spaces",
+            "$PORT",
+            ";"
+        ])
+        .to_string()
+    }
+
+    fn configure(&self, references: bool, web_command: Option<&str>, extra: &str) {
+        let mut config = "format_version = 2\nname = 'project'\n".to_string();
+        for (id, peer) in [("api", "web"), ("web", "api")] {
+            config.push_str(&format!(
+                "\n[[apps]]\nid = '{id}'\ndir = 'apps/{id}'\ntls = false\ncommand = {}\n",
+                if id == "web" {
+                    web_command
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| self.command())
+                } else {
+                    self.command()
+                }
+            ));
+            if id == "web" {
+                config.push_str("name = 'frontend.project'\n");
+            }
+            config.push_str(&format!("[apps.env]\nAPP_ID = '{id}'\n"));
+            if references && id == "api" {
+                config.push_str(&format!(
+                    "PEER_URL = '${{{peer}.url}}'\nPEER_HOST = '${{{peer}.host}}'\nPEER_PORT = '${{{peer}.port}}'\nPEER_UPSTREAM = '${{{peer}.upstream}}'\n"
+                ));
+            }
+            if id == "web" {
+                config.push_str(extra);
+            }
+        }
+        fs::write(self.root.join("nook.toml"), config).unwrap();
+    }
+
+    fn nook(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nook"));
+        command
+            .current_dir(&self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+            .env("TEST_CADDY_SOCKET", self.caddy.admin_socket().unwrap());
+        command
+    }
+
+    fn start(&self, arguments: &[&str]) -> Running {
+        let mut command = self.nook();
+        command.args(arguments);
+        Running::start(command, &self.root, "run")
+    }
+
+    fn run(&self, arguments: &[&str]) -> ExitStatus {
+        let mut running = self.start(arguments);
+        let status = running.wait();
+        assert!(status.success(), "{}", running.logs());
+        status
+    }
+
+    fn state(&self) -> Value {
+        let path = self.root.join("state/nook/state.json");
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                json!({"leases": {}, "pending_operations": []})
+            }
+            Err(error) => panic!("cannot read workspace state: {error}"),
+        }
+    }
+
+    fn report_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("apps/{id}/started.json"))
+    }
+
+    fn report(&self, id: &str) -> Option<Value> {
+        fs::read(self.report_path(id))
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn wait_ready(&self, running: &mut Running, ids: &[&str]) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let reports: Vec<_> = ids.iter().filter_map(|id| self.report(id)).collect();
+            let state = self.state();
+            if reports.len() == ids.len()
+                && state["leases"].as_object().unwrap().len() == ids.len()
+                && state["leases"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|lease| lease["state"] == "ready")
+            {
+                return reports;
+            }
+            assert!(
+                running.child.try_wait().unwrap().is_none(),
+                "supervisor exited before readiness: {}",
+                running.logs()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "workspace never became ready: {}",
+                running.logs()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn http(&self, id: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", 80)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            self.host(id)
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        response
+    }
+
+    fn assert_clean(&self, reports: &[Value]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.spawned_pids().into_iter().any(alive) {
+            assert!(Instant::now() < deadline, "workspace left a child alive");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let state = self.state();
+        assert!(state["leases"].as_object().unwrap().is_empty(), "{state}");
+        assert!(
+            state["pending_operations"].as_array().unwrap().is_empty(),
+            "{state}"
+        );
+        let config = self.caddy.config_json();
+        for id in ["api", "web"] {
+            assert!(
+                !config.contains(&self.host(id)),
+                "route for {id} survived cleanup"
+            );
+        }
+        for report in reports {
+            let port: u16 = report["env"]["PORT"].as_str().unwrap().parse().unwrap();
+            assert!(
+                TcpStream::connect(("127.0.0.1", port)).is_err(),
+                "port {port} still has a listener"
+            );
+        }
+    }
+
+    fn spawned_pids(&self) -> Vec<i32> {
+        ["api", "web"]
+            .iter()
+            .filter_map(|id| {
+                fs::read_to_string(self.root.join(format!("apps/{id}/spawned")))
+                    .ok()
+                    .map(|pid| pid.parse().unwrap())
+            })
+            .collect()
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        // Keep failed assertions from leaving fixture children behind.
+        for pid in self.spawned_pids() {
+            if alive(pid) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+struct Running {
+    child: Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl Running {
+    fn start(mut command: Command, root: &std::path::Path, label: &str) -> Self {
+        let label = format!("{label}-{}", uuid::Uuid::new_v4());
+        let stdout = root.join(format!("{label}.stdout"));
+        let stderr = root.join(format!("{label}.stderr"));
+        let child = command
+            .stdout(Stdio::from(File::create(&stdout).unwrap()))
+            .stderr(Stdio::from(File::create(&stderr).unwrap()))
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+    fn stdout(&self) -> String {
+        fs::read_to_string(&self.stdout).unwrap()
+    }
+    fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr).unwrap()
+    }
+    fn logs(&self) -> String {
+        format!("stdout:\n{}\nstderr:\n{}", self.stdout(), self.stderr())
+    }
+    fn signal(&self, signal: i32) {
+        assert_eq!(unsafe { libc::kill(self.child.id() as i32, signal) }, 0);
+    }
+    fn wait(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "supervisor did not exit: {}",
+                self.logs()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn alive(pid: i32) -> bool {
+    // A killed orphan can remain a zombie until the namespace's init reaps it.
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+        && stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('Z'))
+    {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn in_network_namespace(test: &str) -> bool {
+    if std::env::var_os("NOOK_WORKSPACE_NETNS").is_some() {
+        assert!(
+            Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        return false;
+    }
+    if std::env::var_os("NOOK_E2E_DIRECT").is_some() {
+        return false;
+    }
+    let output = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--net"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env("NOOK_WORKSPACE_NETNS", "1")
+        .output()
+        .expect("unshare is required; use NOOK_E2E_DIRECT=1 only on an isolated host");
+    assert!(
+        output.status.success(),
+        "namespace test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}

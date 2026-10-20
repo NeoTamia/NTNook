@@ -1524,6 +1524,7 @@ mod tests {
             preserve_host: false,
         };
         let lease = Lease {
+            group_id: None,
             lan: false,
             id: Uuid::new_v4(),
             hostname: "run.localhost".into(),

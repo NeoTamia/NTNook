@@ -55,7 +55,7 @@ pub(crate) enum ProcessSignal {
     Kill,
 }
 
-struct ForwardedSignals {
+pub(crate) struct ForwardedSignals {
     #[cfg(unix)]
     inner: Signals,
 }
@@ -66,7 +66,7 @@ static WINDOWS_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static WINDOWS_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 impl ForwardedSignals {
-    fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         #[cfg(unix)]
         {
             Signals::new([SIGINT, SIGTERM]).map(|inner| Self { inner })
@@ -84,7 +84,7 @@ impl ForwardedSignals {
         }
     }
 
-    fn pending(&mut self) -> Vec<ProcessSignal> {
+    pub(crate) fn pending(&mut self) -> Vec<ProcessSignal> {
         #[cfg(unix)]
         {
             self.inner
@@ -148,6 +148,7 @@ impl std::error::Error for Error {
 
 pub(crate) struct ManagedChild {
     child: Child,
+    output_threads: Vec<thread::JoinHandle<()>>,
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) start_time_ticks: u64,
@@ -165,7 +166,7 @@ impl ManagedChild {
         self.wait_with_signals(&mut signals, || {})
     }
 
-    fn signal_foreground(&self, signal: ProcessSignal) -> Result<(), Error> {
+    pub(crate) fn signal_foreground(&self, signal: ProcessSignal) -> Result<(), Error> {
         #[cfg(unix)]
         {
             self.signal(signal)
@@ -200,6 +201,32 @@ impl ManagedChild {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    pub(crate) fn join_output(&mut self) {
+        for output in self.output_threads.drain(..) {
+            let _ = output.join();
+        }
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Result<Option<i32>, Error> {
+        self.child
+            .try_wait()
+            .map(|status| {
+                status.map(|status| {
+                    #[cfg(unix)]
+                    {
+                        status
+                            .code()
+                            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+                    }
+                    #[cfg(windows)]
+                    {
+                        status.code().unwrap_or(1)
+                    }
+                })
+            })
+            .map_err(Error::Spawn)
     }
 
     fn has_exited(&mut self) -> Result<bool, Error> {
@@ -297,7 +324,7 @@ pub(crate) trait RunExposure {
     fn withdraw(&mut self, operations: &OperationGuard, store: &Store, owner_id: Uuid);
 }
 
-struct LocalOnly;
+pub(crate) struct LocalOnly;
 
 impl RunExposure for LocalOnly {
     fn expose(
@@ -340,6 +367,58 @@ fn start_run_with_hook(
 ) -> Result<RunningChild, RunError> {
     let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
     let operations = store.lock_operations()?;
+    let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
+    let mut prepared = prepare_run(config, reservation, store, routes, &operations, exposure)?;
+    let mut running =
+        match spawn_prepared_run(config, &mut prepared, None, None, &[], after_release) {
+            Ok(running) => running,
+            Err(error) => {
+                exposure.withdraw(&operations, store, prepared.owner_id);
+                abandon_prepared_run(config, &prepared, store, routes)?;
+                return Err(error);
+            }
+        };
+    running.signals = signals;
+    match commit_prepared_runs(&[(config, &prepared, &running.child)], None, store, routes) {
+        Ok(warnings) => {
+            if !warnings.is_empty() {
+                let warning = running.warning.get_or_insert_with(String::new);
+                if !warning.is_empty() {
+                    warning.push_str("; ");
+                }
+                warning.push_str(&warnings.join("; "));
+            }
+        }
+        Err(error) => {
+            let _ = running.child.signal(ProcessSignal::Kill);
+            let _ = running.child.wait();
+            exposure.withdraw(&operations, store, prepared.owner_id);
+            abandon_prepared_run(config, &prepared, store, routes)?;
+            return Err(error);
+        }
+    }
+    Ok(running)
+}
+
+/// A reserved port and journaled route, with no child launched yet.
+pub(crate) struct PreparedRun {
+    reservation: Option<PortReservation>,
+    pub(crate) owner_id: Uuid,
+    operation_id: Uuid,
+    target: String,
+    displaced: Vec<RouteSpec>,
+    exposed: Vec<(OsString, OsString)>,
+    warnings: Vec<String>,
+}
+
+pub(crate) fn prepare_run(
+    config: &ResolvedRunConfig,
+    reservation: PortReservation,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    operations: &OperationGuard,
+    exposure: &mut impl RunExposure,
+) -> Result<PreparedRun, RunError> {
     let registry = store.load()?;
     if config.lan {
         let hostname = crate::lan::hostname(&config.hostname);
@@ -374,11 +453,13 @@ fn start_run_with_hook(
         .iter()
         .map(|route| (route.owner_id, route.tls))
         .collect();
-    let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
     let port = reservation.port;
     let owner_id = Uuid::new_v4();
     let operation_id = Uuid::new_v4();
-    let target = format!("http://127.0.0.1:{port}");
+    let target = format!(
+        "http://{}",
+        SocketAddr::new(readiness_probe_address(config.bind_address), port)
+    );
     let route = RouteSpec {
         lan: config.lan,
         owner_id,
@@ -406,14 +487,14 @@ fn start_run_with_hook(
         abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
         return Err(error.into());
     }
-    let exposed = match exposure.expose(&operations, store, owner_id, &config.hostname, &target) {
+    let exposed = match exposure.expose(operations, store, owner_id, &config.hostname, &target) {
         Ok(exposed) => exposed,
         Err(error) => {
             abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
             return Err(error);
         }
     };
-    store.mutate(|registry| {
+    let journal = store.mutate(|registry| {
         replace_operation(
             registry,
             operation_id,
@@ -426,8 +507,48 @@ fn start_run_with_hook(
             },
         );
         Ok(())
-    })?;
+    });
+    if let Err(error) = journal {
+        exposure.withdraw(operations, store, owner_id);
+        abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
+        return Err(error.into());
+    }
 
+    let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
+    if !conflicts.is_empty() {
+        warnings.push(format!(
+            "replaced existing Nook route for {}; the previous owner is no longer managed",
+            config.hostname
+        ));
+    }
+    Ok(PreparedRun {
+        reservation: Some(reservation),
+        owner_id,
+        operation_id,
+        target,
+        displaced,
+        exposed,
+        warnings,
+    })
+}
+
+pub(crate) fn spawn_prepared_run(
+    config: &ResolvedRunConfig,
+    prepared: &mut PreparedRun,
+    directory: Option<&std::path::Path>,
+    prefix: Option<&str>,
+    extra_environment: &[(OsString, OsString)],
+    after_release: impl FnOnce(u16),
+) -> Result<RunningChild, RunError> {
+    let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
+    let port = prepared
+        .reservation
+        .as_ref()
+        .expect("prepared run is spawned once")
+        .port;
+    let owner_id = prepared.owner_id;
+    let exposed = prepared.exposed.clone();
+    let mut warnings = prepared.warnings.clone();
     let argv = substitute_port(&config.command, port);
     let framework = config.framework.resolve(&argv);
     let tailscale_hostname = exposed
@@ -474,83 +595,19 @@ fn start_run_with_hook(
             environment.push((variable.into(), value));
         }
     }
-    let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
-    if !conflicts.is_empty() {
-        warnings.push(format!(
-            "replaced existing Nook route for {}; the previous owner is no longer managed",
-            config.hostname
-        ));
-    }
-    reservation.release();
+    prepared
+        .reservation
+        .take()
+        .expect("port is reserved until spawn")
+        .release();
     after_release(port);
-    let environment: Vec<_> = environment.into_iter().chain(exposed).collect();
-    let child = match spawn_managed_child(&argv, &environment, owner_id) {
-        Ok(child) => child,
-        Err(error) => {
-            exposure.withdraw(&operations, store, owner_id);
-            abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
-            return Err(error.into());
-        }
-    };
-    // Keep displaced owners recorded until spawn succeeds, so either startup
-    // failure can restore their routes without losing aliases or live leases.
-    let cleanup_results: Vec<_> = conflicts
+    let environment: Vec<_> = extra_environment
         .iter()
-        .map(|(id, tls)| {
-            (
-                *id,
-                *tls,
-                routes.remove_if_owned(&config.hostname, *id, *tls),
-            )
-        })
+        .cloned()
+        .chain(environment)
+        .chain(exposed)
         .collect();
-    store.mutate(|registry| {
-        let replaced_ids: std::collections::BTreeSet<_> =
-            conflicts.iter().map(|(id, _)| *id).collect();
-        registry
-            .aliases
-            .retain(|_, alias| !replaced_ids.contains(&alias.id));
-        registry.leases.retain(|id, _| !replaced_ids.contains(id));
-        registry.pending_operations.retain(|operation| {
-            pending_owner(&operation.kind).is_none_or(|id| !replaced_ids.contains(&id))
-        });
-        for (owner_id, tls, result) in &cleanup_results {
-            if result.is_err() {
-                registry.pending_operations.push(PendingOperation {
-                    id: Uuid::new_v4(),
-                    kind: PendingOperationKind::RemoveRoute {
-                        hostname: config.hostname.clone(),
-                        owner_id: *owner_id,
-                        tls: *tls,
-                    },
-                });
-            }
-        }
-        registry
-            .pending_operations
-            .retain(|operation| operation.id != operation_id);
-        registry.leases.insert(
-            owner_id,
-            Lease {
-                lan: config.lan,
-                id: owner_id,
-                hostname: config.hostname.clone(),
-                target,
-                scheme: Scheme::Http,
-                tls: config.tls,
-                pid: child.pid,
-                pgid: child.pgid,
-                process_start_time_ticks: child.start_time_ticks,
-                state: LeaseState::Starting,
-            },
-        );
-        Ok(())
-    })?;
-    for (_, _, result) in &cleanup_results {
-        if let Err(error) = result {
-            warnings.push(format!("cleanup of the previous route is pending: {error}"));
-        }
-    }
+    let child = spawn_managed_child_in(&argv, &environment, owner_id, directory, prefix)?;
     let lan = if config.lan {
         match crate::lan::Advertisement::start(&config.hostname, 80, owner_id) {
             Ok(advertisement) => Some(advertisement),
@@ -575,6 +632,87 @@ fn start_run_with_hook(
         signals,
         lan,
     })
+}
+
+/// Persist ownership only once the caller's entire spawn phase succeeded.
+pub(crate) fn commit_prepared_runs(
+    runs: &[(&ResolvedRunConfig, &PreparedRun, &ManagedChild)],
+    group_id: Option<Uuid>,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+) -> Result<Vec<String>, RunError> {
+    let mut cleanup_failures = Vec::new();
+    let mut warnings = Vec::new();
+    for (config, prepared, _) in runs {
+        for displaced in &prepared.displaced {
+            if let Err(error) =
+                routes.remove_if_owned(&config.hostname, displaced.owner_id, displaced.tls)
+            {
+                warnings.push(format!("cleanup of the previous route is pending: {error}"));
+                cleanup_failures.push(PendingOperation {
+                    id: Uuid::new_v4(),
+                    kind: PendingOperationKind::RemoveRoute {
+                        hostname: config.hostname.clone(),
+                        owner_id: displaced.owner_id,
+                        tls: displaced.tls,
+                    },
+                });
+            }
+        }
+    }
+    // One atomic registry mutation preserves displaced owners if any spawn fails.
+    store.mutate(|registry| {
+        for (config, prepared, child) in runs {
+            let replaced_ids: std::collections::BTreeSet<_> = prepared
+                .displaced
+                .iter()
+                .map(|route| route.owner_id)
+                .collect();
+            registry
+                .aliases
+                .retain(|_, alias| !replaced_ids.contains(&alias.id));
+            registry.leases.retain(|id, _| !replaced_ids.contains(id));
+            registry.pending_operations.retain(|operation| {
+                operation.id != prepared.operation_id
+                    && pending_owner(&operation.kind).is_none_or(|id| !replaced_ids.contains(&id))
+            });
+            registry.leases.insert(
+                prepared.owner_id,
+                Lease {
+                    group_id,
+                    lan: config.lan,
+                    id: prepared.owner_id,
+                    hostname: config.hostname.clone(),
+                    target: prepared.target.clone(),
+                    scheme: Scheme::Http,
+                    tls: config.tls,
+                    pid: child.pid,
+                    pgid: child.pgid,
+                    process_start_time_ticks: child.start_time_ticks,
+                    state: LeaseState::Starting,
+                },
+            );
+        }
+        registry.pending_operations.extend(cleanup_failures);
+        Ok(())
+    })?;
+    Ok(warnings)
+}
+
+pub(crate) fn abandon_prepared_run(
+    config: &ResolvedRunConfig,
+    prepared: &PreparedRun,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+) -> Result<(), RunError> {
+    abandon_route(
+        store,
+        routes,
+        config,
+        prepared.owner_id,
+        prepared.operation_id,
+        &prepared.displaced,
+    )
 }
 
 /// Removes the route of a run that will not start and drops its journal entry,
@@ -689,6 +827,18 @@ impl RunningChild {
                 }
             }
         })?;
+        let warnings = self.cleanup(store, routes)?;
+        Ok(RunOutcome {
+            exit_code,
+            warnings,
+        })
+    }
+
+    pub(crate) fn cleanup(
+        &mut self,
+        store: &Store,
+        routes: &mut impl RouteBackend,
+    ) -> Result<Vec<String>, RunError> {
         self.lan.take();
         let _operations = store.lock_operations()?;
         let cleanup = routes.remove_if_owned(&self.hostname, self.lease_id, self.tls);
@@ -711,14 +861,32 @@ impl RunningChild {
             }
             Ok(())
         })?;
-        Ok(RunOutcome {
-            exit_code,
-            warnings,
-        })
+        Ok(warnings)
+    }
+
+    pub(crate) fn poll_readiness(&mut self, store: &Store) -> Result<bool, RunError> {
+        if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
+            self.lan.take();
+        }
+        if TcpStream::connect_timeout(
+            &SocketAddr::new(readiness_probe_address(self.bind_address), self.port),
+            Duration::from_millis(5),
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
+        store.mutate(|registry| {
+            if let Some(lease) = registry.leases.get_mut(&self.lease_id) {
+                lease.state = LeaseState::Ready;
+            }
+            Ok(())
+        })?;
+        Ok(true)
     }
 }
 
-fn readiness_probe_address(bind_address: IpAddr) -> IpAddr {
+pub(crate) fn readiness_probe_address(bind_address: IpAddr) -> IpAddr {
     match bind_address {
         IpAddr::V4(address) if address.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(address) if address.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -853,6 +1021,16 @@ fn spawn_managed_child(
     environment: &[(OsString, OsString)],
     lease_id: Uuid,
 ) -> Result<ManagedChild, Error> {
+    spawn_managed_child_in(argv, environment, lease_id, None, None)
+}
+
+fn spawn_managed_child_in(
+    argv: &[OsString],
+    environment: &[(OsString, OsString)],
+    lease_id: Uuid,
+    directory: Option<&std::path::Path>,
+    prefix: Option<&str>,
+) -> Result<ManagedChild, Error> {
     #[cfg(unix)]
     let _ = lease_id;
     let (program, arguments) = argv.split_first().ok_or(Error::EmptyCommand)?;
@@ -881,10 +1059,20 @@ fn spawn_managed_child(
         use std::os::windows::process::CommandExt;
         command.raw_arg(raw_argument);
     }
-    command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    if prefix.is_some() {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    } else {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
     configure_child(&mut command);
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
@@ -907,13 +1095,54 @@ fn spawn_managed_child(
         let _ = child.wait();
         return Err(Error::Spawn(error));
     }
+    let mut output_threads = Vec::new();
+    if let Some(prefix) = prefix {
+        if let Some(stdout) = child.stdout.take() {
+            output_threads.push(prefix_output(stdout, prefix.to_owned(), false));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            output_threads.push(prefix_output(stderr, prefix.to_owned(), true));
+        }
+    }
     Ok(ManagedChild {
         child,
+        output_threads,
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
         #[cfg(windows)]
         job,
+    })
+}
+
+fn prefix_output(
+    reader: impl io::Read + Send + 'static,
+    prefix: String,
+    stderr: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        use io::{BufRead, Read, Write};
+        // Bound memory even when a child writes an unbroken stream.
+        let mut reader = io::BufReader::new(reader);
+        loop {
+            let mut line = Vec::new();
+            match reader.by_ref().take(8192).read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let mut output: Box<dyn Write> = if stderr {
+                        Box::new(io::stderr().lock())
+                    } else {
+                        Box::new(io::stdout().lock())
+                    };
+                    let _ = write!(output, "[{prefix}] ");
+                    let _ = output.write_all(&line);
+                    if !line.ends_with(b"\n") {
+                        let _ = output.write_all(b"\n");
+                    }
+                    let _ = output.flush();
+                }
+            }
+        }
     })
 }
 
@@ -1509,6 +1738,33 @@ fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     }
     output.extend_from_slice(rest);
     output
+}
+
+pub(crate) fn substitute_values(
+    argument: &std::ffi::OsStr,
+    values: &std::collections::BTreeMap<String, String>,
+) -> OsString {
+    #[cfg(unix)]
+    {
+        let mut output = argument.as_bytes().to_vec();
+        for (key, value) in values {
+            output = replace_bytes(&output, format!("${{{key}}}").as_bytes(), value.as_bytes());
+        }
+        OsString::from_vec(output)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut output: Vec<_> = argument.encode_wide().collect();
+        for (key, value) in values {
+            output = replace_wide(
+                &output,
+                &format!("${{{key}}}").encode_utf16().collect::<Vec<_>>(),
+                &value.encode_utf16().collect::<Vec<_>>(),
+            );
+        }
+        OsString::from_wide(&output)
+    }
 }
 
 pub(crate) fn child_environment(
@@ -2625,6 +2881,7 @@ mod windows_tests {
         let pid = std::process::id();
         let identity = read_process_identity(pid).unwrap();
         let mut lease = Lease {
+            group_id: None,
             lan: false,
             id: Uuid::new_v4(),
             hostname: "test.localhost".into(),

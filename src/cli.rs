@@ -64,6 +64,9 @@ pub(crate) enum CompletionKind {
 
 #[derive(Debug, Args)]
 pub(crate) struct InitArgs {
+    /// Create a multi-app workspace configuration.
+    #[arg(long, conflicts_with = "local")]
+    pub(crate) workspace: bool,
     /// Create nook.local.toml instead of nook.toml.
     #[arg(long)]
     pub(crate) local: bool,
@@ -196,6 +199,9 @@ pub(crate) struct CaExportArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
+    /// Run only this application from a workspace configuration.
+    #[arg(long, value_name = "ID")]
+    pub(crate) only: Option<String>,
     /// Route name when using `nook run`.
     #[arg(long)]
     pub(crate) name: Option<String>,
@@ -324,9 +330,9 @@ pub(crate) fn run() -> crate::Result<i32> {
         return completion_query(&arguments);
     }
     let cli = parse_from(arguments)?;
-    let stdout = io::stdout();
-    let stderr = io::stderr();
-    execute(cli, &mut stdout.lock(), &mut stderr.lock())
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    execute(cli, &mut stdout, &mut stderr)
 }
 
 fn completion_query(arguments: &[OsString]) -> crate::Result<i32> {
@@ -439,6 +445,9 @@ fn init_command(
 }
 
 fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Result<String> {
+    if arguments.workspace {
+        return workspace_config_template(arguments, directory);
+    }
     let mut contents = String::from("format_version = 1\n\n");
     let name = match arguments.name.as_deref() {
         Some(name) => crate::config::project_name(name)?,
@@ -537,6 +546,67 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
         Some(framework) => contents.push_str(&format!("framework = {}\n", toml_string(framework))),
         None => contents.push_str("# framework = \"vite\"\n"),
     }
+    Ok(contents)
+}
+
+fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::Result<String> {
+    let name = match arguments.name.as_deref() {
+        Some(name) => crate::config::project_name(name)?,
+        None => crate::config::infer_project_name(directory)?,
+    };
+    let command = if arguments.command.is_empty() {
+        vec![
+            OsString::from("pnpm"),
+            OsString::from("run"),
+            OsString::from("dev"),
+        ]
+    } else {
+        arguments.command.clone()
+    };
+    let command = command
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .map(|value| toml::Value::String(value.to_owned()))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "project commands must contain valid UTF-8",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut contents = format!(
+        "format_version = 2\nname = {}\n\n# Add one [[apps]] entry per application. Paths are relative to this file.\n[[apps]]\nid = \"web\"\ndir = \".\"\ncommand = {}\n",
+        toml_string(&name),
+        toml::Value::Array(command)
+    );
+    if arguments.no_tls {
+        contents.push_str("tls = false\n");
+    }
+    if arguments.lan || arguments.no_lan {
+        contents.push_str(&format!("lan = {}\n", arguments.lan));
+    }
+    if let Some(port) = arguments.app_port {
+        contents.push_str(&format!("app_port = {port}\n"));
+    }
+    if arguments.strict_port {
+        contents.push_str("strict_port = true\n");
+    }
+    if let Some(seconds) = arguments.readiness_warn_after {
+        contents.push_str(&format!("readiness_warn_after_seconds = {seconds}\n"));
+    }
+    if let Some(address) = arguments.run_bind_address {
+        contents.push_str(&format!(
+            "run_bind_address = {}\n",
+            toml_string(&address.to_string())
+        ));
+    }
+    if let Some(framework) = &arguments.framework {
+        contents.push_str(&format!("framework = {}\n", toml_string(framework)));
+    }
+    contents.push_str("\n# Example: env = { API_URL = \"${api.url}\" }\n");
     Ok(contents)
 }
 
@@ -1268,11 +1338,21 @@ fn run_command(
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
-    let config = crate::config::resolve_run(
-        &arguments,
-        &std::env::current_dir()?,
-        global.run_bind_address,
-    )?;
+    let current_directory = std::env::current_dir()?;
+    if let Some(workspace) =
+        crate::workspace_config::load(&arguments, &current_directory, global.run_bind_address)?
+    {
+        return run_workspace_command(workspace, arguments.only.as_deref(), global, errors);
+    }
+    if arguments.only.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--only requires a format_version = 2 workspace configuration",
+        )
+        .into());
+    }
+    let config =
+        crate::config::resolve_run(&arguments, &current_directory, global.run_bind_address)?;
     if let Some(path) = &config.ignored_local_config {
         writeln!(
             errors,
@@ -1365,6 +1445,65 @@ fn run_command(
             for warning in converge_tailscale_now(&store) {
                 writeln!(errors, "warning: {warning}")?;
             }
+        }
+        Ok(outcome.exit_code)
+    })
+}
+
+fn run_workspace_command(
+    workspace: crate::workspace_config::ResolvedWorkspaceConfig,
+    only: Option<&str>,
+    global: &crate::config::GlobalConfig,
+    errors: &mut impl Write,
+) -> crate::Result<i32> {
+    let prepared = crate::workspace::prepare(workspace, only)?;
+    let https = prepared.apps.iter().any(|app| app.app.config.tls);
+    let http = prepared
+        .apps
+        .iter()
+        .any(|app| !app.app.config.tls || app.app.config.lan);
+    let lan = prepared.apps.iter().any(|app| app.app.config.lan);
+    let store = state_store()?;
+    writeln!(
+        errors,
+        "nook: workspace={} group_id={}",
+        prepared.root.display(),
+        prepared.group_id
+    )?;
+    with_caddy_routes(global, https, http, |routes| {
+        if lan {
+            routes.require_lan_listener()?;
+        }
+        for app in &prepared.apps {
+            let config = &app.app.config;
+            writeln!(
+                errors,
+                "nook: app={} domain={} url={}://{} port={}",
+                app.app.id,
+                config.hostname,
+                if config.tls { "https" } else { "http" },
+                config.hostname,
+                app.port
+            )?;
+            if let Some(path) = &config.ignored_local_config {
+                writeln!(
+                    errors,
+                    "warning: ignoring local configuration {}; add --local to apply it",
+                    path.display()
+                )?;
+            }
+        }
+        let mut running = prepared.start(&store, routes)?;
+        for (id, app) in &running.apps {
+            if let Some(warning) = &app.warning {
+                let _ = writeln!(errors, "warning: [{id}] {warning}");
+            }
+        }
+        let outcome = running.finish(&store, routes, |warning| {
+            let _ = writeln!(errors, "warning: {warning}");
+        })?;
+        for warning in outcome.warnings {
+            writeln!(errors, "warning: {warning}")?;
         }
         Ok(outcome.exit_code)
     })
@@ -2456,6 +2595,7 @@ mod tests {
             registry.leases.insert(
                 id,
                 Lease {
+                    group_id: None,
                     lan: false,
                     id,
                     hostname: hostname.into(),

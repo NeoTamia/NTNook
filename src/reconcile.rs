@@ -932,6 +932,7 @@ mod tests {
 
     fn lease(hostname: &str) -> Lease {
         Lease {
+            group_id: None,
             lan: false,
             id: Uuid::new_v4(),
             hostname: hostname.into(),
