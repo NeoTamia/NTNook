@@ -1,14 +1,15 @@
 //! Recovery of partial operations, dead leases, and missing managed routes.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use uuid::Uuid;
 
-use crate::process::Liveness;
+use crate::process::{Liveness, kill_owned_lease, workspace_supervisor_liveness};
 use crate::state::{
-    Alias, Lease, OperationGuard, PendingOperation, PendingOperationKind, Registry, Scheme, Store,
+    Alias, Lease, LeaseState, OperationGuard, PendingOperation, PendingOperationKind, Registry,
+    Scheme, Store,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,9 +324,91 @@ fn pending_owner(kind: &PendingOperationKind) -> Option<Uuid> {
 pub(crate) fn reconcile(
     registry: &mut Registry,
     routes: &mut impl RouteBackend,
+    liveness: impl FnMut(&Lease) -> Liveness,
+) -> Report {
+    reconcile_with_supervisors(registry, routes, liveness, workspace_supervisor_liveness)
+}
+
+fn reconcile_with_supervisors(
+    registry: &mut Registry,
+    routes: &mut impl RouteBackend,
     mut liveness: impl FnMut(&Lease) -> Liveness,
+    mut supervisor_liveness: impl FnMut(&crate::state::WorkspaceSupervisor) -> Liveness,
 ) -> Report {
     let mut report = Report::default();
+    // Resolve workspace ownership before replaying any route restorations.
+    let mut live: BTreeMap<_, _> = registry
+        .leases
+        .values_mut()
+        .map(|lease| {
+            let member = liveness(lease);
+            let live = match lease.workspace_supervisor.as_ref() {
+                None => member,
+                Some(supervisor) => match supervisor_liveness(supervisor) {
+                    Liveness::Alive => {
+                        if member == Liveness::Dead {
+                            // The runner may restart this app using the same route/port.
+                            lease.state = LeaseState::Starting;
+                            Liveness::Alive
+                        } else {
+                            member
+                        }
+                    }
+                    Liveness::Dead => match kill_owned_lease(lease) {
+                        Ok(()) => Liveness::Dead,
+                        Err(error) => {
+                            report.warnings.push(format!(
+                                "workspace cleanup for {} is pending: {error}",
+                                lease.hostname
+                            ));
+                            Liveness::Indeterminate
+                        }
+                    },
+                    Liveness::Indeterminate => {
+                        report.warnings.push(format!(
+                            "workspace supervisor identity for {} is temporarily indeterminate",
+                            lease.hostname
+                        ));
+                        Liveness::Indeterminate
+                    }
+                },
+            };
+            (lease.id, live)
+        })
+        .collect();
+    let dead_groups: BTreeMap<_, _> = registry
+        .leases
+        .values()
+        .filter_map(|lease| {
+            (live[&lease.id] == Liveness::Dead).then_some((
+                lease.group_id?,
+                lease.workspace_supervisor.as_ref()?.clone(),
+            ))
+        })
+        .collect();
+    for (group_id, supervisor) in dead_groups {
+        if registry
+            .leases
+            .values()
+            .any(|lease| lease.group_id == Some(group_id) && live[&lease.id] != Liveness::Dead)
+        {
+            continue;
+        }
+        if let Err(error) = crate::workspace_session::cleanup_stale(group_id, &supervisor) {
+            report
+                .warnings
+                .push(format!("workspace session cleanup is pending: {error}"));
+            // Keep a durable reference so a later prune can retry this context.
+            for lease in registry
+                .leases
+                .values()
+                .filter(|lease| lease.group_id == Some(group_id))
+            {
+                live.insert(lease.id, Liveness::Indeterminate);
+            }
+        }
+    }
+    let mut liveness = |lease: &Lease| live[&lease.id];
     retry_pending(registry, routes, &mut liveness, &mut report);
 
     let leases: Vec<_> = registry.leases.values().cloned().collect();
@@ -380,8 +463,23 @@ fn retry_pending(
         let result = match &operation.kind {
             PendingOperationKind::RestoreRoute {
                 hostname, owner_id, ..
-            } => current_route(registry, hostname, *owner_id)
-                .map_or(Ok(()), |route| routes.ensure(&route)),
+            } => {
+                if let Some(lease) = registry.leases.get(owner_id) {
+                    match liveness(lease) {
+                        Liveness::Dead => {
+                            report.completed_operations += 1;
+                            continue;
+                        }
+                        Liveness::Indeterminate => {
+                            registry.pending_operations.push(operation);
+                            continue;
+                        }
+                        Liveness::Alive => {}
+                    }
+                }
+                current_route(registry, hostname, *owner_id)
+                    .map_or(Ok(()), |route| routes.ensure(&route))
+            }
             PendingOperationKind::InstallRoute {
                 hostname,
                 owner_id,
@@ -742,6 +840,241 @@ mod tests {
         assert!(routes.owners.is_empty());
     }
 
+    #[cfg(unix)]
+    fn live_workspace_lease() -> (Lease, crate::process::ManagedChild) {
+        let child = crate::process::spawn_child(&["/bin/sleep".into(), "10".into()], &[]).unwrap();
+        let identity = crate::process::read_process_identity(std::process::id()).unwrap();
+        let mut lease = lease("workspace.localhost");
+        lease.pid = child.pid;
+        lease.pgid = child.pgid;
+        lease.process_start_time_ticks = child.start_time_ticks;
+        lease.workspace_supervisor = Some(crate::state::WorkspaceSupervisor {
+            pid: std::process::id(),
+            process_start_time_ticks: identity.start_time_ticks,
+        });
+        (lease, child)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_supervisor_preserves_exited_members_for_restart() {
+        let (lease, mut child) = live_workspace_lease();
+        crate::process::kill_owned_lease(&lease).unwrap();
+        child.wait().unwrap();
+        assert_eq!(crate::process::lease_liveness(&lease), Liveness::Dead);
+        let mut registry = Registry::empty();
+        registry.leases.insert(lease.id, lease.clone());
+        let mut routes = Routes::default();
+        let report = reconcile(&mut registry, &mut routes, crate::process::lease_liveness);
+        assert!(report.warnings.is_empty());
+        assert_eq!(registry.leases[&lease.id].state, LeaseState::Starting);
+        assert_eq!(routes.owners[&lease.hostname], lease.id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reused_supervisor_kills_live_member_and_prunes_without_touching_foreign_routes() {
+        for foreign in [false, true] {
+            let (mut lease, mut child) = live_workspace_lease();
+            lease
+                .workspace_supervisor
+                .as_mut()
+                .unwrap()
+                .process_start_time_ticks += 1;
+            // Supervisor death must not change the member's pure identity check.
+            assert_eq!(crate::process::lease_liveness(&lease), Liveness::Alive);
+            let mut registry = Registry::empty();
+            registry.leases.insert(lease.id, lease.clone());
+            registry.pending_operations.push(PendingOperation {
+                id: Uuid::new_v4(),
+                kind: PendingOperationKind::RestoreRoute {
+                    hostname: lease.hostname.clone(),
+                    target: lease.target.clone(),
+                    scheme: lease.scheme,
+                    owner_id: lease.id,
+                    tls: lease.tls,
+                },
+            });
+            let owner = if foreign { Uuid::new_v4() } else { lease.id };
+            let mut routes = Routes {
+                owners: BTreeMap::from([(lease.hostname.clone(), owner)]),
+                unavailable: false,
+            };
+            let report = reconcile(&mut registry, &mut routes, crate::process::lease_liveness);
+            assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
+            assert_eq!(
+                report.restored, 0,
+                "orphan recovery must not replay restoration"
+            );
+            assert_eq!(report.removed_dead_leases, 1);
+            assert!(registry.leases.is_empty());
+            assert!(registry.pending_operations.is_empty());
+            assert_eq!(
+                routes.owners.get(&lease.hostname).copied(),
+                foreign.then_some(owner)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zombie_supervisor_is_dead_even_before_it_is_reaped() {
+        let (mut lease, mut child) = live_workspace_lease();
+        let mut supervisor =
+            crate::process::spawn_child(&["/bin/sleep".into(), "10".into()], &[]).unwrap();
+        let owner = crate::state::WorkspaceSupervisor {
+            pid: supervisor.pid,
+            process_start_time_ticks: supervisor.start_time_ticks,
+        };
+        supervisor
+            .signal(crate::process::ProcessSignal::Kill)
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::process::workspace_supervisor_liveness(&owner) != Liveness::Dead {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        lease.workspace_supervisor = Some(owner);
+        let mut registry = Registry::empty();
+        registry.leases.insert(lease.id, lease);
+        let report = reconcile(
+            &mut registry,
+            &mut Routes::default(),
+            crate::process::lease_liveness,
+        );
+        supervisor.wait().unwrap();
+        assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
+        assert_eq!(report.removed_dead_leases, 1);
+        assert!(registry.leases.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn orphan_with_reused_member_identity_does_not_signal_the_current_process() {
+        let (mut lease, mut child) = live_workspace_lease();
+        lease
+            .workspace_supervisor
+            .as_mut()
+            .unwrap()
+            .process_start_time_ticks += 1;
+        lease.process_start_time_ticks += 1;
+        let mut registry = Registry::empty();
+        registry.leases.insert(lease.id, lease);
+        let report = reconcile(
+            &mut registry,
+            &mut Routes::default(),
+            crate::process::lease_liveness,
+        );
+        let still_running = child.try_wait().unwrap().is_none();
+        child.signal(crate::process::ProcessSignal::Kill).unwrap();
+        child.wait().unwrap();
+        assert!(
+            still_running,
+            "a reused PID must never receive a cleanup signal"
+        );
+        assert_eq!(report.removed_dead_leases, 1);
+        assert!(registry.leases.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_supervisor_preserves_live_member_and_pending_restore() {
+        let (lease, mut child) = live_workspace_lease();
+        let mut registry = Registry::empty();
+        registry.leases.insert(lease.id, lease.clone());
+        registry.pending_operations.push(PendingOperation {
+            id: Uuid::new_v4(),
+            kind: PendingOperationKind::RestoreRoute {
+                hostname: lease.hostname.clone(),
+                target: lease.target.clone(),
+                scheme: lease.scheme,
+                owner_id: lease.id,
+                tls: lease.tls,
+            },
+        });
+        let mut routes = Routes::default();
+        let report = super::reconcile_with_supervisors(
+            &mut registry,
+            &mut routes,
+            crate::process::lease_liveness,
+            |_| Liveness::Indeterminate,
+        );
+        let still_running = child.try_wait().unwrap().is_none();
+        child.signal(crate::process::ProcessSignal::Kill).unwrap();
+        child.wait().unwrap();
+        assert!(still_running);
+        assert!(registry.leases.contains_key(&lease.id));
+        assert!(routes.owners.is_empty());
+        assert_eq!(registry.pending_operations.len(), 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("supervisor identity"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_cleanup_waits_for_verified_group_and_preserves_failed_cleanup_for_retry() {
+        let (mut lease, mut child) = live_workspace_lease();
+        let (store, state_path) = temporary_store();
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let group_id = Uuid::new_v4();
+        let session = crate::workspace_session::SessionOwner::create(
+            state_path.parent().unwrap().to_owned(),
+            group_id,
+            store.path().to_owned(),
+            Vec::new(),
+        )
+        .unwrap();
+        lease.group_id = Some(group_id);
+        lease
+            .workspace_supervisor
+            .as_mut()
+            .unwrap()
+            .process_start_time_ticks += 1;
+        let mut registry = Registry::empty();
+        registry.leases.insert(lease.id, lease.clone());
+        let mut routes = Routes::default();
+        super::reconcile_with_supervisors(
+            &mut registry,
+            &mut routes,
+            crate::process::lease_liveness,
+            |_| Liveness::Indeterminate,
+        );
+        assert!(session.path().exists());
+        assert!(child.try_wait().unwrap().is_none());
+
+        // A context belonging to another identity must survive and remain
+        // durably referenced, even after the app group has been killed.
+        let report = reconcile(&mut registry, &mut routes, crate::process::lease_liveness);
+        assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
+        assert!(session.path().exists());
+        assert!(registry.leases.contains_key(&lease.id));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("session cleanup"))
+        );
+        let mut context: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(session.path()).unwrap()).unwrap();
+        context["supervisor"]["process_start_time_ticks"] = serde_json::json!(
+            lease
+                .workspace_supervisor
+                .as_ref()
+                .unwrap()
+                .process_start_time_ticks
+        );
+        std::fs::write(session.path(), serde_json::to_vec(&context).unwrap()).unwrap();
+        let report = reconcile(&mut registry, &mut routes, crate::process::lease_liveness);
+        assert_eq!(report.removed_dead_leases, 1);
+        assert!(!session.path().exists());
+        assert!(registry.leases.is_empty());
+        std::fs::remove_dir_all(state_path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn backend_failure_is_atomically_persisted_for_the_next_process() {
         let directory = std::env::temp_dir().join(format!("nook-reconcile-{}", Uuid::new_v4()));
@@ -933,6 +1266,7 @@ mod tests {
     fn lease(hostname: &str) -> Lease {
         Lease {
             group_id: None,
+            workspace_supervisor: None,
             lan: false,
             id: Uuid::new_v4(),
             hostname: hostname.into(),

@@ -28,7 +28,7 @@ use signal_hook::iterator::Signals;
 
 use crate::config::ResolvedRunConfig;
 use crate::reconcile::{RouteBackend, RouteError, RouteSpec, route_for_alias, route_for_lease};
-use crate::state::Lease;
+use crate::state::{Lease, WorkspaceSupervisor};
 use crate::state::{
     LeaseState, OperationGuard, PendingOperation, PendingOperationKind, Scheme, Store,
 };
@@ -42,10 +42,10 @@ pub(crate) enum Liveness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcIdentity {
-    state: u8,
-    pgid: i32,
-    start_time_ticks: u64,
+pub(crate) struct ProcIdentity {
+    pub(crate) state: u8,
+    pub(crate) pgid: i32,
+    pub(crate) start_time_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,8 +407,14 @@ pub(crate) struct PreparedRun {
     operation_id: Uuid,
     target: String,
     displaced: Vec<RouteSpec>,
-    exposed: Vec<(OsString, OsString)>,
-    warnings: Vec<String>,
+    pub(crate) exposed: Vec<(OsString, OsString)>,
+    pub(crate) warnings: Vec<String>,
+}
+
+impl PreparedRun {
+    pub(crate) fn release_port(&mut self) {
+        self.reservation.take();
+    }
 }
 
 pub(crate) fn prepare_run(
@@ -680,6 +686,7 @@ pub(crate) fn commit_prepared_runs(
                 prepared.owner_id,
                 Lease {
                     group_id,
+                    workspace_supervisor: None,
                     lan: config.lan,
                     id: prepared.owner_id,
                     hostname: config.hostname.clone(),
@@ -1024,7 +1031,7 @@ fn spawn_managed_child(
     spawn_managed_child_in(argv, environment, lease_id, None, None)
 }
 
-fn spawn_managed_child_in(
+pub(crate) fn spawn_managed_child_in(
     argv: &[OsString],
     environment: &[(OsString, OsString)],
     lease_id: Uuid,
@@ -1048,6 +1055,7 @@ fn spawn_managed_child_in(
     // an exposed child gets its own value back from `environment`.
     command
         .env_remove(crate::tailscale::URL_VARIABLE)
+        .env_remove("NOOK_WORKSPACE_SESSION")
         .args(arguments)
         .envs(environment.iter().cloned());
     #[cfg(windows)]
@@ -1406,7 +1414,7 @@ fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
+pub(crate) fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
     fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| parse_stat(&stat))
@@ -1574,7 +1582,7 @@ fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
+pub(crate) fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
     use std::mem::zeroed;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
@@ -1803,22 +1811,42 @@ pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     }
 }
 
+/// The workspace runner may share its caller's process group. Its ownership
+/// depends only on PID/start time, and never authorizes signaling that group.
+#[cfg(unix)]
+pub(crate) fn workspace_supervisor_liveness(supervisor: &WorkspaceSupervisor) -> Liveness {
+    match fs::read_to_string(format!("/proc/{}/stat", supervisor.pid)) {
+        Ok(stat) => match parse_stat(&stat) {
+            Some(identity) => {
+                identity_liveness(identity, identity.pgid, supervisor.process_start_time_ticks)
+            }
+            None => Liveness::Indeterminate,
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Liveness::Dead,
+        Err(_) => Liveness::Indeterminate,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
+    process_liveness(lease.pid, lease.process_start_time_ticks)
+}
+
+#[cfg(windows)]
+pub(crate) fn workspace_supervisor_liveness(supervisor: &WorkspaceSupervisor) -> Liveness {
+    process_liveness(supervisor.pid, supervisor.process_start_time_ticks)
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
+fn process_liveness(pid: u32, start_time_ticks: u64) -> Liveness {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
 
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-            0,
-            lease.pid,
-        )
-    };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
     if process.is_null() {
         return match io::Error::last_os_error().raw_os_error() {
             Some(87) | Some(1168) => Liveness::Dead,
@@ -1830,13 +1858,113 @@ pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     if wait != WAIT_TIMEOUT {
         return Liveness::Dead;
     }
-    match read_process_identity(lease.pid) {
-        Some(identity) if identity.start_time_ticks == lease.process_start_time_ticks => {
-            Liveness::Alive
-        }
+    match read_process_identity(pid) {
+        Some(identity) if identity.start_time_ticks == start_time_ticks => Liveness::Alive,
         Some(_) => Liveness::Dead,
         None => Liveness::Indeterminate,
     }
+}
+
+/// Kill only a currently verified managed application group/job. A matching
+/// Unix zombie still proves group ownership; missing/reused PIDs do not.
+pub(crate) fn kill_owned_lease(lease: &Lease) -> Result<(), Error> {
+    match lease_liveness(lease) {
+        Liveness::Dead => {
+            #[cfg(unix)]
+            if !read_process_identity(lease.pid).is_some_and(|identity| {
+                matches!(identity.state, b'Z' | b'X')
+                    && identity.pgid == lease.pgid
+                    && identity.start_time_ticks == lease.process_start_time_ticks
+            }) {
+                return Ok(());
+            }
+            #[cfg(windows)]
+            return Ok(());
+        }
+        Liveness::Indeterminate => return Err(Error::ProcessIdentity(lease.pid)),
+        Liveness::Alive => {}
+    }
+    if lease.pid == std::process::id()
+        || lease
+            .workspace_supervisor
+            .as_ref()
+            .is_some_and(|supervisor| supervisor.pid == lease.pid)
+    {
+        return Err(Error::Spawn(io::Error::other(
+            "refusing to kill the workspace supervisor or caller",
+        )));
+    }
+    #[cfg(unix)]
+    {
+        // Managed children lead their own group. Never signal the caller's or
+        // workspace supervisor's group, even if a malformed lease names it.
+        if lease.pgid <= 1
+            || i32::try_from(lease.pid) != Ok(lease.pgid)
+            || read_process_identity(std::process::id())
+                .is_none_or(|identity| identity.pgid == lease.pgid)
+            || lease
+                .workspace_supervisor
+                .as_ref()
+                .is_some_and(|supervisor| {
+                    read_process_identity(supervisor.pid).is_some_and(|identity| {
+                        identity.start_time_ticks == supervisor.process_start_time_ticks
+                            && identity.pgid == lease.pgid
+                    })
+                })
+        {
+            return Err(Error::Spawn(io::Error::other(
+                "refusing to kill a lease outside its own application process group",
+            )));
+        }
+    }
+    #[cfg(unix)]
+    {
+        signal_lease(lease, ProcessSignal::Kill).map_err(Error::Spawn)
+    }
+    #[cfg(windows)]
+    {
+        kill_owned_job(lease).map_err(Error::Spawn)
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn kill_owned_job(lease: &Lease) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, OpenJobObjectW, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, lease.pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let name = job_name(lease.id);
+    let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
+    if job.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { CloseHandle(process) };
+        return Err(error);
+    }
+    let mut belongs = 0;
+    let result = if unsafe { IsProcessInJob(process, job, &mut belongs) } == 0 {
+        Err(io::Error::last_os_error())
+    } else if belongs == 0 || lease_liveness(lease) != Liveness::Alive {
+        Err(io::Error::other(
+            "cannot verify application ownership of the named job",
+        ))
+    } else if unsafe { TerminateJobObject(job, 1) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    unsafe {
+        CloseHandle(job);
+        CloseHandle(process);
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -2180,7 +2308,8 @@ mod tests {
             &std::fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap(),
         )
         .unwrap();
-        assert_eq!(first, second);
+        assert_eq!(first.pgid, second.pgid);
+        assert_eq!(first.start_time_ticks, second.start_time_ticks);
         assert!(first.start_time_ticks > 0);
     }
 
@@ -2333,6 +2462,130 @@ mod tests {
             spawn_child(&[OsString::from("/bin/sleep"), OsString::from("10")], &[]).unwrap();
         child.signal(ProcessSignal::Terminate).unwrap();
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGTERM);
+    }
+
+    #[test]
+    fn owned_cleanup_refuses_the_callers_or_supervisors_group() {
+        let identity = read_process_identity(std::process::id()).unwrap();
+        let mut lease = crate::state::Lease {
+            group_id: None,
+            workspace_supervisor: None,
+            lan: false,
+            id: Uuid::new_v4(),
+            hostname: "app.localhost".into(),
+            target: "http://127.0.0.1:3000".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            pid: std::process::id(),
+            pgid: identity.pgid,
+            process_start_time_ticks: identity.start_time_ticks,
+            state: LeaseState::Ready,
+        };
+        assert!(super::kill_owned_lease(&lease).is_err());
+        let mut child = spawn_child(&["/bin/sleep".into(), "10".into()], &[]).unwrap();
+        lease.pid = child.pid;
+        lease.pgid = child.pgid;
+        lease.process_start_time_ticks = child.start_time_ticks;
+        lease.workspace_supervisor = Some(crate::state::WorkspaceSupervisor {
+            pid: child.pid,
+            process_start_time_ticks: child.start_time_ticks,
+        });
+        let refused = super::kill_owned_lease(&lease).is_err();
+        let still_running = child.try_wait().unwrap().is_none();
+        child.signal(ProcessSignal::Kill).unwrap();
+        child.wait().unwrap();
+        assert!(refused && still_running);
+    }
+
+    #[test]
+    fn prepared_port_can_be_released_twice_before_member_joins() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sleep", "10"], 30);
+        let operations = store.lock_operations().unwrap();
+        let reservation = reserve_port(None, false).unwrap();
+        let port = reservation.port;
+        let mut prepared = super::prepare_run(
+            &config,
+            reservation,
+            &store,
+            &mut Routes::default(),
+            &operations,
+            &mut LocalOnly,
+        )
+        .unwrap();
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+        prepared.release_port();
+        prepared.release_port();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+        drop(listener);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn owned_cleanup_kills_the_members_entire_verified_group() {
+        for zombie_leader in [false, true] {
+            let (store, path) = temporary_store();
+            let marker = path.with_extension("descendant");
+            let config = run_config(
+                vec![
+                    "/bin/sh",
+                    "-c",
+                    "sleep 10 & echo $! > \"$1\"; wait",
+                    "nook-test",
+                    marker.to_str().unwrap(),
+                ],
+                30,
+            );
+            let mut running = start_run(&config, &store, &mut Routes::default()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let descendant = loop {
+                if let Ok(contents) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "member did not launch its descendant"
+                );
+                thread::sleep(Duration::from_millis(5));
+            };
+            let identity = read_process_identity(descendant).unwrap();
+            assert_eq!(identity.pgid, running.child.pgid);
+            let lease = store
+                .load()
+                .unwrap()
+                .leases
+                .remove(&running.lease_id)
+                .unwrap();
+            if zombie_leader {
+                // Kill only the leader and leave it unreaped: its recorded raw
+                // identity still proves ownership of the surviving descendant.
+                running.child.child.kill().unwrap();
+                while super::lease_liveness(&lease) != Liveness::Dead {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(read_process_identity(lease.pid).unwrap().state, b'Z');
+                assert_eq!(
+                    read_process_identity(descendant).unwrap().start_time_ticks,
+                    identity.start_time_ticks
+                );
+            }
+            super::kill_owned_lease(&lease).unwrap();
+            assert_eq!(running.child.wait().unwrap(), 128 + libc::SIGKILL);
+            while read_process_identity(descendant).is_some_and(|current| {
+                identity_liveness(current, identity.pgid, identity.start_time_ticks)
+                    == Liveness::Alive
+            }) {
+                assert!(
+                    Instant::now() < deadline,
+                    "member descendant survived group cleanup"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -2800,6 +3053,56 @@ mod windows_tests {
     }
 
     #[test]
+    fn owned_cleanup_requires_member_identity_and_matching_named_job() {
+        let id = Uuid::new_v4();
+        let foreign_id = Uuid::new_v4();
+        let argv = [
+            "cmd.exe".into(),
+            "/D".into(),
+            "/C".into(),
+            "ping -n 20 127.0.0.1 >nul".into(),
+        ];
+        let mut child = super::spawn_managed_child(&argv, &[], id).unwrap();
+        let mut foreign = super::spawn_managed_child(&argv, &[], foreign_id).unwrap();
+        let mut lease = Lease {
+            group_id: None,
+            workspace_supervisor: None,
+            lan: false,
+            id: foreign_id,
+            hostname: "app.localhost".into(),
+            target: "http://127.0.0.1:3000".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            pid: child.pid,
+            pgid: child.pgid,
+            process_start_time_ticks: child.start_time_ticks,
+            state: LeaseState::Ready,
+        };
+        assert!(
+            super::kill_owned_lease(&lease).is_err(),
+            "a different named job must not be killed"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        let foreign_survived = foreign.try_wait().unwrap().is_none();
+        foreign.signal(ProcessSignal::Kill).unwrap();
+        foreign.wait().unwrap();
+        assert!(
+            foreign_survived,
+            "a mismatched job must not receive a cleanup signal"
+        );
+        lease.id = id;
+        lease.process_start_time_ticks += 1;
+        super::kill_owned_lease(&lease).unwrap();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a reused PID must not be signaled"
+        );
+        lease.process_start_time_ticks -= 1;
+        super::kill_owned_lease(&lease).unwrap();
+        assert_eq!(child.wait().unwrap(), 1);
+    }
+
+    #[test]
     fn path_resolves_cmd_package_shims() {
         let directory = std::env::temp_dir().join(format!("nook command shim {}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -2882,6 +3185,7 @@ mod windows_tests {
         let identity = read_process_identity(pid).unwrap();
         let mut lease = Lease {
             group_id: None,
+            workspace_supervisor: None,
             lan: false,
             id: Uuid::new_v4(),
             hostname: "test.localhost".into(),

@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,6 +96,8 @@ pub(crate) struct Alias {
 pub(crate) struct Lease {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) group_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_supervisor: Option<WorkspaceSupervisor>,
     #[serde(default)]
     pub(crate) lan: bool,
     pub(crate) id: Uuid,
@@ -108,6 +110,13 @@ pub(crate) struct Lease {
     pub(crate) pgid: i32,
     pub(crate) process_start_time_ticks: u64,
     pub(crate) state: LeaseState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceSupervisor {
+    pub(crate) pid: u32,
+    pub(crate) process_start_time_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +253,10 @@ pub(crate) struct Store {
 impl Store {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Reads the registry for shell completion without creating or changing
@@ -503,12 +516,40 @@ mod tests {
         assert_eq!(registry.aliases["api.localhost"].id, alias_id);
         assert_eq!(registry.leases[&lease_id].pid, 42);
         assert_eq!(registry.leases[&lease_id].group_id, None);
+        assert_eq!(registry.leases[&lease_id].workspace_supervisor, None);
+        assert!(
+            written["leases"][lease_id.to_string()]
+                .get("workspace_supervisor")
+                .is_none()
+        );
         assert!(!registry.leases[&lease_id].tls);
         assert_eq!(registry.selected_servers.https.as_deref(), Some("srv0"));
         assert_eq!(registry.last_synchronized_at_unix_ms, Some(9));
         assert_eq!(registry.pending_operations[0].id, operation_id);
         assert!(registry.tailscale.registrations.is_empty());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn v2_leases_default_to_no_supervisor_and_round_trip_workspace_ownership() {
+        let id = Uuid::new_v4();
+        let json = format!(
+            r#"{{"format_version":2,"last_synchronized_at_unix_ms":null,
+            "leases":{{"{id}":{{"id":"{id}","hostname":"app.localhost",
+            "target":"http://127.0.0.1:3000","scheme":"http","pid":42,"pgid":42,
+            "process_start_time_ticks":7,"state":"ready"}}}}}}"#
+        );
+        let mut registry = decode(json.as_bytes()).unwrap();
+        assert_eq!(registry.leases[&id].workspace_supervisor, None);
+        registry.leases.get_mut(&id).unwrap().workspace_supervisor =
+            Some(super::WorkspaceSupervisor {
+                pid: 12,
+                process_start_time_ticks: 34,
+            });
+        assert_eq!(
+            decode(&serde_json::to_vec(&registry).unwrap()).unwrap(),
+            registry
+        );
     }
 
     #[test]

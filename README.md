@@ -359,6 +359,18 @@ forwards interruption signals, and preserves Nook's exit code. It has no depende
 hooks and never downloads Nook or Caddy. Nook must still be installed separately and available in
 `PATH`. The wrapper requires Node.js 22 or newer and invokes `nook` or `nook.exe` through `PATH`.
 
+## Monorepo workspaces
+
+A version 2 `nook.toml` can declare several `[[apps]]`, each with its own directory,
+command and domain. `nook run` reserves their ports and routes before starting the
+apps, and resolves references such as `${api.upstream}` in a frontend's environment.
+Use `nook run --only api` to select one app, or `nook init --workspace` for a template.
+
+For existing package scripts using `nook-run`, run the root Turbo or Lerna command
+through `nook run --runner -- pnpm dev`. Each wrapper joins the prepared workspace
+session and receives its app's port and URLs; the runner continues to launch the
+package tasks. See [workspace configuration and runner setup](docs/WORKSPACES.md).
+
 ## Persistent aliases
 
 ```sh

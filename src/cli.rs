@@ -199,10 +199,13 @@ pub(crate) struct CaExportArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
+    /// Run an external workspace task runner; pass its command after --.
+    #[arg(long, conflicts_with = "only")]
+    pub(crate) runner: bool,
     /// Run only this application from a workspace configuration.
     #[arg(long, value_name = "ID")]
     pub(crate) only: Option<String>,
-    /// Route name when using `nook run`.
+    /// Route name; ignored in runner members, whose working directory selects the app.
     #[arg(long)]
     pub(crate) name: Option<String>,
     /// Expose the route over HTTP instead of HTTPS.
@@ -351,6 +354,16 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         caddy_socket,
         command,
     } = cli;
+    // Turbo's strict environment may omit XDG configuration variables. Members
+    // use the root's explicit store path and never contact Caddy themselves.
+    let command = match command {
+        Command::Run(arguments)
+            if std::env::var_os(crate::workspace_session::SESSION_VARIABLE).is_some() =>
+        {
+            return crate::workspace::run_member(arguments);
+        }
+        command => command,
+    };
     if !matches!(command, Command::Completions(_) | Command::Update(_)) {
         crate::update::warn_if_available(errors);
     }
@@ -383,7 +396,7 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
     }
     if !matches!(
         &command,
-        Command::Prune | Command::Ca(_) | Command::Tailscale(_)
+        Command::Prune | Command::Ca(_) | Command::Tailscale(_) | Command::Run(_)
     ) {
         reconcile_before_command(&global, errors)?;
     }
@@ -1334,15 +1347,42 @@ fn write_certificate(path: &Path, contents: &[u8], force: bool) -> io::Result<()
 }
 
 fn run_command(
-    arguments: RunArgs,
+    mut arguments: RunArgs,
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
     let current_directory = std::env::current_dir()?;
+    let runner_command = if arguments.runner {
+        if arguments.command.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--runner requires a root dev command after --",
+            )
+            .into());
+        }
+        // The CLI command belongs to the runner, never to individual apps.
+        Some(std::mem::take(&mut arguments.command))
+    } else {
+        None
+    };
     if let Some(workspace) =
         crate::workspace_config::load(&arguments, &current_directory, global.run_bind_address)?
     {
-        return run_workspace_command(workspace, arguments.only.as_deref(), global, errors);
+        reconcile_before_command(global, errors)?;
+        return run_workspace_command(
+            workspace,
+            arguments.only.as_deref(),
+            runner_command.as_deref(),
+            global,
+            errors,
+        );
+    }
+    if arguments.runner {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--runner requires a format_version = 2 workspace configuration",
+        )
+        .into());
     }
     if arguments.only.is_some() {
         return Err(io::Error::new(
@@ -1353,6 +1393,7 @@ fn run_command(
     }
     let config =
         crate::config::resolve_run(&arguments, &current_directory, global.run_bind_address)?;
+    reconcile_before_command(global, errors)?;
     if let Some(path) = &config.ignored_local_config {
         writeln!(
             errors,
@@ -1453,6 +1494,7 @@ fn run_command(
 fn run_workspace_command(
     workspace: crate::workspace_config::ResolvedWorkspaceConfig,
     only: Option<&str>,
+    runner_command: Option<&[OsString]>,
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
@@ -1492,6 +1534,15 @@ fn run_workspace_command(
                     path.display()
                 )?;
             }
+        }
+        if let Some(command) = runner_command {
+            let outcome = prepared.run_runner(command, &store, routes, |warning| {
+                let _ = writeln!(errors, "warning: {warning}");
+            })?;
+            for warning in outcome.warnings {
+                writeln!(errors, "warning: {warning}")?;
+            }
+            return Ok(outcome.exit_code);
         }
         let mut running = prepared.start(&store, routes)?;
         for (id, app) in &running.apps {
@@ -2578,6 +2629,27 @@ mod tests {
     }
 
     #[test]
+    fn runner_preserves_argv_and_rejects_nook_app_filters() {
+        let cli = parse(&[
+            "run",
+            "--runner",
+            "--",
+            "turbo",
+            "dev",
+            "--filter=web",
+            "two words",
+        ]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(run.runner);
+        assert_eq!(run.command, ["turbo", "dev", "--filter=web", "two words"]);
+        let error = try_parse(&["run", "--runner", "--only", "web", "--", "turbo", "dev"])
+            .expect_err("runner filters belong to the runner");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn rejects_strict_port_without_a_requested_port() {
         let error = try_parse(&["run", "--strict-port", "--", "server"])
             .expect_err("arguments should be rejected");
@@ -2596,6 +2668,7 @@ mod tests {
                 id,
                 Lease {
                     group_id: None,
+                    workspace_supervisor: None,
                     lan: false,
                     id,
                     hostname: hostname.into(),

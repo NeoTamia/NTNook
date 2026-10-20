@@ -8,6 +8,7 @@ on:
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - "src/**"
+      - "packages/nook-run/bin/**"
       - "tests/**"
       - "docker/**"
       - "README.md"
@@ -22,6 +23,7 @@ on:
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - "src/**"
+      - "packages/nook-run/bin/**"
       - "tests/**"
       - "docker/**"
       - "README.md"
@@ -77,6 +79,12 @@ jobs:
 
       - name: Lint
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test real monorepo runners
+        run: |
+          cargo build --locked
+          npm install --prefix target/workspace-runner-tools --no-audit --no-fund turbo@2.11.10 lerna@10.1.1
+          NOOK_RUNNER_DIRECT=1 node --test tests/workspace_runners.mjs
 
       - name: Build release binary
         run: |

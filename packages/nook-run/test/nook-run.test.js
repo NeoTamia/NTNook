@@ -73,6 +73,19 @@ test("warns and runs the command directly when Nook is missing", async (t) => {
   assert.equal(result.stdout, '["an argument"]\n');
 });
 
+test("never runs an unmanaged fallback when a workspace marker is present", async (t) => {
+  const directory = await temporaryDirectory(t);
+  for (const marker of ["", path.join(directory, "stale-session.json")]) {
+    const result = await runLauncher(["--", process.execPath, "-e", 'console.log("unmanaged")'], {
+      env: { ...process.env, PATH: directory, NOOK_WORKSPACE_SESSION: marker },
+    });
+    assert.equal(result.code, 127);
+    assert.match(result.stderr, /cannot join the workspace session/);
+    assert.doesNotMatch(result.stderr, /running the command directly/);
+    assert.equal(result.stdout, "");
+  }
+});
+
 test("selects installation guidance for the host platform", () => {
   const linuxGuidance = installationGuidance("linux");
   assert.match(linuxGuidance, /nook-installer\.sh/);
@@ -121,6 +134,7 @@ writeFileSync(process.env.NOOK_RUN_RECORD, JSON.stringify({
   argv: process.argv.slice(2),
   cwd: process.cwd(),
   marker: process.env.NOOK_RUN_MARKER,
+  session: process.env.NOOK_WORKSPACE_SESSION,
 }));
 `,
   );
@@ -140,6 +154,7 @@ writeFileSync(process.env.NOOK_RUN_RECORD, JSON.stringify({
     env: {
       ...process.env,
       NOOK_RUN_MARKER: "inherited",
+      NOOK_WORKSPACE_SESSION: "opaque-session-context",
       NOOK_RUN_RECORD: recordPath,
       PATH: `${directory}${path.delimiter}${process.env.PATH ?? ""}`,
     },
@@ -150,6 +165,7 @@ writeFileSync(process.env.NOOK_RUN_RECORD, JSON.stringify({
   assert.deepEqual(record.argv, ["run", ...args]);
   assert.equal(record.cwd, directory);
   assert.equal(record.marker, "inherited");
+  assert.equal(record.session, "opaque-session-context");
 });
 
 test("preserves Nook's exit code", async (t) => {

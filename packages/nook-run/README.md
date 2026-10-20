@@ -2,6 +2,11 @@
 
 Run a JavaScript development command through a system-installed [Nook](https://github.com/NeoTamia/NTNook) CLI and get actionable installation guidance when Nook is missing.
 
+When started inside a Nook workspace runner session, the same wrapper joins its
+app's prepared configuration. Package scripts need no second wrapper. See
+[monorepo workspaces](../../docs/WORKSPACES.md) for Turbo's environment allowlist
+and the root `nook run --runner -- <dev command>` invocation.
+
 ## Install
 
 ```sh
