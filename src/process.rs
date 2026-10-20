@@ -2078,6 +2078,15 @@ fn cleanup_marked_workspace_processes(
             if pid == std::process::id() {
                 continue;
             }
+            // An inaccessible candidate is not proof of workspace ownership.
+            // Establish the exact marker before treating inspection failures as
+            // recovery errors, so unrelated protected processes cannot block it.
+            let Ok(environment) = fs::read(entry.path().join("environ")) else {
+                continue;
+            };
+            if !markers.matches(&environment) {
+                continue;
+            }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -2115,16 +2124,6 @@ fn cleanup_marked_workspace_processes(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
                 Ok(_) => {}
-            }
-            match fs::read(entry.path().join("environ")) {
-                Ok(environment) => {
-                    if !markers.matches(&environment) {
-                        continue;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
-                Err(error) => return Err(error),
             }
             found |= kill_marked_process(pid, identity, &markers)?;
         }
@@ -2646,6 +2645,137 @@ mod tests {
             );
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_recovery_skips_protected_foreign_processes_but_keeps_owned_errors() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Stdio;
+
+        // Namespace root may have CAP_SYS_PTRACE. Drop capabilities in an
+        // isolated copy of this test so the /proc failures are real there too.
+        const TEST: &str = "process::tests::workspace_recovery_skips_protected_foreign_processes_but_keeps_owned_errors";
+        const ISOLATED: &str = "NOOK_PROTECTED_RECOVERY_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import ctypes,os,sys\nclass Header(ctypes.Structure): _fields_=[('version',ctypes.c_uint32),('pid',ctypes.c_int)]\nclass Data(ctypes.Structure): _fields_=[('effective',ctypes.c_uint32),('permitted',ctypes.c_uint32),('inheritable',ctypes.c_uint32)]\nlibc=ctypes.CDLL(None); assert libc.prctl(38,1,0,0,0)==0; assert libc.capset(ctypes.byref(Header(0x20080522,0)),ctypes.byref((Data*2)()))==0; os.execv(sys.argv[1],sys.argv[1:])",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let mut foreign = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import ctypes,time; assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; print('protected',flush=True); time.sleep(30)",
+            ])
+            .env_remove(crate::workspace_session::SESSION_VARIABLE)
+            .env_remove(crate::workspace_session::PROCESS_VARIABLE)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(foreign.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "protected");
+        let foreign_path = std::path::PathBuf::from(format!("/proc/{}", foreign.id()));
+        assert_eq!(
+            std::fs::metadata(&foreign_path).unwrap().uid(),
+            std::fs::metadata("/proc/self").unwrap().uid(),
+            "the protected process must reach the same-uid candidate checks"
+        );
+        assert_eq!(
+            std::fs::read_link(foreign_path.join("ns/user"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read(foreign_path.join("environ"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let path = crate::workspace_session::session_path(Uuid::new_v4());
+        let started_after = read_process_identity(std::process::id())
+            .unwrap()
+            .start_time_ticks;
+        for claim in [None, Some(Uuid::new_v4())] {
+            let token = claim.unwrap_or_else(Uuid::new_v4);
+            let mut child = super::spawn_managed_child_in(
+                &["/bin/sleep".into(), "30".into()],
+                &[(
+                    crate::workspace_session::PROCESS_VARIABLE.into(),
+                    crate::workspace_session::member_process_marker(&path, token),
+                )],
+                token,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(foreign.id() < child.pid);
+            let result = super::cleanup_marked_workspace_processes(&path, claim, started_after);
+            let killed = child.try_wait().unwrap().is_some();
+            let foreign_alive = foreign.try_wait().unwrap().is_none();
+            // Reap both children even when exercising the unfixed scanner.
+            if !killed {
+                child.child.kill().unwrap();
+            }
+            child.wait().unwrap();
+            if result.is_err() || !killed || !foreign_alive {
+                let _ = foreign.kill();
+                foreign.wait().unwrap();
+            }
+            result.unwrap();
+            assert!(killed, "the later marked child must be killed");
+            assert!(foreign_alive, "the protected foreign process must survive");
+        }
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
+
+        // An exact marker observed before the process becomes protected still
+        // must not turn a failed pidfd validation into a successful cleanup.
+        let mut owned = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import ctypes,sys,time; print('ready',flush=True); sys.stdin.readline(); assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; print('protected',flush=True); time.sleep(30)",
+            ])
+            .env(crate::workspace_session::SESSION_VARIABLE, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(owned.stdout.take().unwrap());
+        ready.clear();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let identity = read_process_identity(owned.id()).unwrap();
+        let markers = super::RecoveryMarkers::new(&path, None);
+        assert!(markers.matches(&std::fs::read(format!("/proc/{}/environ", owned.id())).unwrap()));
+        owned.stdin.take().unwrap().write_all(b"protect\n").unwrap();
+        ready.clear();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "protected");
+        let result = super::kill_marked_process(owned.id(), identity, &markers);
+        let owned_alive = owned.try_wait().unwrap().is_none();
+        owned.kill().unwrap();
+        owned.wait().unwrap();
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(owned_alive, "failed ownership validation must not signal");
     }
 
     #[test]

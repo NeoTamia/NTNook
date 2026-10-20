@@ -18,6 +18,25 @@ const tools = path.resolve(process.env.NOOK_RUNNER_TOOLS ?? path.join(repository
 const nook = path.resolve(process.env.NOOK_TEST_BINARY ?? path.join(repository, "target/debug/nook"));
 const wrapper = path.join(repository, "packages/nook-run/bin/nook-run.js");
 
+// Local network namespaces run as root. Use ordinary-user process inspection
+// permissions for both the crash fixture and its recovering prune invocation.
+const withoutCapabilities = `
+import ctypes,os,sys
+libc=ctypes.CDLL(None,use_errno=True)
+assert libc.prctl(38,1,0,0,0)==0
+header=(ctypes.c_uint32*2)(0x20080522,0)
+data=(ctypes.c_uint32*6)()
+assert libc.capset(ctypes.byref(header),ctypes.byref(data))==0
+if sys.argv[1]!='-':
+    try:
+        os.readlink('/proc/'+sys.argv[1]+'/ns/user')
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('protected process must deny inspection')
+os.execv(sys.argv[2],sys.argv[2:])
+`;
+
 // Match the Rust integration harness: local runs get a private loopback network
 // and namespace-local root, so port 80 needs no host privileges or free listener.
 if (process.platform === "linux" && !process.env.NOOK_RUNNER_DIRECT) {
@@ -120,6 +139,7 @@ for (const runner of ["turbo", "lerna"]) {
     const root = await mkdtemp(path.join(tmpdir(), `nook-${runner}-`));
     let caddy;
     let running;
+    let protectedProcess;
     try {
       await mkdir(path.join(root, "config/nook"), { recursive: true });
       const adminPort = await availablePort();
@@ -328,9 +348,13 @@ try {
       const crashRunner = path.join(root, "crash-runner.mjs");
       await writeFile(crashRunner, `
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 for (const id of ['api','web']) spawn(process.execPath, [${JSON.stringify(wrapper)}, '--', process.execPath, ${JSON.stringify(path.join(root, "server.mjs"))}], {
   cwd:${JSON.stringify(root)}+'/apps/'+id, env:process.env, stdio:'inherit'
 });
+while (!fs.existsSync(${JSON.stringify(path.join(root, "protected-ready"))})) {
+  await new Promise(resolve=>setTimeout(resolve,10));
+}
 spawn(process.execPath, ['-e', "require('node:fs').writeFileSync('watcher-ran',String(process.pid));setInterval(()=>{},1000)"], {
   cwd:${JSON.stringify(path.join(root, "apps/watcher"))}, env:process.env, detached:true, stdio:'ignore'
 });
@@ -338,10 +362,19 @@ setInterval(()=>{},1000);
 `);
       const sessionTemp = path.join(root, "session-temp");
       await mkdir(sessionTemp);
-      running = launch(nook, ["run", "--runner", "--", process.execPath, crashRunner], {
+      running = launch("python3", ["-c", withoutCapabilities, "-", nook, "run", "--runner", "--", process.execPath, crashRunner], {
         cwd: root, env: { ...environment, TMPDIR: sessionTemp },
       });
       const crashInfos = await waitFor(() => Promise.all(["api", "web"].map(async (id) => JSON.parse(await readFile(path.join(root, "apps", id, "started.json"), "utf8")))), "apps before root crash");
+      // This unrelated process predates the detached watcher and denies /proc
+      // inspection. It must neither stop recovery nor receive a signal.
+      protectedProcess = launch("python3", ["-c", `
+import ctypes,pathlib,time
+assert ctypes.CDLL(None,use_errno=True).prctl(4,0,0,0,0)==0
+pathlib.Path(${JSON.stringify(path.join(root, "protected-ready"))}).write_text('ready')
+time.sleep(120)
+`], { cwd: root, env: environment });
+      await waitFor(() => readFile(path.join(root, "protected-ready"), "utf8"), "protected unrelated process");
       const crashWatcherPid = await waitFor(async () => {
         const pid = Number(await readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"));
         return pid !== watcherPid && pid;
@@ -352,10 +385,13 @@ setInterval(()=>{},1000);
       await readFile(contextPath);
       running.child.kill("SIGKILL");
       await running.ended;
-      const prune = spawnSync(nook, ["prune"], { cwd: root, env: environment, encoding: "utf8" });
+      const prune = spawnSync("python3", ["-c", withoutCapabilities, String(protectedProcess.child.pid), nook, "prune"], {
+        cwd: root, env: environment, encoding: "utf8",
+      });
       assert.equal(prune.status, 0, prune.stdout + prune.stderr);
-      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).leases).length, 0);
-      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).workspace_groups ?? {}).length, 0);
+      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).leases).length, 0, prune.stdout + prune.stderr);
+      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).workspace_groups ?? {}).length, 0, prune.stdout + prune.stderr);
+      process.kill(protectedProcess.child.pid, 0);
       await assert.rejects(readFile(contextPath), { code: "ENOENT" });
       for (const info of [...crashInfos, { pid: crashWatcherPid }]) {
         await waitFor(async () => {
@@ -373,6 +409,7 @@ setInterval(()=>{},1000);
       throw error;
     } finally {
       await running?.stop();
+      await protectedProcess?.stop();
       // A failing regression must not leave the fixture's detached processes.
       for (const id of ["watcher", "api", "web"]) {
         try {
