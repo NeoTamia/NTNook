@@ -151,6 +151,8 @@ pub(crate) struct ManagedChild {
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) start_time_ticks: u64,
+    #[cfg(unix)]
+    terminal: Option<TerminalForeground>,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -191,6 +193,8 @@ impl ManagedChild {
                 self.signal_foreground(signal)?;
             }
             if let Some(status) = self.child.try_wait().map_err(Error::Spawn)? {
+                #[cfg(unix)]
+                drop(self.terminal.take());
                 #[cfg(unix)]
                 return Ok(status
                     .code()
@@ -888,6 +892,8 @@ fn spawn_managed_child(
     configure_child(&mut command);
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
+    #[cfg(unix)]
+    join_child_process_group(pid);
     let Some(identity) = read_process_identity(pid) else {
         cleanup_unidentified_child(&mut child, pid);
         return Err(Error::ProcessIdentity(pid));
@@ -912,6 +918,8 @@ fn spawn_managed_child(
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
+        #[cfg(unix)]
+        terminal: TerminalForeground::claim(identity.pgid),
         #[cfg(windows)]
         job,
     })
@@ -937,6 +945,65 @@ fn cleanup_unidentified_child(child: &mut Child, _pid: u32) {
 }
 
 #[cfg(unix)]
+struct TerminalForeground {
+    previous_pgid: libc::pid_t,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+impl TerminalForeground {
+    fn claim(pgid: i32) -> Option<Self> {
+        // SAFETY: stdin is the caller's inherited terminal, if any. Ignoring
+        // SIGTTOU around tcsetpgrp prevents the parent from being stopped when
+        // it is not already the foreground group.
+        unsafe {
+            if libc::isatty(libc::STDIN_FILENO) == 0 {
+                return None;
+            }
+            let previous_pgid = libc::tcgetpgrp(libc::STDIN_FILENO);
+            if previous_pgid < 0 {
+                return None;
+            }
+            let previous_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            let result = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+            libc::signal(libc::SIGTTOU, previous_ttou);
+            if result == -1 {
+                return None;
+            }
+            Some(Self { previous_pgid })
+        }
+    }
+
+    fn restore(&self) {
+        unsafe {
+            let previous_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            let _ = libc::tcsetpgrp(libc::STDIN_FILENO, self.previous_pgid);
+            libc::signal(libc::SIGTTOU, previous_ttou);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalForeground {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn join_child_process_group(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: pid is the child we just spawned in this session. Fails with
+    // EACCES once the child has exec'd; that race is expected and ignored.
+    unsafe {
+        libc::setpgid(pid, pid);
+    }
+}
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn configure_child(command: &mut Command) {
     // SAFETY: this closure runs after fork and before exec. It only invokes
@@ -946,6 +1013,11 @@ fn configure_child(command: &mut Command) {
             if libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
+            // SIG_IGN is inherited across exec. Without it, a child that puts
+            // the inherited terminal in raw mode (Remotion Studio) is stopped
+            // with SIGTTOU/SIGTTIN because it is not the foreground group.
+            libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -1370,6 +1442,13 @@ fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
         start_time_ticks: u64::from(creation.dwLowDateTime)
             | (u64::from(creation.dwHighDateTime) << 32),
     })
+}
+
+#[cfg(unix)]
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        drop(self.terminal.take());
+    }
 }
 
 #[cfg(windows)]
@@ -2069,6 +2148,87 @@ mod tests {
         assert_eq!(child.pgid, child.pid as i32);
         assert!(child.start_time_ticks > 0);
         assert_eq!(child.wait().unwrap(), 7);
+    }
+
+    const RAW_STDIN_SESSION_ENV: &str = "NOOK_TEST_RAW_STDIN_SESSION";
+
+    #[test]
+    fn raw_tty_child_is_not_stopped_by_process_group() {
+        if std::env::var_os(RAW_STDIN_SESSION_ENV).is_some() {
+            raw_tty_session_leader();
+            return;
+        }
+        if Command::new("python3")
+            .args(["-c", "import pty"])
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let launcher = r#"
+import os, pty, sys
+exe = sys.argv[1]
+env = os.environ.copy()
+env["NOOK_TEST_RAW_STDIN_SESSION"] = "1"
+pid, _fd = pty.fork()
+if pid == 0:
+    os.execve(exe, [exe, "--exact", "process::tests::raw_tty_child_is_not_stopped_by_process_group", "--test-threads=1", "--nocapture"], env)
+    os._exit(127)
+_, status = os.waitpid(pid, 0)
+if os.WIFEXITED(status):
+    sys.exit(os.WEXITSTATUS(status))
+sys.exit(1)
+"#;
+        let output = Command::new("python3")
+            .args(["-c", launcher])
+            .arg(exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "raw-tty child was stopped or failed: status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn raw_tty_session_leader() {
+        let identity_self = read_process_identity(std::process::id()).unwrap();
+        assert_ne!(
+            identity_self.state, b'T',
+            "session leader must own a running controlling terminal"
+        );
+        let mut child = spawn_child(
+            &[
+                OsString::from("/usr/bin/python3"),
+                OsString::from("-c"),
+                OsString::from(
+                    "import sys, tty, time\ntty.setraw(0)\nsys.stderr.write('setraw-ok\\n')\nsys.stderr.flush()\ntime.sleep(2)\n",
+                ),
+            ],
+            &[],
+        )
+        .unwrap();
+        let started = Instant::now();
+        loop {
+            let identity = read_process_identity(child.pid)
+                .expect("raw-tty child should remain visible in /proc");
+            assert_ne!(
+                identity.state, b'T',
+                "child in a new process group was stopped (SIGTTIN/SIGTTOU) while using raw stdin"
+            );
+            if child.has_exited().unwrap() || started.elapsed() >= Duration::from_millis(400) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !child.has_exited().unwrap() {
+            child.signal(ProcessSignal::Terminate).unwrap();
+        }
+        let _ = child.wait();
     }
 
     #[test]
