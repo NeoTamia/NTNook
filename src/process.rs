@@ -202,6 +202,8 @@ impl ManagedChild {
                 #[cfg(windows)]
                 return Ok(status.code().unwrap_or(1));
             }
+            #[cfg(unix)]
+            self.follow_stopped_child();
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -211,6 +213,28 @@ impl ManagedChild {
             .try_wait()
             .map(|status| status.is_some())
             .map_err(Error::Spawn)
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn follow_stopped_child(&mut self) {
+        if !process_is_stopped(self.pid) {
+            return;
+        }
+        drop(self.terminal.take());
+        // SAFETY: unblock SIGTSTP, restore the default stop action, and
+        // signal this process group so the controlling shell can take the
+        // terminal back. After SIGCONT we re-claim it and continue the child.
+        unsafe {
+            let mut set = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTSTP);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            libc::raise(libc::SIGTSTP);
+        }
+        self.terminal = TerminalForeground::claim(self.pgid);
+        let _ = send_group_signal(self.pgid, libc::SIGCONT);
     }
 }
 
@@ -666,6 +690,8 @@ impl RunningChild {
             if self.child.has_exited()? {
                 return Ok(false);
             }
+            #[cfg(unix)]
+            self.child.follow_stopped_child();
             if !warned && started.elapsed() >= self.readiness_warn_after {
                 warn(&format!(
                     "{} is still not accepting connections on port {}; its route and process remain active (check that it binds HOST and PORT)",
@@ -994,6 +1020,16 @@ impl Drop for TerminalForeground {
 #[cfg(unix)]
 fn owns_foreground_terminal(foreground_pgid: libc::pid_t, our_pgid: libc::pid_t) -> bool {
     foreground_pgid >= 0 && foreground_pgid == our_pgid
+}
+
+#[cfg(unix)]
+fn process_is_stopped_state(state: u8) -> bool {
+    matches!(state, b'T' | b't')
+}
+
+#[cfg(unix)]
+fn process_is_stopped(pid: u32) -> bool {
+    read_process_identity(pid).is_some_and(|identity| process_is_stopped_state(identity.state))
 }
 
 #[cfg(unix)]
@@ -1704,9 +1740,10 @@ mod tests {
     use super::{
         Error, Liveness, LocalOnly, ProcIdentity, ProcessSignal, RunError, RunExposure, StopError,
         StopSystem, child_environment, cleanup_unidentified_child, configure_child,
-        identity_liveness, owns_foreground_terminal, parse_stat, read_process_identity,
-        readiness_probe_address, reserve_port, spawn_child, start_exposed_run, start_run,
-        start_run_with_hook, stop_managed, substitute_port,
+        identity_liveness, owns_foreground_terminal, parse_stat, process_is_stopped,
+        process_is_stopped_state, read_process_identity, readiness_probe_address, reserve_port,
+        send_group_signal, spawn_child, start_exposed_run, start_run, start_run_with_hook,
+        stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -2242,6 +2279,134 @@ sys.exit(1)
         assert!(owns_foreground_terminal(42, 42));
         assert!(!owns_foreground_terminal(42, 7));
         assert!(!owns_foreground_terminal(-1, 7));
+    }
+
+    #[test]
+    fn stopped_states_are_job_control_stops() {
+        assert!(process_is_stopped_state(b'T'));
+        assert!(process_is_stopped_state(b't'));
+        assert!(!process_is_stopped_state(b'S'));
+        assert!(!process_is_stopped_state(b'R'));
+    }
+
+    const JOB_CONTROL_SESSION_ENV: &str = "NOOK_TEST_JOB_CONTROL_SESSION";
+
+    #[test]
+    fn stopped_child_suspends_until_continued() {
+        if std::env::var_os(JOB_CONTROL_SESSION_ENV).is_some() {
+            job_control_session_leader();
+            return;
+        }
+        if Command::new("python3")
+            .args(["-c", "import pty"])
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let launcher = r#"
+import fcntl, os, select, signal, sys, termios, time
+exe = sys.argv[1]
+env = os.environ.copy()
+env["NOOK_TEST_JOB_CONTROL_SESSION"] = "1"
+master, slave = os.openpty()
+shell = os.fork()
+if shell == 0:
+    os.close(master)
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    os.dup2(slave, 0)
+    os.dup2(slave, 1)
+    os.dup2(slave, 2)
+    if slave > 2:
+        os.close(slave)
+    nook = os.fork()
+    if nook == 0:
+        os.setpgid(0, 0)
+        os.execve(exe, [exe, "--exact", "process::tests::stopped_child_suspends_until_continued", "--test-threads=1", "--nocapture"], env)
+        os._exit(127)
+    os.setpgid(nook, nook)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    os.tcsetpgrp(0, nook)
+    saw_stop = False
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        wpid, status = os.waitpid(nook, os.WUNTRACED | os.WNOHANG)
+        if wpid == 0:
+            time.sleep(0.05)
+            continue
+        if os.WIFSTOPPED(status):
+            saw_stop = True
+            os.kill(nook, signal.SIGCONT)
+            continue
+        if os.WIFEXITED(status):
+            if not saw_stop:
+                os.write(2, b"wrapper never stopped\n")
+                os._exit(2)
+            os._exit(os.WEXITSTATUS(status))
+        os._exit(1)
+    os.write(2, b"timed out waiting for job-control stop\n")
+    os._exit(3)
+os.close(slave)
+deadline = time.time() + 9
+while time.time() < deadline:
+    readable, _, _ = select.select([master], [], [], 0.05)
+    if master in readable:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            chunk = b""
+        if chunk:
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+    wpid, status = os.waitpid(shell, os.WNOHANG)
+    if wpid == 0:
+        continue
+    if os.WIFEXITED(status):
+        sys.exit(os.WEXITSTATUS(status))
+    sys.exit(1)
+sys.stderr.write("timed out waiting for session shell\n")
+sys.exit(3)
+"#;
+        let output = Command::new("python3")
+            .args(["-c", launcher])
+            .arg(exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "job-control child did not suspend the wrapper: status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn job_control_session_leader() {
+        let mut child =
+            spawn_child(&[OsString::from("/bin/sleep"), OsString::from("30")], &[]).unwrap();
+        send_group_signal(child.pgid, libc::SIGTSTP).unwrap();
+        let stop_deadline = Instant::now() + Duration::from_secs(1);
+        while !process_is_stopped(child.pid) {
+            assert!(
+                Instant::now() < stop_deadline,
+                "child did not stop after SIGTSTP"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.follow_stopped_child();
+        let continue_deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_stopped(child.pid) {
+            assert!(
+                Instant::now() < continue_deadline,
+                "child did not continue after wrapper SIGCONT"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.signal(ProcessSignal::Terminate).unwrap();
+        let _ = child.wait();
     }
 
     #[test]
