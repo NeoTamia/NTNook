@@ -223,15 +223,15 @@ impl ManagedChild {
         }
         drop(self.terminal.take());
         // SAFETY: unblock SIGTSTP, restore the default stop action, and
-        // signal this process group so the controlling shell can take the
-        // terminal back. After SIGCONT we re-claim it and continue the child.
+        // stop this process group so a pipeline job (`nook | cat`) suspends
+        // together. After SIGCONT we re-claim the TTY and continue the child.
         unsafe {
             let mut set = std::mem::zeroed::<libc::sigset_t>();
             libc::sigemptyset(&mut set);
             libc::sigaddset(&mut set, libc::SIGTSTP);
             libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             libc::signal(libc::SIGTSTP, libc::SIG_DFL);
-            libc::raise(libc::SIGTSTP);
+            libc::kill(0, libc::SIGTSTP);
         }
         self.terminal = TerminalForeground::claim(self.pgid);
         let _ = send_group_signal(self.pgid, libc::SIGCONT);
@@ -2425,6 +2425,16 @@ sys.exit(3)
     }
 
     fn job_control_session_leader() {
+        let mut sibling = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let sibling_pid = sibling.id();
+        let sibling_ready = Instant::now() + Duration::from_secs(1);
+        while read_process_identity(sibling_pid).is_none() {
+            assert!(
+                Instant::now() < sibling_ready,
+                "pipeline sibling did not start"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         let mut child =
             spawn_child(&[OsString::from("/bin/sleep"), OsString::from("30")], &[]).unwrap();
         send_group_signal(child.pgid, libc::SIGTSTP).unwrap();
@@ -2437,6 +2447,10 @@ sys.exit(3)
             thread::sleep(Duration::from_millis(20));
         }
         child.follow_stopped_child();
+        assert!(
+            process_is_stopped(sibling_pid),
+            "wrapper SIGTSTP must stop the rest of its process group"
+        );
         let continue_deadline = Instant::now() + Duration::from_secs(1);
         while process_is_stopped(child.pid) {
             assert!(
@@ -2445,6 +2459,8 @@ sys.exit(3)
             );
             thread::sleep(Duration::from_millis(20));
         }
+        let _ = sibling.kill();
+        let _ = sibling.wait();
         child.signal(ProcessSignal::Terminate).unwrap();
         let _ = child.wait();
     }
