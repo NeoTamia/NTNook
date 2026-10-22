@@ -203,7 +203,7 @@ impl ManagedChild {
                 return Ok(status.code().unwrap_or(1));
             }
             #[cfg(unix)]
-            self.follow_stopped_child();
+            self.sync_terminal();
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -213,6 +213,14 @@ impl ManagedChild {
             .try_wait()
             .map(|status| status.is_some())
             .map_err(Error::Spawn)
+    }
+
+    #[cfg(unix)]
+    fn sync_terminal(&mut self) {
+        if self.terminal.is_none() && !process_is_stopped(self.pid) {
+            self.terminal = TerminalForeground::claim(self.pgid);
+        }
+        self.follow_stopped_child();
     }
 
     #[cfg(unix)]
@@ -691,7 +699,7 @@ impl RunningChild {
                 return Ok(false);
             }
             #[cfg(unix)]
-            self.child.follow_stopped_child();
+            self.child.sync_terminal();
             if !warned && started.elapsed() >= self.readiness_warn_after {
                 warn(&format!(
                     "{} is still not accepting connections on port {}; its route and process remain active (check that it binds HOST and PORT)",
@@ -1058,7 +1066,7 @@ fn parent_may_reassign_foreground(
 
 #[cfg(unix)]
 fn process_is_stopped_state(state: u8) -> bool {
-    matches!(state, b'T' | b't')
+    state == b'T'
 }
 
 #[cfg(unix)]
@@ -2346,7 +2354,7 @@ sys.exit(1)
     #[test]
     fn stopped_states_are_job_control_stops() {
         assert!(process_is_stopped_state(b'T'));
-        assert!(process_is_stopped_state(b't'));
+        assert!(!process_is_stopped_state(b't'));
         assert!(!process_is_stopped_state(b'S'));
         assert!(!process_is_stopped_state(b'R'));
     }
