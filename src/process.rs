@@ -1010,7 +1010,13 @@ impl TerminalForeground {
     }
 
     fn handoff(&self, pgid: i32) {
+        // pre_exec already claimed the TTY. Repeating after spawn would steal
+        // it from a descendant if the child (bash -m) already moved it.
         unsafe {
+            let current = libc::tcgetpgrp(libc::STDIN_FILENO);
+            if !parent_may_reassign_foreground(current, self.previous_pgid, pgid) {
+                return;
+            }
             let _ = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
         }
     }
@@ -1039,6 +1045,15 @@ impl Drop for TerminalForeground {
 #[cfg(unix)]
 fn owns_foreground_terminal(foreground_pgid: libc::pid_t, our_pgid: libc::pid_t) -> bool {
     foreground_pgid >= 0 && foreground_pgid == our_pgid
+}
+
+#[cfg(unix)]
+fn parent_may_reassign_foreground(
+    current: libc::pid_t,
+    previous: libc::pid_t,
+    child: libc::pid_t,
+) -> bool {
+    current == previous || current == child
 }
 
 #[cfg(unix)]
@@ -1780,10 +1795,10 @@ mod tests {
     use super::{
         Error, Liveness, LocalOnly, ProcIdentity, ProcessSignal, RunError, RunExposure, StopError,
         StopSystem, child_environment, cleanup_unidentified_child, configure_child,
-        identity_liveness, owns_foreground_terminal, parse_stat, process_is_stopped,
-        process_is_stopped_state, read_process_identity, readiness_probe_address, reserve_port,
-        send_group_signal, spawn_child, start_exposed_run, start_run, start_run_with_hook,
-        stop_managed, substitute_port,
+        identity_liveness, owns_foreground_terminal, parent_may_reassign_foreground, parse_stat,
+        process_is_stopped, process_is_stopped_state, read_process_identity,
+        readiness_probe_address, reserve_port, send_group_signal, spawn_child, start_exposed_run,
+        start_run, start_run_with_hook, stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -2319,6 +2334,13 @@ sys.exit(1)
         assert!(owns_foreground_terminal(42, 42));
         assert!(!owns_foreground_terminal(42, 7));
         assert!(!owns_foreground_terminal(-1, 7));
+    }
+
+    #[test]
+    fn parent_handoff_does_not_steal_a_descendant_foreground() {
+        assert!(parent_may_reassign_foreground(7, 7, 11));
+        assert!(parent_may_reassign_foreground(11, 7, 11));
+        assert!(!parent_may_reassign_foreground(13, 7, 11));
     }
 
     #[test]
