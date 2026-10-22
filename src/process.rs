@@ -953,15 +953,16 @@ struct TerminalForeground {
 #[allow(unsafe_code)]
 impl TerminalForeground {
     fn claim(pgid: i32) -> Option<Self> {
-        // SAFETY: stdin is the caller's inherited terminal, if any. Ignoring
-        // SIGTTOU around tcsetpgrp prevents the parent from being stopped when
-        // it is not already the foreground group.
+        // SAFETY: stdin is the caller's inherited terminal, if any. Claiming
+        // only when this process group already owns the foreground avoids
+        // stealing the TTY from the shell after `bg`. Ignoring SIGTTOU around
+        // tcsetpgrp still covers the handoff race.
         unsafe {
             if libc::isatty(libc::STDIN_FILENO) == 0 {
                 return None;
             }
             let previous_pgid = libc::tcgetpgrp(libc::STDIN_FILENO);
-            if previous_pgid < 0 {
+            if !owns_foreground_terminal(previous_pgid, libc::getpgrp()) {
                 return None;
             }
             let previous_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
@@ -988,6 +989,11 @@ impl Drop for TerminalForeground {
     fn drop(&mut self) {
         self.restore();
     }
+}
+
+#[cfg(unix)]
+fn owns_foreground_terminal(foreground_pgid: libc::pid_t, our_pgid: libc::pid_t) -> bool {
+    foreground_pgid >= 0 && foreground_pgid == our_pgid
 }
 
 #[cfg(unix)]
@@ -1698,9 +1704,9 @@ mod tests {
     use super::{
         Error, Liveness, LocalOnly, ProcIdentity, ProcessSignal, RunError, RunExposure, StopError,
         StopSystem, child_environment, cleanup_unidentified_child, configure_child,
-        identity_liveness, parse_stat, read_process_identity, readiness_probe_address,
-        reserve_port, spawn_child, start_exposed_run, start_run, start_run_with_hook, stop_managed,
-        substitute_port,
+        identity_liveness, owns_foreground_terminal, parse_stat, read_process_identity,
+        readiness_probe_address, reserve_port, spawn_child, start_exposed_run, start_run,
+        start_run_with_hook, stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -2229,6 +2235,13 @@ sys.exit(1)
             child.signal(ProcessSignal::Terminate).unwrap();
         }
         let _ = child.wait();
+    }
+
+    #[test]
+    fn terminal_is_claimed_only_when_this_process_group_owns_it() {
+        assert!(owns_foreground_terminal(42, 42));
+        assert!(!owns_foreground_terminal(42, 7));
+        assert!(!owns_foreground_terminal(-1, 7));
     }
 
     #[test]
