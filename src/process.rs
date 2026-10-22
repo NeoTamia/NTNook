@@ -916,6 +916,11 @@ fn spawn_managed_child(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     configure_child(&mut command);
+    // Acquire before spawn: Command::spawn only returns after exec, so the
+    // child claims the TTY in pre_exec. Nook keeps SIGTTOU ignored so later
+    // wrapper writes survive `stty tostop`.
+    #[cfg(unix)]
+    let terminal = TerminalForeground::acquire();
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
     #[cfg(unix)]
@@ -939,13 +944,17 @@ fn spawn_managed_child(
         let _ = child.wait();
         return Err(Error::Spawn(error));
     }
+    #[cfg(unix)]
+    if let Some(terminal) = &terminal {
+        terminal.handoff(identity.pgid);
+    }
     Ok(ManagedChild {
         child,
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
         #[cfg(unix)]
-        terminal: TerminalForeground::claim(identity.pgid),
+        terminal,
         #[cfg(windows)]
         job,
     })
@@ -973,16 +982,17 @@ fn cleanup_unidentified_child(child: &mut Child, _pid: u32) {
 #[cfg(unix)]
 struct TerminalForeground {
     previous_pgid: libc::pid_t,
+    previous_ttou: libc::sighandler_t,
 }
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
 impl TerminalForeground {
-    fn claim(pgid: i32) -> Option<Self> {
+    fn acquire() -> Option<Self> {
         // SAFETY: stdin is the caller's inherited terminal, if any. Claiming
         // only when this process group already owns the foreground avoids
-        // stealing the TTY from the shell after `bg`. Ignoring SIGTTOU around
-        // tcsetpgrp still covers the handoff race.
+        // stealing the TTY from the shell after `bg`. SIGTTOU stays ignored
+        // for the rest of the handoff so wrapper writes survive `stty tostop`.
         unsafe {
             if libc::isatty(libc::STDIN_FILENO) == 0 {
                 return None;
@@ -992,20 +1002,29 @@ impl TerminalForeground {
                 return None;
             }
             let previous_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-            let result = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
-            libc::signal(libc::SIGTTOU, previous_ttou);
-            if result == -1 {
-                return None;
-            }
-            Some(Self { previous_pgid })
+            Some(Self {
+                previous_pgid,
+                previous_ttou,
+            })
         }
+    }
+
+    fn handoff(&self, pgid: i32) {
+        unsafe {
+            let _ = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        }
+    }
+
+    fn claim(pgid: i32) -> Option<Self> {
+        let terminal = Self::acquire()?;
+        terminal.handoff(pgid);
+        Some(terminal)
     }
 
     fn restore(&self) {
         unsafe {
-            let previous_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             let _ = libc::tcsetpgrp(libc::STDIN_FILENO, self.previous_pgid);
-            libc::signal(libc::SIGTTOU, previous_ttou);
+            libc::signal(libc::SIGTTOU, self.previous_ttou);
         }
     }
 }
@@ -1050,24 +1069,45 @@ fn join_child_process_group(pid: u32) {
 fn configure_child(command: &mut Command) {
     // SAFETY: this closure runs after fork and before exec. It only invokes
     // async-signal-safe libc syscalls and constructs errors from errno.
+    // The child claims the TTY here because Command::spawn returns only after
+    // exec; permanently ignoring SIGTTIN would turn a too-early stdin read
+    // into EIO instead of blocking until the handoff.
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            // SIG_IGN is inherited across exec. Without it, a child that puts
-            // the inherited terminal in raw mode (Remotion Studio) is stopped
-            // with SIGTTOU/SIGTTIN because it is not the foreground group.
-            libc::signal(libc::SIGTTIN, libc::SIG_IGN);
-            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                 return Err(io::Error::last_os_error());
             }
             if libc::getppid() == 1 {
                 libc::raise(libc::SIGTERM);
             }
+            claim_controlling_terminal();
             Ok(())
         });
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn claim_controlling_terminal() {
+    // SAFETY: pre_exec; only async-signal-safe syscalls. Take the foreground
+    // when the parent still owns it, then restore default job-control
+    // dispositions so the exec'd program can stop on SIGTSTP/SIGTTIN.
+    unsafe {
+        if libc::isatty(libc::STDIN_FILENO) == 0 {
+            return;
+        }
+        let foreground = libc::tcgetpgrp(libc::STDIN_FILENO);
+        let parent_pgid = libc::getpgid(libc::getppid());
+        if parent_pgid < 0 || foreground != parent_pgid {
+            return;
+        }
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let _ = libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp());
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
     }
 }
 
