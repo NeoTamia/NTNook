@@ -309,6 +309,10 @@ API_UPSTREAM = "\${api.upstream}"
         // exists only in the disposable fixture repository, never this checkout.
         const commit = spawnSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "--quiet", "-m", "fixture"], { cwd: root, encoding: "utf8" });
         assert.equal(commit.status, 0, commit.stderr);
+        // Keep CI enabled, but compare fixture revisions instead of the host
+        // repository's pull-request branches or commit SHAs.
+        environment.MOON_BASE = "main";
+        environment.MOON_HEAD = "HEAD";
       }
       running = launch(nook, ["run", "--runner", "--", "npm", "run", "dev"], { cwd: root, env: environment });
       const infos = await waitFor(async () => {
