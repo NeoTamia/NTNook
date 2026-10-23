@@ -151,6 +151,8 @@ pub(crate) struct ManagedChild {
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) start_time_ticks: u64,
+    #[cfg(unix)]
+    terminal: Option<TerminalForeground>,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -192,12 +194,16 @@ impl ManagedChild {
             }
             if let Some(status) = self.child.try_wait().map_err(Error::Spawn)? {
                 #[cfg(unix)]
+                drop(self.terminal.take());
+                #[cfg(unix)]
                 return Ok(status
                     .code()
                     .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
                 #[cfg(windows)]
                 return Ok(status.code().unwrap_or(1));
             }
+            #[cfg(unix)]
+            self.sync_terminal();
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -207,6 +213,36 @@ impl ManagedChild {
             .try_wait()
             .map(|status| status.is_some())
             .map_err(Error::Spawn)
+    }
+
+    #[cfg(unix)]
+    fn sync_terminal(&mut self) {
+        if self.terminal.is_none() && !process_is_stopped(self.pid) {
+            self.terminal = TerminalForeground::claim(self.pgid);
+        }
+        self.follow_stopped_child();
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn follow_stopped_child(&mut self) {
+        if !process_is_stopped(self.pid) {
+            return;
+        }
+        drop(self.terminal.take());
+        // SAFETY: unblock SIGTSTP, restore the default stop action, and
+        // stop this process group so a pipeline job (`nook | cat`) suspends
+        // together. After SIGCONT we re-claim the TTY and continue the child.
+        unsafe {
+            let mut set = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTSTP);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            libc::kill(0, libc::SIGTSTP);
+        }
+        self.terminal = TerminalForeground::claim(self.pgid);
+        let _ = send_group_signal(self.pgid, libc::SIGCONT);
     }
 }
 
@@ -662,6 +698,8 @@ impl RunningChild {
             if self.child.has_exited()? {
                 return Ok(false);
             }
+            #[cfg(unix)]
+            self.child.sync_terminal();
             if !warned && started.elapsed() >= self.readiness_warn_after {
                 warn(&format!(
                     "{} is still not accepting connections on port {}; its route and process remain active (check that it binds HOST and PORT)",
@@ -886,8 +924,15 @@ fn spawn_managed_child(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     configure_child(&mut command);
+    // Acquire before spawn: Command::spawn only returns after exec, so the
+    // child claims the TTY in pre_exec. Nook keeps SIGTTOU ignored so later
+    // wrapper writes survive `stty tostop`.
+    #[cfg(unix)]
+    let terminal = TerminalForeground::acquire();
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
+    #[cfg(unix)]
+    join_child_process_group(pid);
     let Some(identity) = read_process_identity(pid) else {
         cleanup_unidentified_child(&mut child, pid);
         return Err(Error::ProcessIdentity(pid));
@@ -907,11 +952,17 @@ fn spawn_managed_child(
         let _ = child.wait();
         return Err(Error::Spawn(error));
     }
+    #[cfg(unix)]
+    if let Some(terminal) = &terminal {
+        terminal.handoff(identity.pgid);
+    }
     Ok(ManagedChild {
         child,
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
+        #[cfg(unix)]
+        terminal,
         #[cfg(windows)]
         job,
     })
@@ -937,10 +988,113 @@ fn cleanup_unidentified_child(child: &mut Child, _pid: u32) {
 }
 
 #[cfg(unix)]
+struct TerminalForeground {
+    previous_pgid: libc::pid_t,
+    previous_ttou: libc::sighandler_t,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+impl TerminalForeground {
+    fn acquire() -> Option<Self> {
+        // SAFETY: stdin is the caller's inherited terminal, if any. Claiming
+        // only when this process group already owns the foreground avoids
+        // stealing the TTY from the shell after `bg`. SIGTTOU stays ignored
+        // for the rest of the handoff so wrapper writes survive `stty tostop`.
+        unsafe {
+            if libc::isatty(libc::STDIN_FILENO) == 0 {
+                return None;
+            }
+            let previous_pgid = libc::tcgetpgrp(libc::STDIN_FILENO);
+            if !owns_foreground_terminal(previous_pgid, libc::getpgrp()) {
+                return None;
+            }
+            let previous_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            Some(Self {
+                previous_pgid,
+                previous_ttou,
+            })
+        }
+    }
+
+    fn handoff(&self, pgid: i32) {
+        // pre_exec already claimed the TTY. Repeating after spawn would steal
+        // it from a descendant if the child (bash -m) already moved it.
+        unsafe {
+            let current = libc::tcgetpgrp(libc::STDIN_FILENO);
+            if !parent_may_reassign_foreground(current, self.previous_pgid, pgid) {
+                return;
+            }
+            let _ = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+        }
+    }
+
+    fn claim(pgid: i32) -> Option<Self> {
+        let terminal = Self::acquire()?;
+        terminal.handoff(pgid);
+        Some(terminal)
+    }
+
+    fn restore(&self) {
+        unsafe {
+            let _ = libc::tcsetpgrp(libc::STDIN_FILENO, self.previous_pgid);
+            libc::signal(libc::SIGTTOU, self.previous_ttou);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalForeground {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(unix)]
+fn owns_foreground_terminal(foreground_pgid: libc::pid_t, our_pgid: libc::pid_t) -> bool {
+    foreground_pgid >= 0 && foreground_pgid == our_pgid
+}
+
+#[cfg(unix)]
+fn parent_may_reassign_foreground(
+    current: libc::pid_t,
+    previous: libc::pid_t,
+    child: libc::pid_t,
+) -> bool {
+    current == previous || current == child
+}
+
+#[cfg(unix)]
+fn process_is_stopped_state(state: u8) -> bool {
+    state == b'T'
+}
+
+#[cfg(unix)]
+fn process_is_stopped(pid: u32) -> bool {
+    read_process_identity(pid).is_some_and(|identity| process_is_stopped_state(identity.state))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn join_child_process_group(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: pid is the child we just spawned in this session. Fails with
+    // EACCES once the child has exec'd; that race is expected and ignored.
+    unsafe {
+        libc::setpgid(pid, pid);
+    }
+}
+
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn configure_child(command: &mut Command) {
     // SAFETY: this closure runs after fork and before exec. It only invokes
     // async-signal-safe libc syscalls and constructs errors from errno.
+    // The child claims the TTY here because Command::spawn returns only after
+    // exec; permanently ignoring SIGTTIN would turn a too-early stdin read
+    // into EIO instead of blocking until the handoff.
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -952,8 +1106,31 @@ fn configure_child(command: &mut Command) {
             if libc::getppid() == 1 {
                 libc::raise(libc::SIGTERM);
             }
+            claim_controlling_terminal();
             Ok(())
         });
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn claim_controlling_terminal() {
+    // SAFETY: pre_exec; only async-signal-safe syscalls. Take the foreground
+    // when the parent still owns it, then restore default job-control
+    // dispositions so the exec'd program can stop on SIGTSTP/SIGTTIN.
+    unsafe {
+        if libc::isatty(libc::STDIN_FILENO) == 0 {
+            return;
+        }
+        let foreground = libc::tcgetpgrp(libc::STDIN_FILENO);
+        let parent_pgid = libc::getpgid(libc::getppid());
+        if parent_pgid < 0 || foreground != parent_pgid {
+            return;
+        }
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let _ = libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp());
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
     }
 }
 
@@ -1372,6 +1549,13 @@ fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
     })
 }
 
+#[cfg(unix)]
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        drop(self.terminal.take());
+    }
+}
+
 #[cfg(windows)]
 impl Drop for ManagedChild {
     #[allow(unsafe_code)]
@@ -1619,9 +1803,10 @@ mod tests {
     use super::{
         Error, Liveness, LocalOnly, ProcIdentity, ProcessSignal, RunError, RunExposure, StopError,
         StopSystem, child_environment, cleanup_unidentified_child, configure_child,
-        identity_liveness, parse_stat, read_process_identity, readiness_probe_address,
-        reserve_port, spawn_child, start_exposed_run, start_run, start_run_with_hook, stop_managed,
-        substitute_port,
+        identity_liveness, owns_foreground_terminal, parent_may_reassign_foreground, parse_stat,
+        process_is_stopped, process_is_stopped_state, read_process_identity,
+        readiness_probe_address, reserve_port, send_group_signal, spawn_child, start_exposed_run,
+        start_run, start_run_with_hook, stop_managed, substitute_port,
     };
     use crate::config::ResolvedRunConfig;
     use crate::reconcile::{RouteBackend, RouteError, RouteSpec};
@@ -2069,6 +2254,245 @@ mod tests {
         assert_eq!(child.pgid, child.pid as i32);
         assert!(child.start_time_ticks > 0);
         assert_eq!(child.wait().unwrap(), 7);
+    }
+
+    const RAW_STDIN_SESSION_ENV: &str = "NOOK_TEST_RAW_STDIN_SESSION";
+
+    #[test]
+    fn raw_tty_child_is_not_stopped_by_process_group() {
+        if std::env::var_os(RAW_STDIN_SESSION_ENV).is_some() {
+            raw_tty_session_leader();
+            return;
+        }
+        if Command::new("python3")
+            .args(["-c", "import pty"])
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let launcher = r#"
+import os, pty, sys
+exe = sys.argv[1]
+env = os.environ.copy()
+env["NOOK_TEST_RAW_STDIN_SESSION"] = "1"
+pid, _fd = pty.fork()
+if pid == 0:
+    os.execve(exe, [exe, "--exact", "process::tests::raw_tty_child_is_not_stopped_by_process_group", "--test-threads=1", "--nocapture"], env)
+    os._exit(127)
+_, status = os.waitpid(pid, 0)
+if os.WIFEXITED(status):
+    sys.exit(os.WEXITSTATUS(status))
+sys.exit(1)
+"#;
+        let output = Command::new("python3")
+            .args(["-c", launcher])
+            .arg(exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "raw-tty child was stopped or failed: status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn raw_tty_session_leader() {
+        let identity_self = read_process_identity(std::process::id()).unwrap();
+        assert_ne!(
+            identity_self.state, b'T',
+            "session leader must own a running controlling terminal"
+        );
+        let mut child = spawn_child(
+            &[
+                OsString::from("/usr/bin/python3"),
+                OsString::from("-c"),
+                OsString::from(
+                    "import sys, tty, time\ntty.setraw(0)\nsys.stderr.write('setraw-ok\\n')\nsys.stderr.flush()\ntime.sleep(2)\n",
+                ),
+            ],
+            &[],
+        )
+        .unwrap();
+        let started = Instant::now();
+        loop {
+            let identity = read_process_identity(child.pid)
+                .expect("raw-tty child should remain visible in /proc");
+            assert_ne!(
+                identity.state, b'T',
+                "child in a new process group was stopped (SIGTTIN/SIGTTOU) while using raw stdin"
+            );
+            if child.has_exited().unwrap() || started.elapsed() >= Duration::from_millis(400) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !child.has_exited().unwrap() {
+            child.signal(ProcessSignal::Terminate).unwrap();
+        }
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn terminal_is_claimed_only_when_this_process_group_owns_it() {
+        assert!(owns_foreground_terminal(42, 42));
+        assert!(!owns_foreground_terminal(42, 7));
+        assert!(!owns_foreground_terminal(-1, 7));
+    }
+
+    #[test]
+    fn parent_handoff_does_not_steal_a_descendant_foreground() {
+        assert!(parent_may_reassign_foreground(7, 7, 11));
+        assert!(parent_may_reassign_foreground(11, 7, 11));
+        assert!(!parent_may_reassign_foreground(13, 7, 11));
+    }
+
+    #[test]
+    fn stopped_states_are_job_control_stops() {
+        assert!(process_is_stopped_state(b'T'));
+        assert!(!process_is_stopped_state(b't'));
+        assert!(!process_is_stopped_state(b'S'));
+        assert!(!process_is_stopped_state(b'R'));
+    }
+
+    const JOB_CONTROL_SESSION_ENV: &str = "NOOK_TEST_JOB_CONTROL_SESSION";
+
+    #[test]
+    fn stopped_child_suspends_until_continued() {
+        if std::env::var_os(JOB_CONTROL_SESSION_ENV).is_some() {
+            job_control_session_leader();
+            return;
+        }
+        if Command::new("python3")
+            .args(["-c", "import pty"])
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let launcher = r#"
+import fcntl, os, select, signal, sys, termios, time
+exe = sys.argv[1]
+env = os.environ.copy()
+env["NOOK_TEST_JOB_CONTROL_SESSION"] = "1"
+master, slave = os.openpty()
+shell = os.fork()
+if shell == 0:
+    os.close(master)
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    os.dup2(slave, 0)
+    os.dup2(slave, 1)
+    os.dup2(slave, 2)
+    if slave > 2:
+        os.close(slave)
+    nook = os.fork()
+    if nook == 0:
+        os.setpgid(0, 0)
+        os.execve(exe, [exe, "--exact", "process::tests::stopped_child_suspends_until_continued", "--test-threads=1", "--nocapture"], env)
+        os._exit(127)
+    os.setpgid(nook, nook)
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    os.tcsetpgrp(0, nook)
+    saw_stop = False
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        wpid, status = os.waitpid(nook, os.WUNTRACED | os.WNOHANG)
+        if wpid == 0:
+            time.sleep(0.05)
+            continue
+        if os.WIFSTOPPED(status):
+            saw_stop = True
+            os.kill(nook, signal.SIGCONT)
+            continue
+        if os.WIFEXITED(status):
+            if not saw_stop:
+                os.write(2, b"wrapper never stopped\n")
+                os._exit(2)
+            os._exit(os.WEXITSTATUS(status))
+        os._exit(1)
+    os.write(2, b"timed out waiting for job-control stop\n")
+    os._exit(3)
+os.close(slave)
+deadline = time.time() + 9
+while time.time() < deadline:
+    readable, _, _ = select.select([master], [], [], 0.05)
+    if master in readable:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            chunk = b""
+        if chunk:
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+    wpid, status = os.waitpid(shell, os.WNOHANG)
+    if wpid == 0:
+        continue
+    if os.WIFEXITED(status):
+        sys.exit(os.WEXITSTATUS(status))
+    sys.exit(1)
+sys.stderr.write("timed out waiting for session shell\n")
+sys.exit(3)
+"#;
+        let output = Command::new("python3")
+            .args(["-c", launcher])
+            .arg(exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "job-control child did not suspend the wrapper: status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn job_control_session_leader() {
+        let mut sibling = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let sibling_pid = sibling.id();
+        let sibling_ready = Instant::now() + Duration::from_secs(1);
+        while read_process_identity(sibling_pid).is_none() {
+            assert!(
+                Instant::now() < sibling_ready,
+                "pipeline sibling did not start"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut child =
+            spawn_child(&[OsString::from("/bin/sleep"), OsString::from("30")], &[]).unwrap();
+        send_group_signal(child.pgid, libc::SIGTSTP).unwrap();
+        let stop_deadline = Instant::now() + Duration::from_secs(1);
+        while !process_is_stopped(child.pid) {
+            assert!(
+                Instant::now() < stop_deadline,
+                "child did not stop after SIGTSTP"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.follow_stopped_child();
+        assert!(
+            process_is_stopped(sibling_pid),
+            "wrapper SIGTSTP must stop the rest of its process group"
+        );
+        let continue_deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_stopped(child.pid) {
+            assert!(
+                Instant::now() < continue_deadline,
+                "child did not continue after wrapper SIGCONT"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+        child.signal(ProcessSignal::Terminate).unwrap();
+        let _ = child.wait();
     }
 
     #[test]
