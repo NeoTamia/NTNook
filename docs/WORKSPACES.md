@@ -113,8 +113,12 @@ The tested Yarn foreach, direct Nx and Lerna continuous-task configurations keep
 persistent siblings alive after a member error. Nook keeps the session and its
 ports available for a restart. The gate verifies that the sibling still serves
 HTTP, then ends the remaining tasks successfully and checks that the runner
-reports the original failure and Nook cleans up. pnpm, Bun, Vite Task and the
-moon system-task fixture stop their peers when the member fails.
+reports the original failure and Nook cleans up. For Nx and Lerna, the gate waits
+until Nx observes the failed task before ending its dependent. Nx can otherwise
+classify a continuous task as fulfilled and return success if its dependents have
+already finished, even when that task exits nonzero. Nook preserves the runner's
+actual exit code. pnpm, Bun, Vite Task and the moon system-task fixture stop their
+peers when the member fails.
 
 ### Turborepo
 

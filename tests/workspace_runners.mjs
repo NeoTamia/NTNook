@@ -365,7 +365,17 @@ API_UPSTREAM = "\${api.upstream}"
       // A real package failure must reach the root, clean routes, and stop peers.
       for (const id of ["api", "web"]) await rm(path.join(root, "apps", id, "started.json"), { force: true });
       await rm(path.join(root, "apps/watcher/watcher-ran"));
-      running = launch(nook, ["run", "--runner", "--", "npm", "run", "dev"], { cwd: root, env: environment });
+      const runnerExitProbe = path.join(root, "runner-exit-probe.mjs");
+      await writeFile(runnerExitProbe, `
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+const runner = spawn('npm', ['run', 'dev'], {stdio:'inherit'});
+runner.on('exit', (code, signal) => {
+  fs.writeFileSync('runner-exit.json', JSON.stringify({code, signal}));
+  process.exitCode = code ?? 1;
+});
+`);
+      running = launch(nook, ["run", "--runner", "--", process.execPath, runnerExitProbe], { cwd: root, env: environment });
       const failedInfos = await waitFor(() => Promise.all(["api", "web"].map(async (id) => JSON.parse(await readFile(path.join(root, "apps", id, "started.json"), "utf8")))), "apps before package error");
       const failedWatcherPid = Number(await waitFor(() => readFile(path.join(root, "apps/watcher/watcher-ran"), "utf8"), "watcher before package error"));
       await writeFile(path.join(root, "apps/api/fail-server"), "fail");
@@ -376,12 +386,20 @@ API_UPSTREAM = "\${api.upstream}"
           try { return /\) [ZX] /.test(await readFile(`/proc/${failedInfos[0].pid}/stat`, "utf8")); }
           catch (error) { if (error.code === "ENOENT") return true; throw error; }
         }, "failed member exits");
+        if (["lerna", "nx"].includes(runner)) {
+          // Server exit precedes npm/wrapper completion. Nx must observe the
+          // failure while its dependent is still alive, or it may mark it fulfilled.
+          await waitFor(() => /Task "@fixture\/api:dev" is continuous but exited with code [1-9]\d*/.test(running.log()), "Nx observes failed API task");
+        }
         assert.equal(running.child.exitCode, null, "runner waits for other persistent tasks");
         assert.equal((await adminConfig("http://127.0.0.1", "web.runner.localhost")).pid, failedInfos[1].pid, "sibling still serves HTTP after member failure");
         process.kill(failedInfos[1].pid, "SIGTERM");
         process.kill(failedWatcherPid, "SIGTERM");
       }
       await waitFor(() => running.child.exitCode !== null, "package failure reaches workspace root");
+      const runnerExit = JSON.parse(await readFile(path.join(root, "runner-exit.json"), "utf8"));
+      assert.equal(runnerExit.signal, null, running.log());
+      assert.equal(running.child.exitCode, runnerExit.code, "Nook preserves the runner's exit code");
       assert.notEqual(running.child.exitCode, 0, running.log());
       await rm(path.join(root, "apps/api/fail-server"));
       for (const { pid } of [...failedInfos, { pid: failedWatcherPid }]) {
