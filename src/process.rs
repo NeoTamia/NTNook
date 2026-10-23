@@ -3452,10 +3452,16 @@ sys.exit(3)
             thread::sleep(Duration::from_millis(20));
         }
         assert!(child.try_wait().unwrap().is_none());
-        assert!(
-            process_is_stopped(sibling_pid),
-            "wrapper SIGTSTP must stop the rest of its process group"
-        );
+        // The shell can resume the wrapper before its sibling has processed
+        // the group stop signal. Wait for the observable state, not scheduling.
+        let sibling_stop_deadline = Instant::now() + Duration::from_secs(1);
+        while !process_is_stopped(sibling_pid) {
+            assert!(
+                Instant::now() < sibling_stop_deadline,
+                "wrapper SIGTSTP must stop the rest of its process group"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         let continue_deadline = Instant::now() + Duration::from_secs(1);
         while process_is_stopped(child.pid) {
             assert!(
