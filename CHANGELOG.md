@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.9.1](https://github.com/NeoTamia/NTNook/compare/v0.9.0...v0.9.1) (2026-10-23)
+
+
+### 🐛 Bug Fixes
+
+* **run:** Claim the TTY before exec and keep wrapper SIGTTOU ignored ([d4a070c](https://github.com/NeoTamia/NTNook/commit/d4a070cb0e5798cfbaf28d6e35d7e163110b4c6c))
+* **run:** Claim the TTY on fg and ignore ptrace stops ([43f7bf8](https://github.com/NeoTamia/NTNook/commit/43f7bf8589cb6a500a619857ae97e6435b7d1706))
+* **run:** Claim the TTY only when nook owns the foreground ([9152dc3](https://github.com/NeoTamia/NTNook/commit/9152dc3b4b61982e2a79f236629cb022f264a96f))
+* **run:** Do not steal the TTY from a child's descendant ([a2e85a3](https://github.com/NeoTamia/NTNook/commit/a2e85a38dc118a940709a929d7353857b630abb6))
+* **run:** Give the child the terminal so raw-mode CLIs keep running ([e2c199c](https://github.com/NeoTamia/NTNook/commit/e2c199c80e786a598d743905412b4b149607472d))
+* **run:** Stop the wrapper process group on child SIGTSTP ([c38d1ed](https://github.com/NeoTamia/NTNook/commit/c38d1eda33987920d6715b15470a5fa2edc79c76))
+* **run:** Suspend nook when the child is job-control stopped ([8307123](https://github.com/NeoTamia/NTNook/commit/8307123f8ec99185d5657883c2966ee83fb80b71))
+
+
+### 🔧 Build System
+
+* **deps:** Lock file maintenance ([#31](https://github.com/NeoTamia/NTNook/issues/31)) ([7ae6e31](https://github.com/NeoTamia/NTNook/commit/7ae6e31aec8f7c55068cb7bed1bdf9968e37c79f))
+* **deps:** Update caddy:2.11.7-alpine docker digest to eb4d35b ([#74](https://github.com/NeoTamia/NTNook/issues/74)) ([0b5f116](https://github.com/NeoTamia/NTNook/commit/0b5f116957b62eec53527b82a5a6051c1f1eaf68))
+* **deps:** Update pnpm to v12.14.0 ([#66](https://github.com/NeoTamia/NTNook/issues/66)) ([f7ea75d](https://github.com/NeoTamia/NTNook/commit/f7ea75da59e5128b82f099d4c11024c1f101c358))
+* **deps:** Update rust crate libc to v0.2.191 ([#69](https://github.com/NeoTamia/NTNook/issues/69)) ([d43f163](https://github.com/NeoTamia/NTNook/commit/d43f163073e7d422e7e4a8d4f16d7fcdafcf7503))
+* **deps:** Update rust crate mdns-sd to v0.21.6 ([#70](https://github.com/NeoTamia/NTNook/issues/70)) ([aaffbbf](https://github.com/NeoTamia/NTNook/commit/aaffbbfa05e86a6715d36fc334374b0b46178a15))
+* **deps:** Update rust crate ureq to v3.5.0 ([#73](https://github.com/NeoTamia/NTNook/issues/73)) ([c5b2273](https://github.com/NeoTamia/NTNook/commit/c5b22737928867cb47bafcfef86072958500099c))
+* **deps:** Update rust to v1.99.1 ([#65](https://github.com/NeoTamia/NTNook/issues/65)) ([947da60](https://github.com/NeoTamia/NTNook/commit/947da60be7b7e7a8d30a3f02bcd626db988b51d1))
+* **deps:** Update rust-lang/crates-io-auth-action action to v1.0.6 ([#72](https://github.com/NeoTamia/NTNook/issues/72)) ([e081877](https://github.com/NeoTamia/NTNook/commit/e08187720b328fbaa12ff20c1c27a229e210df22))
+
 ## [0.9.0](https://github.com/NeoTamia/NTNook/compare/v0.8.0...v0.9.0) (2026-10-16)
 
 
