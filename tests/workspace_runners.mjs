@@ -271,7 +271,7 @@ export default {
         await mkdir(path.join(root, ".moon"));
         await writeFile(path.join(root, ".moon/workspace.yml"), "projects:\n  api: apps/api\n  web: apps/web\n  watcher: apps/watcher\ntelemetry: false\npipeline:\n  installDependencies: false\nvcs:\n  client: git\n  defaultBranch: main\n");
         for (const id of ["api", "web", "watcher"]) {
-          await writeFile(path.join(root, "apps", id, "moon.yml"), "tasks:\n  dev:\n    command: npm run dev\n    toolchains: system\n    options:\n      cache: false\n      persistent: true\n      outputStyle: stream\n");
+          await writeFile(path.join(root, "apps", id, "moon.yml"), "tasks:\n  dev:\n    command: npm run dev\n    toolchains: system\n    options:\n      cache: false\n      persistent: true\n      runInCI: true\n      outputStyle: stream\n");
         }
       }
       await writeFile(path.join(root, "nook.toml"), `

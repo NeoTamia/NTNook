@@ -221,8 +221,10 @@ tasks:
 
 `moon run :dev` starts the two apps and watcher; `moon run api:dev` selects the
 API. The fixture has a Git HEAD, disables automatic dependency installation,
-and needs no managed toolchain download. This validates the inherited session
-contract for system tasks, not moon's managed Node toolchain, affected runs,
+and needs no managed toolchain download. Its test tasks explicitly set
+`runInCI: true`, since moon excludes persistent tasks in CI by default. Regular
+local development does not need this test-only opt-in. This validates the inherited
+session contract for system tasks, not moon's managed Node toolchain, affected runs,
 remote caching, wait dependencies or daemon integration. The npm CLI release
 2.6.3 referenced an unpublished Linux native package when checked, so the gate
 pins the complete 2.6.2 release.
