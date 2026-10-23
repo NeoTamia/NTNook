@@ -2099,6 +2099,13 @@ fn process_liveness(pid: u32, start_time_ticks: u64) -> Liveness {
 /// Kill only a currently verified managed application group/job. A matching
 /// Unix zombie still proves group ownership; missing/reused PIDs do not.
 pub(crate) fn kill_owned_lease(lease: &Lease) -> Result<(), Error> {
+    signal_owned_lease(lease, ProcessSignal::Kill).map(|_| ())
+}
+
+/// Signal only a verified independent application group, including a zombie
+/// leader that still proves ownership. All signal kinds share the same guards.
+/// Returns true only when delivered; missing/reused identities are a false no-op.
+pub(crate) fn signal_owned_lease(lease: &Lease, signal: ProcessSignal) -> Result<bool, Error> {
     match lease_liveness(lease) {
         Liveness::Dead => {
             #[cfg(unix)]
@@ -2107,10 +2114,10 @@ pub(crate) fn kill_owned_lease(lease: &Lease) -> Result<(), Error> {
                     && identity.pgid == lease.pgid
                     && identity.start_time_ticks == lease.process_start_time_ticks
             }) {
-                return Ok(());
+                return Ok(false);
             }
             #[cfg(windows)]
-            return Ok(());
+            return Ok(false);
         }
         Liveness::Indeterminate => return Err(Error::ProcessIdentity(lease.pid)),
         Liveness::Alive => {}
@@ -2150,11 +2157,18 @@ pub(crate) fn kill_owned_lease(lease: &Lease) -> Result<(), Error> {
     }
     #[cfg(unix)]
     {
-        signal_lease(lease, ProcessSignal::Kill).map_err(Error::Spawn)
+        signal_lease(lease, signal)
+            .map(|()| true)
+            .map_err(Error::Spawn)
     }
     #[cfg(windows)]
     {
-        kill_owned_job(lease).map_err(Error::Spawn)
+        match signal {
+            ProcessSignal::Kill => kill_owned_job(lease),
+            _ => signal_lease(lease, signal),
+        }
+        .map(|()| true)
+        .map_err(Error::Spawn)
     }
 }
 
@@ -2251,78 +2265,8 @@ fn cleanup_marked_workspace_processes(
     claim: Option<Uuid>,
     started_after: u64,
 ) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let markers = RecoveryMarkers::new(path, claim);
-    let uid = fs::metadata("/proc/self")?.uid();
-    let namespace = fs::read_link("/proc/self/ns/user")?;
-    let uid_map = fs::read("/proc/self/uid_map")?;
     let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let mut found = false;
-        for entry in fs::read_dir("/proc")? {
-            let entry = entry?;
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            if pid == std::process::id() {
-                continue;
-            }
-            // An inaccessible candidate is not proof of workspace ownership.
-            // Establish the exact marker before treating inspection failures as
-            // recovery errors, so unrelated protected processes cannot block it.
-            let Ok(environment) = fs::read(entry.path().join("environ")) else {
-                continue;
-            };
-            if !markers.matches(&environment) {
-                continue;
-            }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if metadata.uid() != uid {
-                continue;
-            }
-            let Some(identity) = read_process_identity(pid) else {
-                if entry.path().exists() {
-                    return Err(io::Error::other(
-                        "cannot verify workspace candidate identity",
-                    ));
-                }
-                continue;
-            };
-            if matches!(identity.state, b'Z' | b'X') {
-                continue;
-            }
-            // Exact inherited ownership also covers setsid descendants and
-            // processes launched before their lease association was persisted.
-            if identity.start_time_ticks < started_after {
-                continue;
-            }
-            // Host processes mapped into a test's user namespace are not
-            // candidates, even when their displayed uid happens to match.
-            match fs::read(entry.path().join("uid_map")) {
-                Ok(candidate_map) if candidate_map != uid_map => continue,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-                Ok(_) => {}
-            }
-            match fs::read_link(entry.path().join("ns/user")) {
-                Ok(candidate_namespace) if candidate_namespace != namespace => continue,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-                Ok(_) => {}
-            }
-            found |= kill_marked_process(pid, identity, &markers)?;
-        }
-        if !found {
-            return Ok(());
-        }
+    while signal_marked_workspace_processes(path, claim, started_after, ProcessSignal::Kill, &[])? {
         if Instant::now() >= deadline {
             return Err(io::Error::other(
                 "workspace descendants have not exited; retry prune",
@@ -2330,14 +2274,97 @@ fn cleanup_marked_workspace_processes(
         }
         thread::sleep(Duration::from_millis(10));
     }
+    Ok(())
+}
+
+/// One pass over exactly marked descendants. Graceful shutdown uses the same
+/// identity, namespace and pidfd protections as forced recovery. Skip groups
+/// only after a verified group signal was actually delivered to them.
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_marked_workspace_processes(
+    path: &std::path::Path,
+    claim: Option<Uuid>,
+    started_after: u64,
+    signal: ProcessSignal,
+    signaled_groups: &[i32],
+) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let markers = RecoveryMarkers::new(path, claim);
+    let uid = fs::metadata("/proc/self")?.uid();
+    let namespace = fs::read_link("/proc/self/ns/user")?;
+    let uid_map = fs::read("/proc/self/uid_map")?;
+    let mut found = false;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        // An inaccessible candidate is not proof of workspace ownership.
+        // Establish the exact marker before treating inspection failures as
+        // recovery errors, so unrelated protected processes cannot block it.
+        let Ok(environment) = fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        if !markers.matches(&environment) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.uid() != uid {
+            continue;
+        }
+        let Some(identity) = read_process_identity(pid) else {
+            if entry.path().exists() {
+                return Err(io::Error::other(
+                    "cannot verify workspace candidate identity",
+                ));
+            }
+            continue;
+        };
+        if matches!(identity.state, b'Z' | b'X') || signaled_groups.contains(&identity.pgid) {
+            continue;
+        }
+        // Exact inherited ownership also covers setsid descendants and
+        // processes launched before their lease association was persisted.
+        if identity.start_time_ticks < started_after {
+            continue;
+        }
+        // Host processes mapped into a test's user namespace are not
+        // candidates, even when their displayed uid happens to match.
+        match fs::read(entry.path().join("uid_map")) {
+            Ok(candidate_map) if candidate_map != uid_map => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        match fs::read_link(entry.path().join("ns/user")) {
+            Ok(candidate_namespace) if candidate_namespace != namespace => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        found |= signal_marked_process(pid, identity, &markers, signal)?;
+    }
+    Ok(found)
 }
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn kill_marked_process(
+fn signal_marked_process(
     pid: u32,
     expected: ProcIdentity,
     markers: &RecoveryMarkers,
+    signal: ProcessSignal,
 ) -> io::Result<bool> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // Open before re-reading /proc. Even if the numeric PID is reused during
@@ -2368,11 +2395,16 @@ fn kill_marked_process(
     if !markers.matches(&environment) {
         return Ok(false);
     }
+    let signal = match signal {
+        ProcessSignal::Interrupt => libc::SIGINT,
+        ProcessSignal::Terminate => libc::SIGTERM,
+        ProcessSignal::Kill => libc::SIGKILL,
+    };
     let result = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             fd.as_raw_fd(),
-            libc::SIGKILL,
+            signal,
             std::ptr::null::<libc::siginfo_t>(),
             0,
         )
@@ -2961,7 +2993,8 @@ mod tests {
         ready.clear();
         output.read_line(&mut ready).unwrap();
         assert_eq!(ready.trim(), "protected");
-        let result = super::kill_marked_process(owned.id(), identity, &markers);
+        let result =
+            super::signal_marked_process(owned.id(), identity, &markers, ProcessSignal::Kill);
         let owned_alive = owned.try_wait().unwrap().is_none();
         owned.kill().unwrap();
         owned.wait().unwrap();
@@ -2994,12 +3027,15 @@ mod tests {
             start_time_ticks: identity.start_time_ticks + 1,
             ..identity
         };
-        assert!(!super::kill_marked_process(child.pid, reused, &marker).unwrap());
         assert!(
-            !super::kill_marked_process(
+            !super::signal_marked_process(child.pid, reused, &marker, ProcessSignal::Kill).unwrap()
+        );
+        assert!(
+            !super::signal_marked_process(
                 child.pid,
                 identity,
-                &super::RecoveryMarkers::new(std::path::Path::new("/foreign/context.json"), None)
+                &super::RecoveryMarkers::new(std::path::Path::new("/foreign/context.json"), None),
+                ProcessSignal::Kill
             )
             .unwrap()
         );
@@ -3010,7 +3046,10 @@ mod tests {
             state: b'R',
             ..read_process_identity(child.pid).unwrap()
         };
-        assert!(super::kill_marked_process(child.pid, changed_state, &marker).unwrap());
+        assert!(
+            super::signal_marked_process(child.pid, changed_state, &marker, ProcessSignal::Kill)
+                .unwrap()
+        );
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
     }
 
@@ -3512,9 +3551,22 @@ sys.exit(3)
         });
         let refused = super::kill_owned_lease(&lease).is_err();
         let still_running = child.try_wait().unwrap().is_none();
-        child.signal(ProcessSignal::Kill).unwrap();
-        child.wait().unwrap();
+        lease.workspace_supervisor = None;
+        lease.process_start_time_ticks += 1;
+        let reused = super::signal_owned_lease(&lease, ProcessSignal::Terminate).unwrap();
+        let survived_reused = child.try_wait().unwrap().is_none();
+        lease.process_start_time_ticks -= 1;
+        let delivered = super::signal_owned_lease(&lease, ProcessSignal::Terminate).unwrap();
+        let code = child.wait().unwrap();
+        let missing = super::signal_owned_lease(&lease, ProcessSignal::Terminate).unwrap();
         assert!(refused && still_running);
+        assert!(
+            !reused && survived_reused,
+            "a reused identity must report no delivery"
+        );
+        assert!(delivered, "a verified group signal must report delivery");
+        assert_eq!(code, 128 + libc::SIGTERM);
+        assert!(!missing, "a reaped process must report no delivery");
     }
 
     #[test]

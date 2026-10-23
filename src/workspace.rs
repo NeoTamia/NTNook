@@ -45,6 +45,15 @@ impl ChildTree {
         Self(child, false)
     }
 
+    fn wait_for_shutdown(&mut self, deadline: Instant) {
+        // A shell/package-manager leader can exit while its descendants are
+        // still handling the signal. Reap it, but preserve the tree's grace.
+        while Instant::now() < deadline {
+            let _ = self.0.try_wait();
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn stop(&mut self) {
         if self.1 {
             return;
@@ -161,14 +170,26 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
         },
         associate_member,
     )?);
+    let mut graceful = false;
     let result = (|| -> crate::Result<i32> {
         let store = Store::new(member.state_path().to_owned());
         loop {
             if let Some(code) = child.0.try_wait().map_err(process::RunError::from)? {
+                // Root shutdown may have signaled the group before this tick.
+                // A leader's exit must not bypass its descendants' grace, but
+                // an unsolicited exit in a live session still cleans up now.
+                graceful = !signals.pending().is_empty() || member.check_live().is_err();
                 return Ok(code);
             }
             if let Some(signal) = signals.pending().first() {
-                let _ = child.0.signal_foreground(*signal);
+                // A closing root signals the entire owned tree itself, after
+                // freezing spawns. Do not forward its signal a second time.
+                if member.check_live().is_ok()
+                    || process::lease_liveness(member.supervisor()) != process::Liveness::Alive
+                {
+                    let _ = child.0.signal_foreground(*signal);
+                }
+                graceful = true;
                 return Ok(if *signal == ProcessSignal::Interrupt {
                     130
                 } else {
@@ -177,7 +198,16 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
             }
             // Recheck the context as well as the root identity: closing a live
             // root session must also end independent member process groups.
-            member.check_live()?;
+            if let Err(error) = member.check_live() {
+                // Root teardown closes the context before signaling children.
+                // Its close notification must not bypass the shutdown grace.
+                // A dead root cannot send that signal, so do it on its behalf.
+                if process::lease_liveness(member.supervisor()) != process::Liveness::Alive {
+                    let _ = child.0.signal_foreground(ProcessSignal::Terminate);
+                }
+                graceful = true;
+                return Err(error);
+            }
             let owned = store
                 .load()?
                 .leases
@@ -195,6 +225,9 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
             thread::sleep(Duration::from_millis(20));
         }
     })();
+    if graceful {
+        child.wait_for_shutdown(Instant::now() + Duration::from_secs(2));
+    }
     child.stop();
     let cleanup = member.cleanup_child(&child.0);
     drop(child);
@@ -308,6 +341,7 @@ pub(crate) struct RunningWorkspace {
 struct RunnerTree {
     owner: SessionOwner,
     child: ChildTree,
+    lease: Lease,
     store: Store,
     group_id: Uuid,
     supervisor: WorkspaceSupervisor,
@@ -315,7 +349,7 @@ struct RunnerTree {
 }
 
 impl RunnerTree {
-    fn stop(&mut self) -> Vec<String> {
+    fn stop(&mut self, signal: Option<ProcessSignal>) -> Vec<String> {
         if self.stopped {
             return Vec::new();
         }
@@ -348,6 +382,51 @@ impl RunnerTree {
                 }
             }
             Err(error) => warnings.push(format!("cannot read workspace children: {error}")),
+        }
+        if let Some(signal) = signal {
+            #[cfg(target_os = "linux")]
+            {
+                // A durable identity still authorizes its group when a server
+                // makes /proc/environ unreadable. Signal known groups first;
+                // only actual delivery may suppress the marker scan's signal.
+                let mut signaled_groups = Vec::new();
+                for child in children.values().chain(std::iter::once(&self.lease)) {
+                    match process::signal_owned_lease(child, signal) {
+                        Ok(true) => signaled_groups.push(child.pgid),
+                        Ok(false) => {}
+                        Err(error) => warnings.push(format!(
+                            "cannot signal workspace child {}: {error}",
+                            child.pid
+                        )),
+                    }
+                }
+                if let Err(error) = process::signal_marked_workspace_processes(
+                    self.owner.path(),
+                    None,
+                    self.supervisor.process_start_time_ticks,
+                    signal,
+                    &signaled_groups,
+                ) {
+                    warnings.push(format!("cannot signal workspace processes: {error}"));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = self.child.0.signal_foreground(signal);
+                for child in children.values() {
+                    if let Err(error) = process::signal_owned_lease(child, signal) {
+                        warnings.push(format!(
+                            "cannot signal workspace child {}: {error}",
+                            child.pid
+                        ));
+                    }
+                }
+            }
+            // The runner leader can exit before non-HTTP tasks and detached
+            // descendants finish. Give the entire frozen tree the same bound,
+            // rather than treating the leader's exit as proof of tree exit.
+            self.child
+                .wait_for_shutdown(Instant::now() + Duration::from_secs(2));
         }
         for child in children.values() {
             if let Err(error) = process::kill_owned_lease(child) {
@@ -405,7 +484,7 @@ impl RunnerTree {
 
 impl Drop for RunnerTree {
     fn drop(&mut self) {
-        self.stop();
+        self.stop(None);
     }
 }
 
@@ -501,9 +580,24 @@ impl PreparedWorkspace {
                 )
                 .map_err(process::RunError::from)?,
             );
+            let lease = Lease {
+                id: self.group_id,
+                group_id: Some(self.group_id),
+                workspace_supervisor: Some(root_supervisor.clone()),
+                lan: false,
+                hostname: String::new(),
+                target: String::new(),
+                scheme: crate::state::Scheme::Http,
+                tls: false,
+                pid: child.0.pid,
+                pgid: child.0.pgid,
+                process_start_time_ticks: child.0.start_time_ticks,
+                state: LeaseState::Starting,
+            };
             runner = Some(RunnerTree {
                 owner: unstarted_owner.take().expect("created"),
                 child,
+                lease,
                 store: Store::new(store.path().to_owned()),
                 group_id: self.group_id,
                 supervisor: root_supervisor.clone(),
@@ -513,25 +607,11 @@ impl PreparedWorkspace {
             // be replaced. The earlier group journal and marker cover a crash
             // between spawn and this write.
             store.mutate(|registry| {
-                let child = &runner.as_ref().expect("spawned").child.0;
                 registry
                     .workspace_groups
                     .get_mut(&self.group_id)
                     .expect("journaled")
-                    .runner = Some(Lease {
-                    id: self.group_id,
-                    group_id: Some(self.group_id),
-                    workspace_supervisor: Some(root_supervisor.clone()),
-                    lan: false,
-                    hostname: String::new(),
-                    target: String::new(),
-                    scheme: crate::state::Scheme::Http,
-                    tls: false,
-                    pid: child.pid,
-                    pgid: child.pgid,
-                    process_start_time_ticks: child.start_time_ticks,
-                    state: LeaseState::Starting,
-                });
+                    .runner = Some(runner.as_ref().expect("spawned").lease.clone());
                 Ok(())
             })?;
             let entries: Vec<_> = self
@@ -581,13 +661,14 @@ impl PreparedWorkspace {
         let mut runner = runner.expect("committed runner");
         let started = Instant::now();
         let mut readiness = vec![(None, false, false); self.apps.len()];
+        let mut shutdown_signal = ProcessSignal::Terminate;
         let result = (|| -> crate::Result<i32> {
             for warning in startup? {
                 warn(&warning);
             }
             loop {
                 if let Some(signal) = self.signals.pending().first() {
-                    let _ = runner.child.0.signal_foreground(*signal);
+                    shutdown_signal = *signal;
                     return Ok(if *signal == ProcessSignal::Interrupt {
                         130
                     } else {
@@ -679,7 +760,7 @@ impl PreparedWorkspace {
                 thread::sleep(Duration::from_millis(20));
             }
         })();
-        let mut warnings = runner.stop();
+        let mut warnings = runner.stop(result.is_ok().then_some(shutdown_signal));
         let mut cleanup_error = None;
         for (app, run) in self.apps.iter().zip(&prepared_runs) {
             match process::cleanup_run_route(

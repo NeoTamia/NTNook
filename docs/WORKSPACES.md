@@ -104,6 +104,10 @@ when run outside a workspace session. Nook does not change the runner's failure
 policy: a member can exit while other tasks continue. The prepared route and port
 remain owned by the live session, allowing that member to restart on the same port.
 When the root command exits, Nook stops the remaining children and removes routes.
+On an interrupt, termination signal, or orderly runner exit, Nook allows two
+seconds for application shutdown handlers before forcibly stopping remaining
+owned processes. The same grace period applies when signaling an individual
+session member.
 
 The tested Yarn foreach, direct Nx and Lerna continuous-task configurations keep
 persistent siblings alive after a member error. Nook keeps the session and its

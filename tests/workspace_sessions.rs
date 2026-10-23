@@ -62,3 +62,594 @@ fn external_runner_requires_a_workspace_and_its_own_command() {
     }
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(unix)]
+#[path = "support/caddy.rs"]
+mod caddy;
+
+#[cfg(unix)]
+mod shutdown {
+    use super::caddy;
+    use super::*;
+    use serde_json::Value;
+    use std::fs::File;
+    use std::process::{Child, ExitStatus, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const SERVER: &str = r#"
+import http.server, os, pathlib, signal, subprocess, sys, time
+role = sys.argv[1]
+def record(file, value):
+    path = pathlib.Path(file)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(value)
+    temporary.replace(path)
+def stop(sig, frame):
+    def repeated(sig, frame):
+        pathlib.Path(role + '-duplicate').write_text(str(sig))
+    signal.signal(signal.SIGINT, repeated)
+    signal.signal(signal.SIGTERM, repeated)
+    record(role + '-stopping', str(sig))
+    time.sleep(.35 if role == 'task' else .2)
+    record(role + '-clean', str(sig))
+    sys.exit(0)
+for sig in [signal.SIGINT, signal.SIGTERM]:
+    signal.signal(sig, signal.SIG_IGN if os.environ.get('STUBBORN') and role == 'api' else stop)
+if role != 'task':
+    server = http.server.HTTPServer((os.environ['HOST'], int(os.environ['PORT'])), http.server.SimpleHTTPRequestHandler)
+    detached = subprocess.Popen([sys.executable, '-c', 'import signal,time;signal.signal(signal.SIGINT,signal.SIG_IGN);signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)'], start_new_session=True)
+    record(role + '-detached', str(detached.pid))
+if os.environ.get('NONDUMPABLE') and role == 'api':
+    import ctypes
+    assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0
+record(role + '-pid', str(os.getpid()))
+while True:
+    if pathlib.Path('exit-api').exists() and role == 'api':
+        sys.exit(23)
+    time.sleep(.01)
+"#;
+
+    const RUNNER: &str = r#"
+import os, pathlib, signal, subprocess, sys, time
+root = pathlib.Path.cwd()
+def stop(sig, frame):
+    def repeated(sig, frame):
+        pathlib.Path('runner-duplicate').write_text(str(sig))
+    signal.signal(signal.SIGINT, repeated)
+    signal.signal(signal.SIGTERM, repeated)
+    time.sleep(.05)
+    pathlib.Path('runner-clean').write_text(str(sig))
+    sys.exit(0)
+for sig in [signal.SIGINT, signal.SIGTERM]:
+    signal.signal(sig, stop)
+pathlib.Path('context').write_text(os.environ['NOOK_WORKSPACE_SESSION'])
+def member(role):
+    argv = [sys.executable, str(root/'server.py'), role]
+    if os.environ.get('SHELL_MEMBER'):
+        argv = ['/bin/sh', '-c', 'trap "exit 130" INT; trap "exit 143" TERM; "$@" & wait "$!"', 'nook-test-shell', *argv]
+    return subprocess.Popen([os.environ['TEST_NOOK'], 'run', '--', *argv], cwd=root/role)
+children = {role: member(role) for role in ['api', 'web']}
+task = subprocess.Popen([sys.executable, 'server.py', 'task'], start_new_session=True)
+while True:
+    protected = root/'api/api-pid'
+    if os.environ.get('NONDUMPABLE') and protected.exists() and not (root/'api-unreadable').exists():
+        pid = int(protected.read_text())
+        try:
+            pathlib.Path('/proc/'+str(pid)+'/environ').read_bytes()
+        except PermissionError:
+            (root/'api-unreadable').write_text('verified')
+        else:
+            raise AssertionError('nondumpable server environment must be unreadable')
+    for role, child in children.items():
+        code = child.poll()
+        if code is not None:
+            temporary = pathlib.Path(role + '-exit.tmp')
+            temporary.write_text(str(code))
+            temporary.replace(role + '-exit')
+    if pathlib.Path('restart-api').exists():
+        for file in ['api-exit', 'api/api-pid', 'api/api-clean', 'api/exit-api']:
+            (root/file).unlink(missing_ok=True)
+        children['api'] = member('api')
+        pathlib.Path('restart-api').unlink()
+    if pathlib.Path('exit-runner').exists():
+        sys.exit(7)
+    time.sleep(.01)
+"#;
+
+    struct Fixture {
+        caddy: caddy::CaddyHarness,
+        child: Child,
+    }
+
+    impl Fixture {
+        fn start(stubborn: bool) -> Self {
+            Self::start_with(stubborn, false, false)
+        }
+
+        fn start_with(stubborn: bool, nondumpable: bool, shell: bool) -> Self {
+            let caddy = caddy::CaddyHarness::start_on_standard_ports();
+            let root = caddy.root();
+            fs::create_dir_all(root.join("config/nook")).unwrap();
+            fs::write(
+                root.join("config/nook/config.toml"),
+                format!(
+                    "format_version = 1\ncaddy_admin = {:?}\n",
+                    caddy.admin_url()
+                ),
+            )
+            .unwrap();
+            fs::write(root.join("server.py"), SERVER).unwrap();
+            fs::write(root.join("runner.py"), RUNNER).unwrap();
+            let mut manifest = "format_version = 2\nname = 'grace'\n".to_owned();
+            for role in ["api", "web"] {
+                fs::create_dir(root.join(role)).unwrap();
+                manifest.push_str(&format!("[[apps]]\nid = '{role}'\ndir = '{role}'\ntls = false\nframework = 'none'\ncommand = ['unused']\n"));
+            }
+            fs::write(root.join("nook.toml"), manifest).unwrap();
+            let mut command = if nondumpable {
+                // Match the protected-process recovery test: no exec may regain
+                // root's capabilities inside the test's user namespace.
+                let mut command = Command::new("python3");
+                command.args([
+                    "-c",
+                    r"import ctypes,os,sys
+libc=ctypes.CDLL(None)
+assert libc.prctl(38,1,0,0,0)==0
+header=(ctypes.c_uint32*2)(0x20080522,0)
+data=(ctypes.c_uint32*6)()
+assert libc.capset(ctypes.byref(header),ctypes.byref(data))==0
+os.execv(sys.argv[1],sys.argv[1:])",
+                ]);
+                command.arg(env!("CARGO_BIN_EXE_nook"));
+                command
+            } else {
+                Command::new(env!("CARGO_BIN_EXE_nook"))
+            };
+            let child = command
+                .current_dir(root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+                .env("TEST_NOOK", env!("CARGO_BIN_EXE_nook"))
+                .env_remove("NOOK_WORKSPACE_SESSION")
+                .envs(stubborn.then_some(("STUBBORN", "1")))
+                .envs(nondumpable.then_some(("NONDUMPABLE", "1")))
+                .envs(shell.then_some(("SHELL_MEMBER", "1")))
+                .args(["run", "--runner", "--", "python3", "runner.py"])
+                .stdout(Stdio::from(File::create(root.join("run.stdout")).unwrap()))
+                .stderr(Stdio::from(File::create(root.join("run.stderr")).unwrap()))
+                .spawn()
+                .unwrap();
+            let mut fixture = Self { caddy, child };
+            fixture.until(|fixture| {
+                ["api/api-pid", "web/web-pid", "task-pid"]
+                    .iter()
+                    .all(|file| fixture.path(file).exists())
+            });
+            fixture
+        }
+
+        fn path(&self, file: &str) -> std::path::PathBuf {
+            self.caddy.root().join(file)
+        }
+        fn logs(&self) -> String {
+            fs::read_to_string(self.path("run.stderr")).unwrap()
+        }
+        fn until(&mut self, mut check: impl FnMut(&Self) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !check(self) {
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "root exited: {}",
+                    self.logs()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture timed out: {}",
+                    self.logs()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn pid(&self, file: &str) -> i32 {
+            fs::read_to_string(self.path(file))
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+        fn state(&self) -> Value {
+            serde_json::from_slice(&fs::read(self.path("state/nook/state.json")).unwrap()).unwrap()
+        }
+        fn wait(&mut self) -> ExitStatus {
+            let deadline = Instant::now() + Duration::from_secs(7);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "shutdown was not bounded: {}",
+                    self.logs()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn clean(&self) {
+            let state = self.state();
+            for key in ["leases", "workspace_groups"] {
+                assert!(
+                    state
+                        .get(key)
+                        .is_none_or(|value| value.as_object().unwrap().is_empty()),
+                    "{state}"
+                );
+            }
+            assert!(
+                state["pending_operations"].as_array().unwrap().is_empty(),
+                "{state}"
+            );
+            let context = fs::read_to_string(self.path("context")).unwrap();
+            assert!(!Path::new(&context).exists(), "session survived shutdown");
+            let config = self.caddy.config_json();
+            for role in ["api", "web"] {
+                assert!(
+                    !config.contains(&format!("{role}.grace.localhost")),
+                    "route survived shutdown"
+                );
+                for file in [
+                    format!("{role}/{role}-pid"),
+                    format!("{role}/{role}-detached"),
+                ] {
+                    assert!(!alive(self.pid(&file)), "{file} survived shutdown");
+                }
+            }
+            assert!(
+                !alive(self.pid("task-pid")),
+                "non-HTTP task survived shutdown"
+            );
+            for file in [
+                "api/api-duplicate",
+                "web/web-duplicate",
+                "task-duplicate",
+                "runner-duplicate",
+            ] {
+                assert!(
+                    !self.path(file).exists(),
+                    "graceful signal forwarded twice to {file}"
+                );
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            for file in [
+                "api/api-pid",
+                "web/web-pid",
+                "api/api-detached",
+                "web/web-detached",
+                "task-pid",
+            ] {
+                if self.path(file).exists() {
+                    unsafe {
+                        libc::kill(self.pid(file), libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+    fn alive(pid: i32) -> bool {
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+            && stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('Z'))
+        {
+            return false;
+        }
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+    fn signal(pid: i32, signal: i32) {
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+    }
+    fn namespace(test: &str) -> bool {
+        if std::env::var_os("NOOK_SESSION_NETNS").is_some() {
+            assert!(
+                Command::new("ip")
+                    .args(["link", "set", "lo", "up"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return false;
+        }
+        if std::env::var_os("NOOK_E2E_DIRECT").is_some() {
+            return false;
+        }
+        let output = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--net"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("NOOK_SESSION_NETNS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn member_signals_allow_async_cleanup_and_preserve_siblings() {
+        if namespace("shutdown::member_signals_allow_async_cleanup_and_preserve_siblings") {
+            return;
+        }
+        for (sig, stubborn) in [
+            (Some(libc::SIGINT), false),
+            (Some(libc::SIGTERM), false),
+            (None, false),
+            (Some(libc::SIGTERM), true),
+        ] {
+            let mut fixture = Fixture::start(stubborn);
+            let previous_pid = fixture.pid("api/api-pid");
+            let context = fs::read_to_string(fixture.path("context")).unwrap();
+            let members: Value = serde_json::from_slice(&fs::read(&context).unwrap()).unwrap();
+            let wrapper = members["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|member| member["app_id"] == "api")
+                .unwrap()["wrapper"]["pid"]
+                .as_u64()
+                .unwrap();
+            if let Some(sig) = sig {
+                signal(wrapper as i32, sig);
+            } else {
+                fs::write(fixture.path("api/exit-api"), "").unwrap();
+            }
+            fixture.until(|fixture| fixture.path("api-exit").exists());
+            assert_eq!(
+                fs::read_to_string(fixture.path("api-exit")).unwrap(),
+                sig.map_or(23, |sig| 128 + sig).to_string()
+            );
+            assert_eq!(
+                fixture.path("api/api-clean").exists(),
+                sig.is_some() && !stubborn,
+                "member killed before asynchronous cleanup"
+            );
+            if let Some(sig) = sig
+                && !stubborn
+            {
+                assert_eq!(
+                    fs::read_to_string(fixture.path("api/api-clean")).unwrap(),
+                    sig.to_string()
+                );
+            }
+            assert!(
+                !alive(fixture.pid("api/api-detached")),
+                "claim released before detached cleanup"
+            );
+            assert!(
+                alive(fixture.pid("web/web-pid")),
+                "member shutdown killed its sibling"
+            );
+            assert!(!fixture.path("web/web-clean").exists());
+            let context: Value = serde_json::from_slice(&fs::read(&context).unwrap()).unwrap();
+            assert!(
+                context["members"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|member| member["app_id"] != "api")
+            );
+            fs::write(fixture.path("restart-api"), "").unwrap();
+            fixture.until(|fixture| {
+                fs::read_to_string(fixture.path("api/api-pid"))
+                    .ok()
+                    .is_some_and(|pid| pid.parse::<i32>().unwrap() != previous_pid)
+            });
+            assert!(
+                alive(fixture.pid("web/web-pid")),
+                "restart killed its sibling"
+            );
+            signal(fixture.child.id() as i32, libc::SIGTERM);
+            assert_eq!(fixture.wait().code(), Some(143));
+            fixture.clean();
+        }
+    }
+
+    #[test]
+    fn root_signals_allow_async_member_and_task_cleanup() {
+        if namespace("shutdown::root_signals_allow_async_member_and_task_cleanup") {
+            return;
+        }
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            let mut fixture = Fixture::start(false);
+            signal(fixture.child.id() as i32, sig);
+            assert_eq!(fixture.wait().code(), Some(128 + sig));
+            for file in [
+                "api/api-clean",
+                "web/web-clean",
+                "task-clean",
+                "runner-clean",
+            ] {
+                assert!(
+                    fixture.path(file).exists(),
+                    "{file}: root killed before asynchronous cleanup: {}",
+                    fixture.logs()
+                );
+            }
+            for file in [
+                "api/api-clean",
+                "web/web-clean",
+                "task-clean",
+                "runner-clean",
+            ] {
+                assert_eq!(
+                    fs::read_to_string(fixture.path(file)).unwrap(),
+                    sig.to_string()
+                );
+            }
+            fixture.clean();
+        }
+    }
+
+    #[test]
+    fn member_shell_leader_exit_preserves_descendant_cleanup() {
+        if namespace("shutdown::member_shell_leader_exit_preserves_descendant_cleanup") {
+            return;
+        }
+        for sig in [Some(libc::SIGINT), Some(libc::SIGTERM), None] {
+            let mut fixture = Fixture::start_with(false, false, true);
+            let context = fs::read_to_string(fixture.path("context")).unwrap();
+            let context: Value = serde_json::from_slice(&fs::read(context).unwrap()).unwrap();
+            let wrapper = context["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|member| member["app_id"] == "api")
+                .unwrap()["wrapper"]["pid"]
+                .as_u64()
+                .unwrap();
+            let state = fixture.state();
+            assert!(
+                state["leases"].as_object().unwrap().values().any(|lease| {
+                    lease["hostname"] == "api.grace.localhost"
+                        && lease["pid"].as_i64() != Some(i64::from(fixture.pid("api/api-pid")))
+                }),
+                "the registered leader must be the shell, not the server: {state}"
+            );
+            if let Some(sig) = sig {
+                signal(wrapper as i32, sig);
+            } else {
+                fs::write(fixture.path("api/exit-api"), "").unwrap();
+            }
+            fixture.until(|fixture| fixture.path("api-exit").exists());
+            assert_eq!(
+                fs::read_to_string(fixture.path("api-exit")).unwrap(),
+                sig.map_or(23, |sig| 128 + sig).to_string()
+            );
+            if let Some(sig) = sig {
+                assert!(
+                    fixture.path("api/api-stopping").exists(),
+                    "descendant never received the signal"
+                );
+                assert!(
+                    fixture.path("api/api-clean").exists(),
+                    "shell exited before descendant cleanup, and member forced the tree too soon: {}",
+                    fixture.logs()
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path("api/api-clean")).unwrap(),
+                    sig.to_string()
+                );
+            } else {
+                assert!(
+                    !fixture.path("api/api-clean").exists(),
+                    "unsolicited exit must retain its normal status"
+                );
+            }
+            assert!(
+                !alive(fixture.pid("api/api-detached")),
+                "detached child survived member cleanup"
+            );
+            assert!(
+                alive(fixture.pid("web/web-pid")),
+                "member shutdown killed its sibling"
+            );
+            signal(fixture.child.id() as i32, libc::SIGTERM);
+            assert_eq!(fixture.wait().code(), Some(143));
+            fixture.clean();
+        }
+    }
+
+    #[test]
+    fn root_shell_leader_exit_preserves_descendant_cleanup() {
+        if namespace("shutdown::root_shell_leader_exit_preserves_descendant_cleanup") {
+            return;
+        }
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            let mut fixture = Fixture::start_with(false, false, true);
+            signal(fixture.child.id() as i32, sig);
+            assert_eq!(fixture.wait().code(), Some(128 + sig));
+            for role in ["api", "web"] {
+                assert!(
+                    fixture.path(&format!("{role}/{role}-stopping")).exists(),
+                    "descendant never received the signal"
+                );
+                assert!(
+                    fixture.path(&format!("{role}/{role}-clean")).exists(),
+                    "shell exited during root shutdown and member bypassed descendant grace: {}",
+                    fixture.logs()
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.path(&format!("{role}/{role}-clean"))).unwrap(),
+                    sig.to_string()
+                );
+            }
+            fixture.clean();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn registered_nondumpable_server_gets_one_graceful_signal() {
+        if namespace("shutdown::registered_nondumpable_server_gets_one_graceful_signal") {
+            return;
+        }
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            let mut fixture = Fixture::start_with(false, true, false);
+            fixture.until(|fixture| fixture.path("api-unreadable").exists());
+            let state = fixture.state();
+            assert!(
+                state["leases"].as_object().unwrap().values().any(|lease| {
+                    lease["hostname"] == "api.grace.localhost"
+                        && lease["pid"].as_i64() == Some(i64::from(fixture.pid("api/api-pid")))
+                }),
+                "protected server must already have a durable lease: {state}"
+            );
+            signal(fixture.child.id() as i32, sig);
+            assert_eq!(fixture.wait().code(), Some(128 + sig));
+            assert!(
+                fixture.path("api/api-clean").exists(),
+                "verified child with unreadable environ missed graceful cleanup: {}",
+                fixture.logs()
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.path("api/api-clean")).unwrap(),
+                sig.to_string()
+            );
+            fixture.clean(); // Includes duplicate-signal and detached cleanup assertions.
+        }
+    }
+
+    #[test]
+    fn runner_exit_and_stubborn_member_shutdown_are_bounded() {
+        if namespace("shutdown::runner_exit_and_stubborn_member_shutdown_are_bounded") {
+            return;
+        }
+        for stubborn in [false, true] {
+            let mut fixture = Fixture::start(stubborn);
+            if stubborn {
+                signal(fixture.child.id() as i32, libc::SIGTERM);
+            } else {
+                fs::write(fixture.path("exit-runner"), "").unwrap();
+            }
+            assert_eq!(fixture.wait().code(), Some(if stubborn { 143 } else { 7 }));
+            assert!(
+                fixture.path("web/web-clean").exists(),
+                "orderly runner exit skipped member cleanup"
+            );
+            assert!(
+                fixture.path("task-clean").exists(),
+                "orderly runner exit skipped non-HTTP cleanup"
+            );
+            assert_eq!(fixture.path("api/api-clean").exists(), !stubborn);
+            fixture.clean();
+        }
+    }
+}
