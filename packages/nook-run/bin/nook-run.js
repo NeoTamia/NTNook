@@ -25,6 +25,11 @@ function signalExitCode(signal) {
 }
 
 const args = process.argv.slice(2);
+// Bun consumes a leading `--` after the script path. Nook still needs that
+// boundary; separators after Nook options and inside the command stay intact.
+if (process.versions.bun && args.length > 0 && !args[0].startsWith("-")) {
+  args.unshift("--");
+}
 const separatorIndex = args.indexOf("--");
 const command = separatorIndex === -1 ? [] : args.slice(separatorIndex + 1);
 
@@ -82,6 +87,13 @@ function handleLaunchError(error) {
   launchErrors.add(child);
 
   if (error.code === "ENOENT") {
+    if (Object.hasOwn(process.env, "NOOK_WORKSPACE_SESSION")) {
+      removeSignalHandlers();
+      report("nook-run: cannot join the workspace session: Nook was not found in PATH; refusing to start an unmanaged command.");
+      process.exitCode = 127;
+      return;
+    }
+
     report(`nook-run: warning: Nook was not found in PATH; running the command directly.
 
 ${installationGuidance(process.platform)}

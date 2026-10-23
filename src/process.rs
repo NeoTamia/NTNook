@@ -28,7 +28,7 @@ use signal_hook::iterator::Signals;
 
 use crate::config::ResolvedRunConfig;
 use crate::reconcile::{RouteBackend, RouteError, RouteSpec, route_for_alias, route_for_lease};
-use crate::state::Lease;
+use crate::state::{Lease, WorkspaceSupervisor};
 use crate::state::{
     LeaseState, OperationGuard, PendingOperation, PendingOperationKind, Scheme, Store,
 };
@@ -42,10 +42,10 @@ pub(crate) enum Liveness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcIdentity {
-    state: u8,
-    pgid: i32,
-    start_time_ticks: u64,
+pub(crate) struct ProcIdentity {
+    pub(crate) state: u8,
+    pub(crate) pgid: i32,
+    pub(crate) start_time_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,7 @@ pub(crate) enum ProcessSignal {
     Kill,
 }
 
-struct ForwardedSignals {
+pub(crate) struct ForwardedSignals {
     #[cfg(unix)]
     inner: Signals,
 }
@@ -66,7 +66,7 @@ static WINDOWS_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static WINDOWS_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 impl ForwardedSignals {
-    fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         #[cfg(unix)]
         {
             Signals::new([SIGINT, SIGTERM]).map(|inner| Self { inner })
@@ -84,7 +84,7 @@ impl ForwardedSignals {
         }
     }
 
-    fn pending(&mut self) -> Vec<ProcessSignal> {
+    pub(crate) fn pending(&mut self) -> Vec<ProcessSignal> {
         #[cfg(unix)]
         {
             self.inner
@@ -148,11 +148,16 @@ impl std::error::Error for Error {
 
 pub(crate) struct ManagedChild {
     child: Child,
+    output_threads: Vec<thread::JoinHandle<()>>,
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) start_time_ticks: u64,
     #[cfg(unix)]
+    workspace_owned: bool,
+    #[cfg(unix)]
     terminal: Option<TerminalForeground>,
+    #[cfg(unix)]
+    inherits_stdin: bool,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -167,7 +172,7 @@ impl ManagedChild {
         self.wait_with_signals(&mut signals, || {})
     }
 
-    fn signal_foreground(&self, signal: ProcessSignal) -> Result<(), Error> {
+    pub(crate) fn signal_foreground(&self, signal: ProcessSignal) -> Result<(), Error> {
         #[cfg(unix)]
         {
             self.signal(signal)
@@ -208,6 +213,34 @@ impl ManagedChild {
         }
     }
 
+    pub(crate) fn join_output(&mut self) {
+        for output in self.output_threads.drain(..) {
+            let _ = output.join();
+        }
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Result<Option<i32>, Error> {
+        let status = self.child.try_wait().map_err(Error::Spawn)?;
+        #[cfg(unix)]
+        if status.is_some() {
+            drop(self.terminal.take());
+        } else {
+            self.sync_terminal();
+        }
+        Ok(status.map(|status| {
+            #[cfg(unix)]
+            {
+                status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+            }
+            #[cfg(windows)]
+            {
+                status.code().unwrap_or(1)
+            }
+        }))
+    }
+
     fn has_exited(&mut self) -> Result<bool, Error> {
         self.child
             .try_wait()
@@ -217,6 +250,9 @@ impl ManagedChild {
 
     #[cfg(unix)]
     fn sync_terminal(&mut self) {
+        if !self.inherits_stdin {
+            return;
+        }
         if self.terminal.is_none() && !process_is_stopped(self.pid) {
             self.terminal = TerminalForeground::claim(self.pgid);
         }
@@ -333,7 +369,7 @@ pub(crate) trait RunExposure {
     fn withdraw(&mut self, operations: &OperationGuard, store: &Store, owner_id: Uuid);
 }
 
-struct LocalOnly;
+pub(crate) struct LocalOnly;
 
 impl RunExposure for LocalOnly {
     fn expose(
@@ -376,6 +412,64 @@ fn start_run_with_hook(
 ) -> Result<RunningChild, RunError> {
     let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
     let operations = store.lock_operations()?;
+    let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
+    let mut prepared = prepare_run(config, reservation, store, routes, &operations, exposure)?;
+    let mut running =
+        match spawn_prepared_run(config, &mut prepared, None, None, &[], after_release) {
+            Ok(running) => running,
+            Err(error) => {
+                exposure.withdraw(&operations, store, prepared.owner_id);
+                abandon_prepared_run(config, &prepared, store, routes)?;
+                return Err(error);
+            }
+        };
+    running.signals = signals;
+    match commit_prepared_runs(&[(config, &prepared, &running.child)], None, store, routes) {
+        Ok(warnings) => {
+            if !warnings.is_empty() {
+                let warning = running.warning.get_or_insert_with(String::new);
+                if !warning.is_empty() {
+                    warning.push_str("; ");
+                }
+                warning.push_str(&warnings.join("; "));
+            }
+        }
+        Err(error) => {
+            let _ = running.child.signal(ProcessSignal::Kill);
+            let _ = running.child.wait();
+            exposure.withdraw(&operations, store, prepared.owner_id);
+            abandon_prepared_run(config, &prepared, store, routes)?;
+            return Err(error);
+        }
+    }
+    Ok(running)
+}
+
+/// A reserved port and journaled route, with no child launched yet.
+pub(crate) struct PreparedRun {
+    reservation: Option<PortReservation>,
+    pub(crate) owner_id: Uuid,
+    operation_id: Uuid,
+    target: String,
+    displaced: Vec<RouteSpec>,
+    pub(crate) exposed: Vec<(OsString, OsString)>,
+    pub(crate) warnings: Vec<String>,
+}
+
+impl PreparedRun {
+    pub(crate) fn release_port(&mut self) {
+        self.reservation.take();
+    }
+}
+
+pub(crate) fn prepare_run(
+    config: &ResolvedRunConfig,
+    reservation: PortReservation,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+    operations: &OperationGuard,
+    exposure: &mut impl RunExposure,
+) -> Result<PreparedRun, RunError> {
     let registry = store.load()?;
     if config.lan {
         let hostname = crate::lan::hostname(&config.hostname);
@@ -410,11 +504,13 @@ fn start_run_with_hook(
         .iter()
         .map(|route| (route.owner_id, route.tls))
         .collect();
-    let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
     let port = reservation.port;
     let owner_id = Uuid::new_v4();
     let operation_id = Uuid::new_v4();
-    let target = format!("http://127.0.0.1:{port}");
+    let target = format!(
+        "http://{}",
+        SocketAddr::new(readiness_probe_address(config.bind_address), port)
+    );
     let route = RouteSpec {
         lan: config.lan,
         owner_id,
@@ -442,14 +538,14 @@ fn start_run_with_hook(
         abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
         return Err(error.into());
     }
-    let exposed = match exposure.expose(&operations, store, owner_id, &config.hostname, &target) {
+    let exposed = match exposure.expose(operations, store, owner_id, &config.hostname, &target) {
         Ok(exposed) => exposed,
         Err(error) => {
             abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
             return Err(error);
         }
     };
-    store.mutate(|registry| {
+    let journal = store.mutate(|registry| {
         replace_operation(
             registry,
             operation_id,
@@ -462,8 +558,48 @@ fn start_run_with_hook(
             },
         );
         Ok(())
-    })?;
+    });
+    if let Err(error) = journal {
+        exposure.withdraw(operations, store, owner_id);
+        abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
+        return Err(error.into());
+    }
 
+    let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
+    if !conflicts.is_empty() {
+        warnings.push(format!(
+            "replaced existing Nook route for {}; the previous owner is no longer managed",
+            config.hostname
+        ));
+    }
+    Ok(PreparedRun {
+        reservation: Some(reservation),
+        owner_id,
+        operation_id,
+        target,
+        displaced,
+        exposed,
+        warnings,
+    })
+}
+
+pub(crate) fn spawn_prepared_run(
+    config: &ResolvedRunConfig,
+    prepared: &mut PreparedRun,
+    directory: Option<&std::path::Path>,
+    prefix: Option<&str>,
+    extra_environment: &[(OsString, OsString)],
+    after_release: impl FnOnce(u16),
+) -> Result<RunningChild, RunError> {
+    let signals = ForwardedSignals::new().map_err(Error::Spawn)?;
+    let port = prepared
+        .reservation
+        .as_ref()
+        .expect("prepared run is spawned once")
+        .port;
+    let owner_id = prepared.owner_id;
+    let exposed = prepared.exposed.clone();
+    let mut warnings = prepared.warnings.clone();
     let argv = substitute_port(&config.command, port);
     let framework = config.framework.resolve(&argv);
     let tailscale_hostname = exposed
@@ -510,83 +646,19 @@ fn start_run_with_hook(
             environment.push((variable.into(), value));
         }
     }
-    let mut warnings: Vec<String> = reservation.warning.iter().cloned().collect();
-    if !conflicts.is_empty() {
-        warnings.push(format!(
-            "replaced existing Nook route for {}; the previous owner is no longer managed",
-            config.hostname
-        ));
-    }
-    reservation.release();
+    prepared
+        .reservation
+        .take()
+        .expect("port is reserved until spawn")
+        .release();
     after_release(port);
-    let environment: Vec<_> = environment.into_iter().chain(exposed).collect();
-    let child = match spawn_managed_child(&argv, &environment, owner_id) {
-        Ok(child) => child,
-        Err(error) => {
-            exposure.withdraw(&operations, store, owner_id);
-            abandon_route(store, routes, config, owner_id, operation_id, &displaced)?;
-            return Err(error.into());
-        }
-    };
-    // Keep displaced owners recorded until spawn succeeds, so either startup
-    // failure can restore their routes without losing aliases or live leases.
-    let cleanup_results: Vec<_> = conflicts
+    let environment: Vec<_> = extra_environment
         .iter()
-        .map(|(id, tls)| {
-            (
-                *id,
-                *tls,
-                routes.remove_if_owned(&config.hostname, *id, *tls),
-            )
-        })
+        .cloned()
+        .chain(environment)
+        .chain(exposed)
         .collect();
-    store.mutate(|registry| {
-        let replaced_ids: std::collections::BTreeSet<_> =
-            conflicts.iter().map(|(id, _)| *id).collect();
-        registry
-            .aliases
-            .retain(|_, alias| !replaced_ids.contains(&alias.id));
-        registry.leases.retain(|id, _| !replaced_ids.contains(id));
-        registry.pending_operations.retain(|operation| {
-            pending_owner(&operation.kind).is_none_or(|id| !replaced_ids.contains(&id))
-        });
-        for (owner_id, tls, result) in &cleanup_results {
-            if result.is_err() {
-                registry.pending_operations.push(PendingOperation {
-                    id: Uuid::new_v4(),
-                    kind: PendingOperationKind::RemoveRoute {
-                        hostname: config.hostname.clone(),
-                        owner_id: *owner_id,
-                        tls: *tls,
-                    },
-                });
-            }
-        }
-        registry
-            .pending_operations
-            .retain(|operation| operation.id != operation_id);
-        registry.leases.insert(
-            owner_id,
-            Lease {
-                lan: config.lan,
-                id: owner_id,
-                hostname: config.hostname.clone(),
-                target,
-                scheme: Scheme::Http,
-                tls: config.tls,
-                pid: child.pid,
-                pgid: child.pgid,
-                process_start_time_ticks: child.start_time_ticks,
-                state: LeaseState::Starting,
-            },
-        );
-        Ok(())
-    })?;
-    for (_, _, result) in &cleanup_results {
-        if let Err(error) = result {
-            warnings.push(format!("cleanup of the previous route is pending: {error}"));
-        }
-    }
+    let child = spawn_managed_child_in(&argv, &environment, owner_id, directory, prefix)?;
     let lan = if config.lan {
         match crate::lan::Advertisement::start(&config.hostname, 80, owner_id) {
             Ok(advertisement) => Some(advertisement),
@@ -611,6 +683,93 @@ fn start_run_with_hook(
         signals,
         lan,
     })
+}
+
+/// Persist ownership only once the caller's entire spawn phase succeeded.
+pub(crate) fn commit_prepared_runs(
+    runs: &[(&ResolvedRunConfig, &PreparedRun, &ManagedChild)],
+    group_id: Option<Uuid>,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+) -> Result<Vec<String>, RunError> {
+    let mut cleanup_failures = Vec::new();
+    let mut warnings = Vec::new();
+    for (config, prepared, _) in runs {
+        for displaced in &prepared.displaced {
+            if let Err(error) =
+                routes.remove_if_owned(&config.hostname, displaced.owner_id, displaced.tls)
+            {
+                warnings.push(format!("cleanup of the previous route is pending: {error}"));
+                cleanup_failures.push(PendingOperation {
+                    id: Uuid::new_v4(),
+                    kind: PendingOperationKind::RemoveRoute {
+                        hostname: config.hostname.clone(),
+                        owner_id: displaced.owner_id,
+                        tls: displaced.tls,
+                    },
+                });
+            }
+        }
+    }
+    // One atomic registry mutation preserves displaced owners if any spawn fails.
+    store.mutate(|registry| {
+        for (config, prepared, child) in runs {
+            let replaced_ids: std::collections::BTreeSet<_> = prepared
+                .displaced
+                .iter()
+                .map(|route| route.owner_id)
+                .collect();
+            registry
+                .aliases
+                .retain(|_, alias| !replaced_ids.contains(&alias.id));
+            registry.leases.retain(|id, _| !replaced_ids.contains(id));
+            registry.pending_operations.retain(|operation| {
+                operation.id != prepared.operation_id
+                    && pending_owner(&operation.kind).is_none_or(|id| !replaced_ids.contains(&id))
+            });
+            registry.leases.insert(
+                prepared.owner_id,
+                Lease {
+                    group_id,
+                    workspace_supervisor: group_id.and_then(|id| {
+                        registry
+                            .workspace_groups
+                            .get(&id)
+                            .map(|group| group.supervisor.clone())
+                    }),
+                    lan: config.lan,
+                    id: prepared.owner_id,
+                    hostname: config.hostname.clone(),
+                    target: prepared.target.clone(),
+                    scheme: Scheme::Http,
+                    tls: config.tls,
+                    pid: child.pid,
+                    pgid: child.pgid,
+                    process_start_time_ticks: child.start_time_ticks,
+                    state: LeaseState::Starting,
+                },
+            );
+        }
+        registry.pending_operations.extend(cleanup_failures);
+        Ok(())
+    })?;
+    Ok(warnings)
+}
+
+pub(crate) fn abandon_prepared_run(
+    config: &ResolvedRunConfig,
+    prepared: &PreparedRun,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+) -> Result<(), RunError> {
+    abandon_route(
+        store,
+        routes,
+        config,
+        prepared.owner_id,
+        prepared.operation_id,
+        &prepared.displaced,
+    )
 }
 
 /// Removes the route of a run that will not start and drops its journal entry,
@@ -727,36 +886,76 @@ impl RunningChild {
                 }
             }
         })?;
-        self.lan.take();
-        let _operations = store.lock_operations()?;
-        let cleanup = routes.remove_if_owned(&self.hostname, self.lease_id, self.tls);
-        let mut warnings = Vec::new();
-        store.mutate(|registry| {
-            registry.leases.remove(&self.lease_id);
-            if let Err(error) = &cleanup {
-                registry.pending_operations.push(PendingOperation {
-                    id: Uuid::new_v4(),
-                    kind: PendingOperationKind::RemoveRoute {
-                        hostname: self.hostname.clone(),
-                        owner_id: self.lease_id,
-                        tls: self.tls,
-                    },
-                });
-                warnings.push(format!(
-                    "cleanup of {} is pending: {error}; run `nook prune` to retry",
-                    self.hostname
-                ));
-            }
-            Ok(())
-        })?;
+        let warnings = self.cleanup(store, routes)?;
         Ok(RunOutcome {
             exit_code,
             warnings,
         })
     }
+
+    pub(crate) fn cleanup(
+        &mut self,
+        store: &Store,
+        routes: &mut impl RouteBackend,
+    ) -> Result<Vec<String>, RunError> {
+        self.lan.take();
+        cleanup_run_route(&self.hostname, self.lease_id, self.tls, store, routes)
+    }
+
+    pub(crate) fn poll_readiness(&mut self, store: &Store) -> Result<bool, RunError> {
+        if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
+            self.lan.take();
+        }
+        if TcpStream::connect_timeout(
+            &SocketAddr::new(readiness_probe_address(self.bind_address), self.port),
+            Duration::from_millis(5),
+        )
+        .is_err()
+        {
+            return Ok(false);
+        }
+        store.mutate(|registry| {
+            if let Some(lease) = registry.leases.get_mut(&self.lease_id) {
+                lease.state = LeaseState::Ready;
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
 }
 
-fn readiness_probe_address(bind_address: IpAddr) -> IpAddr {
+/// Both direct children and runner members use the same ownership transaction.
+pub(crate) fn cleanup_run_route(
+    hostname: &str,
+    owner_id: Uuid,
+    tls: bool,
+    store: &Store,
+    routes: &mut impl RouteBackend,
+) -> Result<Vec<String>, RunError> {
+    let _operations = store.lock_operations()?;
+    let cleanup = routes.remove_if_owned(hostname, owner_id, tls);
+    let mut warnings = Vec::new();
+    store.mutate(|registry| {
+        registry.leases.remove(&owner_id);
+        if let Err(error) = &cleanup {
+            registry.pending_operations.push(PendingOperation {
+                id: Uuid::new_v4(),
+                kind: PendingOperationKind::RemoveRoute {
+                    hostname: hostname.to_owned(),
+                    owner_id,
+                    tls,
+                },
+            });
+            warnings.push(format!(
+                "cleanup of {hostname} is pending: {error}; run `nook prune` to retry"
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(warnings)
+}
+
+pub(crate) fn readiness_probe_address(bind_address: IpAddr) -> IpAddr {
     match bind_address {
         IpAddr::V4(address) if address.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(address) if address.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -774,6 +973,7 @@ pub(crate) struct RunOutcome {
 pub(crate) enum StopError {
     State(String),
     NotManaged(String),
+    PendingMember(String),
     Stale(String),
     Signal(String),
 }
@@ -785,6 +985,10 @@ impl fmt::Display for StopError {
             Self::NotManaged(hostname) => {
                 write!(formatter, "no managed run exists for `{hostname}`")
             }
+            Self::PendingMember(hostname) => write!(
+                formatter,
+                "workspace app `{hostname}` has not started; pending member association"
+            ),
             Self::Stale(hostname) => write!(
                 formatter,
                 "managed run `{hostname}` is no longer the same process"
@@ -827,18 +1031,40 @@ pub(crate) fn stop_managed(
     let _operations = store
         .lock_operations()
         .map_err(|error| StopError::State(error.to_string()))?;
-    let lease = store
-        .mutate(|registry| {
-            Ok(registry
-                .leases
-                .values()
-                .find(|lease| lease.hostname == hostname)
-                .cloned())
-        })
-        .map_err(|error: crate::state::Error| StopError::State(error.to_string()))?;
-    let lease = lease
-        .as_ref()
+    let registry = store
+        .load()
+        .map_err(|error| StopError::State(error.to_string()))?;
+    let lease = registry
+        .leases
+        .values()
+        .find(|lease| lease.hostname == hostname)
         .ok_or_else(|| StopError::NotManaged(hostname.to_owned()))?;
+    if let Some(group_id) = lease.group_id {
+        let group = registry.workspace_groups.get(&group_id).ok_or_else(|| {
+            StopError::State(format!("workspace group for `{hostname}` is missing"))
+        })?;
+        if lease.workspace_supervisor.as_ref() != Some(&group.supervisor) {
+            return Err(StopError::State(format!(
+                "workspace ownership for `{hostname}` does not match its group"
+            )));
+        }
+        if let Some(runner) = &group.runner {
+            if runner.id != group_id
+                || runner.group_id != Some(group_id)
+                || runner.workspace_supervisor.as_ref() != Some(&group.supervisor)
+            {
+                return Err(StopError::State(
+                    "workspace runner identity does not match its group".into(),
+                ));
+            }
+            // Prepared runner apps point to the runner until associate_member
+            // replaces them. Never let an individual stop signal that tree,
+            // including partial/mismatched identities in an inconsistent journal.
+            if lease.pid == runner.pid || lease.pgid == runner.pgid {
+                return Err(StopError::PendingMember(hostname.to_owned()));
+            }
+        }
+    }
     if system.liveness(lease) != Liveness::Alive {
         return Err(StopError::Stale(hostname.to_owned()));
     }
@@ -891,6 +1117,16 @@ fn spawn_managed_child(
     environment: &[(OsString, OsString)],
     lease_id: Uuid,
 ) -> Result<ManagedChild, Error> {
+    spawn_managed_child_in(argv, environment, lease_id, None, None)
+}
+
+pub(crate) fn spawn_managed_child_in(
+    argv: &[OsString],
+    environment: &[(OsString, OsString)],
+    lease_id: Uuid,
+    directory: Option<&std::path::Path>,
+    prefix: Option<&str>,
+) -> Result<ManagedChild, Error> {
     #[cfg(unix)]
     let _ = lease_id;
     let (program, arguments) = argv.split_first().ok_or(Error::EmptyCommand)?;
@@ -902,12 +1138,14 @@ fn spawn_managed_child(
         arguments,
         raw_argument,
         internal_environment,
-    } = prepare_windows_command(program, arguments, environment, lease_id)?;
+    } = prepare_windows_command(program, arguments, environment, lease_id, directory)?;
     let mut command = Command::new(program);
     // A run started from an exposed run must not inherit its tailnet URL;
     // an exposed child gets its own value back from `environment`.
     command
         .env_remove(crate::tailscale::URL_VARIABLE)
+        .env_remove("NOOK_WORKSPACE_SESSION")
+        .env_remove(crate::workspace_session::PROCESS_VARIABLE)
         .args(arguments)
         .envs(environment.iter().cloned());
     #[cfg(windows)]
@@ -919,16 +1157,26 @@ fn spawn_managed_child(
         use std::os::windows::process::CommandExt;
         command.raw_arg(raw_argument);
     }
-    command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    if prefix.is_some() {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    } else {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
     configure_child(&mut command);
     // Acquire before spawn: Command::spawn only returns after exec, so the
     // child claims the TTY in pre_exec. Nook keeps SIGTTOU ignored so later
     // wrapper writes survive `stty tostop`.
     #[cfg(unix)]
-    let terminal = TerminalForeground::acquire();
+    let terminal = prefix.is_none().then(TerminalForeground::acquire).flatten();
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
     #[cfg(unix)]
@@ -952,19 +1200,67 @@ fn spawn_managed_child(
         let _ = child.wait();
         return Err(Error::Spawn(error));
     }
+    let mut output_threads = Vec::new();
+    if let Some(prefix) = prefix {
+        if let Some(stdout) = child.stdout.take() {
+            output_threads.push(prefix_output(stdout, prefix.to_owned(), false));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            output_threads.push(prefix_output(stderr, prefix.to_owned(), true));
+        }
+    }
     #[cfg(unix)]
     if let Some(terminal) = &terminal {
         terminal.handoff(identity.pgid);
     }
     Ok(ManagedChild {
         child,
+        output_threads,
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
         #[cfg(unix)]
+        workspace_owned: environment.iter().any(|(key, _)| {
+            key == crate::workspace_session::SESSION_VARIABLE
+                || key == crate::workspace_session::PROCESS_VARIABLE
+        }),
+        #[cfg(unix)]
         terminal,
+        #[cfg(unix)]
+        inherits_stdin: prefix.is_none(),
         #[cfg(windows)]
         job,
+    })
+}
+
+fn prefix_output(
+    reader: impl io::Read + Send + 'static,
+    prefix: String,
+    stderr: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        use io::{BufRead, Read, Write};
+        // Bound memory even when a child writes an unbroken stream.
+        let mut reader = io::BufReader::new(reader);
+        loop {
+            let mut line = Vec::new();
+            match reader.by_ref().take(8192).read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let mut output: Box<dyn Write> = if stderr {
+                        Box::new(io::stderr().lock())
+                    } else {
+                        Box::new(io::stdout().lock())
+                    };
+                    let _ = write!(output, "[{prefix}] ");
+                    let _ = output.write_all(&line);
+                    if !line.ends_with(b"\n") {
+                        let _ = output.write_all(b"\n");
+                    }
+                    let _ = output.flush();
+                }
+            }
+        }
     })
 }
 
@@ -1148,8 +1444,9 @@ fn prepare_windows_command(
     arguments: Vec<OsString>,
     environment: &[(OsString, OsString)],
     lease_id: Uuid,
+    directory: Option<&std::path::Path>,
 ) -> Result<PreparedWindowsCommand, Error> {
-    let Some(resolved) = resolve_windows_program(&program, environment) else {
+    let Some(resolved) = resolve_windows_program(&program, environment, directory) else {
         return Ok(PreparedWindowsCommand {
             program,
             arguments,
@@ -1253,20 +1550,25 @@ fn windows_batch_command_line(
 fn resolve_windows_program(
     program: &std::ffi::OsStr,
     environment: &[(OsString, OsString)],
+    directory: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
 
     let program = Path::new(program);
+    let current_directory = match directory {
+        Some(directory) => directory.to_path_buf(),
+        None => env::current_dir().ok()?,
+    };
     let has_directory = program.is_absolute()
         || program
             .parent()
             .is_some_and(|parent| !parent.as_os_str().is_empty());
     let directories = if has_directory {
-        vec![PathBuf::new()]
+        vec![current_directory.clone()]
     } else {
-        let mut directories = vec![env::current_dir().ok()?];
+        let mut directories = vec![current_directory.clone()];
         if let Some(path) = effective_windows_env(environment, "PATH") {
-            directories.extend(env::split_paths(&path));
+            directories.extend(env::split_paths(&path).map(|entry| current_directory.join(entry)));
         }
         directories
     };
@@ -1335,6 +1637,15 @@ fn send_group_signal(pgid: i32, signal: i32) -> io::Result<()> {
 
 #[cfg(unix)]
 fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Result<()> {
+    // A reaped leader's numeric PGID may already belong to another process.
+    // Runner recovery separately finds marked descendants when this is absent.
+    if child.workspace_owned
+        && !read_process_identity(child.pid).is_some_and(|identity| {
+            identity.pgid == child.pgid && identity.start_time_ticks == child.start_time_ticks
+        })
+    {
+        return Ok(());
+    }
     let signal = match signal {
         ProcessSignal::Interrupt => libc::SIGINT,
         ProcessSignal::Terminate => libc::SIGTERM,
@@ -1354,7 +1665,7 @@ fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
+pub(crate) fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
     fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| parse_stat(&stat))
@@ -1522,7 +1833,7 @@ fn signal_lease(lease: &Lease, signal: ProcessSignal) -> io::Result<()> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
+pub(crate) fn read_process_identity(pid: u32) -> Option<ProcIdentity> {
     use std::mem::zeroed;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
@@ -1695,6 +2006,33 @@ fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     output
 }
 
+pub(crate) fn substitute_values(
+    argument: &std::ffi::OsStr,
+    values: &std::collections::BTreeMap<String, String>,
+) -> OsString {
+    #[cfg(unix)]
+    {
+        let mut output = argument.as_bytes().to_vec();
+        for (key, value) in values {
+            output = replace_bytes(&output, format!("${{{key}}}").as_bytes(), value.as_bytes());
+        }
+        OsString::from_vec(output)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut output: Vec<_> = argument.encode_wide().collect();
+        for (key, value) in values {
+            output = replace_wide(
+                &output,
+                &format!("${{{key}}}").encode_utf16().collect::<Vec<_>>(),
+                &value.encode_utf16().collect::<Vec<_>>(),
+            );
+        }
+        OsString::from_wide(&output)
+    }
+}
+
 pub(crate) fn child_environment(
     port: u16,
     bind_address: IpAddr,
@@ -1731,22 +2069,42 @@ pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     }
 }
 
+/// The workspace runner may share its caller's process group. Its ownership
+/// depends only on PID/start time, and never authorizes signaling that group.
+#[cfg(unix)]
+pub(crate) fn workspace_supervisor_liveness(supervisor: &WorkspaceSupervisor) -> Liveness {
+    match fs::read_to_string(format!("/proc/{}/stat", supervisor.pid)) {
+        Ok(stat) => match parse_stat(&stat) {
+            Some(identity) => {
+                identity_liveness(identity, identity.pgid, supervisor.process_start_time_ticks)
+            }
+            None => Liveness::Indeterminate,
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Liveness::Dead,
+        Err(_) => Liveness::Indeterminate,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
+    process_liveness(lease.pid, lease.process_start_time_ticks)
+}
+
+#[cfg(windows)]
+pub(crate) fn workspace_supervisor_liveness(supervisor: &WorkspaceSupervisor) -> Liveness {
+    process_liveness(supervisor.pid, supervisor.process_start_time_ticks)
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
+fn process_liveness(pid: u32, start_time_ticks: u64) -> Liveness {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
 
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-            0,
-            lease.pid,
-        )
-    };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
     if process.is_null() {
         return match io::Error::last_os_error().raw_os_error() {
             Some(87) | Some(1168) => Liveness::Dead,
@@ -1758,13 +2116,433 @@ pub(crate) fn lease_liveness(lease: &Lease) -> Liveness {
     if wait != WAIT_TIMEOUT {
         return Liveness::Dead;
     }
-    match read_process_identity(lease.pid) {
-        Some(identity) if identity.start_time_ticks == lease.process_start_time_ticks => {
-            Liveness::Alive
-        }
+    match read_process_identity(pid) {
+        Some(identity) if identity.start_time_ticks == start_time_ticks => Liveness::Alive,
         Some(_) => Liveness::Dead,
         None => Liveness::Indeterminate,
     }
+}
+
+/// Kill only a currently verified managed application group/job. A matching
+/// Unix zombie still proves group ownership; missing/reused PIDs do not.
+pub(crate) fn kill_owned_lease(lease: &Lease) -> Result<(), Error> {
+    signal_owned_lease(lease, ProcessSignal::Kill).map(|_| ())
+}
+
+/// Signal only a verified independent application group, including a zombie
+/// leader that still proves ownership. All signal kinds share the same guards.
+/// Returns true only when delivered; missing/reused identities are a false no-op.
+pub(crate) fn signal_owned_lease(lease: &Lease, signal: ProcessSignal) -> Result<bool, Error> {
+    match lease_liveness(lease) {
+        Liveness::Dead => {
+            #[cfg(unix)]
+            if !read_process_identity(lease.pid).is_some_and(|identity| {
+                matches!(identity.state, b'Z' | b'X')
+                    && identity.pgid == lease.pgid
+                    && identity.start_time_ticks == lease.process_start_time_ticks
+            }) {
+                return Ok(false);
+            }
+            #[cfg(windows)]
+            return Ok(false);
+        }
+        Liveness::Indeterminate => return Err(Error::ProcessIdentity(lease.pid)),
+        Liveness::Alive => {}
+    }
+    if lease.pid == std::process::id()
+        || lease
+            .workspace_supervisor
+            .as_ref()
+            .is_some_and(|supervisor| supervisor.pid == lease.pid)
+    {
+        return Err(Error::Spawn(io::Error::other(
+            "refusing to kill the workspace supervisor or caller",
+        )));
+    }
+    #[cfg(unix)]
+    {
+        // Managed children lead their own group. Never signal the caller's or
+        // workspace supervisor's group, even if a malformed lease names it.
+        if lease.pgid <= 1
+            || i32::try_from(lease.pid) != Ok(lease.pgid)
+            || read_process_identity(std::process::id())
+                .is_none_or(|identity| identity.pgid == lease.pgid)
+            || lease
+                .workspace_supervisor
+                .as_ref()
+                .is_some_and(|supervisor| {
+                    read_process_identity(supervisor.pid).is_some_and(|identity| {
+                        identity.start_time_ticks == supervisor.process_start_time_ticks
+                            && identity.pgid == lease.pgid
+                    })
+                })
+        {
+            return Err(Error::Spawn(io::Error::other(
+                "refusing to kill a lease outside its own application process group",
+            )));
+        }
+    }
+    #[cfg(unix)]
+    {
+        owned_group_signal_result(signal_lease(lease, signal))
+    }
+    #[cfg(windows)]
+    {
+        match signal {
+            ProcessSignal::Kill => kill_owned_job(lease),
+            _ => signal_lease(lease, signal),
+        }
+        .map(|()| true)
+        .map_err(Error::Spawn)
+    }
+}
+
+#[cfg(unix)]
+fn owned_group_signal_result(result: io::Result<()>) -> Result<bool, Error> {
+    match result {
+        Ok(()) => Ok(true),
+        // The verified group can exit and be reaped before kill(2). No signal
+        // was delivered, so marker recovery must still inspect descendants.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Err(error) => Err(Error::Spawn(error)),
+    }
+}
+
+/// Recover the independent runner tree even after its leader has been reaped.
+/// No environment is persisted or reported; only an exact inherited marker is
+/// compared in memory. pidfds pin each verified process across PID reuse.
+pub(crate) fn cleanup_workspace_processes(
+    group_id: Uuid,
+    group: &crate::state::WorkspaceGroup,
+) -> io::Result<()> {
+    if let Some(runner) = &group.runner {
+        if runner.id != group_id
+            || runner.group_id != Some(group_id)
+            || runner.workspace_supervisor.as_ref() != Some(&group.supervisor)
+        {
+            return Err(io::Error::other(
+                "workspace runner identity does not match its group",
+            ));
+        }
+        kill_owned_lease(runner).map_err(io::Error::other)?;
+    }
+    cleanup_marked_workspace_processes(
+        crate::workspace_session::recovery_path(group_id, group)?,
+        None,
+        group.supervisor.process_start_time_ticks,
+    )
+}
+
+pub(crate) fn cleanup_workspace_member_processes(
+    path: &std::path::Path,
+    token: Uuid,
+    started_after: u64,
+    child: Option<&Lease>,
+) -> io::Result<()> {
+    if let Some(child) = child {
+        kill_owned_lease(child).map_err(io::Error::other)?;
+    }
+    cleanup_marked_workspace_processes(path, Some(token), started_after)
+}
+
+#[cfg(target_os = "linux")]
+struct RecoveryMarkers {
+    exact: Vec<Vec<u8>>,
+    claim_prefix: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "linux")]
+impl RecoveryMarkers {
+    fn new(path: &std::path::Path, claim: Option<Uuid>) -> Self {
+        let marker = |key: &str, value: &std::ffi::OsStr| {
+            let mut marker = key.as_bytes().to_vec();
+            marker.push(b'=');
+            marker.extend_from_slice(value.as_bytes());
+            marker
+        };
+        if let Some(token) = claim {
+            Self {
+                exact: vec![marker(
+                    crate::workspace_session::PROCESS_VARIABLE,
+                    &crate::workspace_session::member_process_marker(path, token),
+                )],
+                claim_prefix: None,
+            }
+        } else {
+            let process = marker(crate::workspace_session::PROCESS_VARIABLE, path.as_os_str());
+            let mut prefix = process.clone();
+            prefix.push(b'/');
+            Self {
+                exact: vec![
+                    marker(crate::workspace_session::SESSION_VARIABLE, path.as_os_str()),
+                    process,
+                ],
+                claim_prefix: Some(prefix),
+            }
+        }
+    }
+
+    fn matches(&self, environment: &[u8]) -> bool {
+        environment.split(|byte| *byte == 0).any(|value| {
+            self.exact.iter().any(|marker| value == marker)
+                || self.claim_prefix.as_ref().is_some_and(|prefix| {
+                    value
+                        .strip_prefix(prefix.as_slice())
+                        .and_then(|token| std::str::from_utf8(token).ok())
+                        .is_some_and(|token| Uuid::parse_str(token).is_ok())
+                })
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_marked_workspace_processes(
+    path: &std::path::Path,
+    claim: Option<Uuid>,
+    started_after: u64,
+) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while signal_marked_workspace_processes(path, claim, started_after, ProcessSignal::Kill, &[])? {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "workspace descendants have not exited; retry prune",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// One pass over exactly marked descendants. Graceful shutdown uses the same
+/// identity, namespace and pidfd protections as forced recovery. Skip groups
+/// only after a verified group signal was actually delivered to them.
+#[cfg(target_os = "linux")]
+pub(crate) fn signal_marked_workspace_processes(
+    path: &std::path::Path,
+    claim: Option<Uuid>,
+    started_after: u64,
+    signal: ProcessSignal,
+    signaled_groups: &[i32],
+) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let markers = RecoveryMarkers::new(path, claim);
+    let uid = fs::metadata("/proc/self")?.uid();
+    let namespace = fs::read_link("/proc/self/ns/user")?;
+    let uid_map = fs::read("/proc/self/uid_map")?;
+    let mut found = false;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        // An inaccessible candidate is not proof of workspace ownership.
+        // Establish the exact marker before treating inspection failures as
+        // recovery errors, so unrelated protected processes cannot block it.
+        let Ok(environment) = fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        if !markers.matches(&environment) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.uid() != uid {
+            continue;
+        }
+        let Some(identity) = read_process_identity(pid) else {
+            if entry.path().exists() {
+                return Err(io::Error::other(
+                    "cannot verify workspace candidate identity",
+                ));
+            }
+            continue;
+        };
+        if matches!(identity.state, b'Z' | b'X') || signaled_groups.contains(&identity.pgid) {
+            continue;
+        }
+        // Exact inherited ownership also covers setsid descendants and
+        // processes launched before their lease association was persisted.
+        if identity.start_time_ticks < started_after {
+            continue;
+        }
+        // Host processes mapped into a test's user namespace are not
+        // candidates, even when their displayed uid happens to match.
+        match fs::read(entry.path().join("uid_map")) {
+            Ok(candidate_map) if candidate_map != uid_map => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        if !workspace_namespace_matches(
+            pid,
+            identity,
+            &namespace,
+            fs::read_link(entry.path().join("ns/user")),
+        )? {
+            continue;
+        }
+        found |= signal_marked_process(pid, identity, &markers, signal)?;
+    }
+    Ok(found)
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_namespace_matches(
+    pid: u32,
+    expected: ProcIdentity,
+    namespace: &std::path::Path,
+    result: io::Result<std::path::PathBuf>,
+) -> io::Result<bool> {
+    match result {
+        Ok(candidate) => Ok(candidate == namespace),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // proc_ns_readlink also returns EACCES if the task disappears
+            // after resolving its namespace dentry. Only confirmed exit or
+            // PID reuse makes this harmless; unknown/live identity keeps the
+            // original permission error and leaves recovery pending.
+            let exited = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => parse_stat(&stat).is_some_and(|identity| {
+                    matches!(identity.state, b'Z' | b'X')
+                        || identity.start_time_ticks != expected.start_time_ticks
+                }),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                _ => false,
+            };
+            if exited { Ok(false) } else { Err(error) }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn signal_marked_process(
+    pid: u32,
+    expected: ProcIdentity,
+    markers: &RecoveryMarkers,
+    signal: ProcessSignal,
+) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Open before re-reading /proc. Even if the numeric PID is reused during
+    // validation, the signal can only reach the process pinned by this fd.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    if !read_process_identity(pid).is_some_and(|identity| {
+        !matches!(identity.state, b'Z' | b'X')
+            && identity.pgid == expected.pgid
+            && identity.start_time_ticks == expected.start_time_ticks
+    }) {
+        return Ok(false);
+    }
+    let environment = match fs::read(format!("/proc/{pid}/environ")) {
+        Ok(environment) => environment,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !markers.matches(&environment) {
+        return Ok(false);
+    }
+    let signal = match signal {
+        ProcessSignal::Interrupt => libc::SIGINT,
+        ProcessSignal::Terminate => libc::SIGTERM,
+        ProcessSignal::Kill => libc::SIGKILL,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn cleanup_marked_workspace_processes(
+    _path: &std::path::Path,
+    _claim: Option<Uuid>,
+    _started_after: u64,
+) -> io::Result<()> {
+    // Every runner is assigned to a non-inherited KILL_ON_JOB_CLOSE job before
+    // it is resumed. Root death closes the last handle, including the window
+    // before its process identity could be persisted in the registry.
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn cleanup_marked_workspace_processes(
+    _path: &std::path::Path,
+    _claim: Option<Uuid>,
+    _started_after: u64,
+) -> io::Result<()> {
+    Err(io::Error::other(
+        "workspace descendant recovery requires Linux /proc",
+    ))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn kill_owned_job(lease: &Lease) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, OpenJobObjectW, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, lease.pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let name = job_name(lease.id);
+    let job = unsafe { OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
+    if job.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe { CloseHandle(process) };
+        return Err(error);
+    }
+    let mut belongs = 0;
+    let result = if unsafe { IsProcessInJob(process, job, &mut belongs) } == 0 {
+        Err(io::Error::last_os_error())
+    } else if belongs == 0 || lease_liveness(lease) != Liveness::Alive {
+        Err(io::Error::other(
+            "cannot verify application ownership of the named job",
+        ))
+    } else if unsafe { TerminateJobObject(job, 1) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    unsafe {
+        CloseHandle(job);
+        CloseHandle(process);
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -2070,6 +2848,348 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_recovery_finds_non_http_descendants_after_runner_reaping_or_unjournaled_spawn() {
+        for (persisted_runner, unassociated_member) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (store, state_path) = temporary_store();
+            let root = state_path.parent().unwrap();
+            std::fs::create_dir_all(root).unwrap();
+            let marker_file = root.join("watcher.pid");
+            let group_id = Uuid::new_v4();
+            crate::workspace_session::journal_group(&store, group_id).unwrap();
+            let mut group = store
+                .load()
+                .unwrap()
+                .workspace_groups
+                .remove(&group_id)
+                .unwrap();
+            let actual_path = root
+                .join("custom-temp")
+                .join(format!("nook-session-{group_id}/context.json"));
+            assert_ne!(
+                actual_path,
+                crate::workspace_session::session_path(group_id)
+            );
+            group.session_path = Some(actual_path.clone().into_os_string());
+            store
+                .mutate(|registry| {
+                    registry.workspace_groups.insert(group_id, group.clone());
+                    Ok(())
+                })
+                .unwrap();
+            group = store
+                .load()
+                .unwrap()
+                .workspace_groups
+                .remove(&group_id)
+                .unwrap();
+            let code = if unassociated_member {
+                "import os,subprocess,time,uuid; env=os.environ.copy(); env['NOOK_WORKSPACE_PROCESS']=env.pop('NOOK_WORKSPACE_SESSION')+'/'+str(uuid.uuid4()); p=subprocess.Popen(['/bin/sleep','30'],start_new_session=True,env=env); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
+            } else {
+                "import os,subprocess,time; p=subprocess.Popen(['/bin/sleep','30'],start_new_session=True); open(os.environ['WATCHER_PID'],'w').write(str(p.pid)); time.sleep(.05)"
+            };
+            let mut leader = super::spawn_managed_child_in(
+                &["/usr/bin/python3".into(), "-c".into(), code.into()],
+                &[
+                    (
+                        crate::workspace_session::SESSION_VARIABLE.into(),
+                        actual_path.into_os_string(),
+                    ),
+                    ("WATCHER_PID".into(), marker_file.into_os_string()),
+                ],
+                group_id,
+                None,
+                None,
+            )
+            .unwrap();
+            if persisted_runner {
+                group.runner = Some(crate::state::Lease {
+                    group_id: Some(group_id),
+                    workspace_supervisor: Some(group.supervisor.clone()),
+                    lan: false,
+                    id: group_id,
+                    hostname: String::new(),
+                    target: String::new(),
+                    scheme: Scheme::Http,
+                    tls: false,
+                    pid: leader.pid,
+                    pgid: leader.pgid,
+                    process_start_time_ticks: leader.start_time_ticks,
+                    state: LeaseState::Starting,
+                });
+            }
+            assert_eq!(leader.wait().unwrap(), 0);
+            let watcher: u32 = std::fs::read_to_string(root.join("watcher.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(read_process_identity(leader.pid).is_none());
+            assert!(
+                read_process_identity(watcher).is_some_and(|identity| identity.pgid
+                    == watcher as i32
+                    && identity.state != b'Z')
+            );
+            super::cleanup_workspace_processes(group_id, &group).unwrap();
+            assert!(
+                read_process_identity(watcher)
+                    .is_none_or(|identity| matches!(identity.state, b'Z' | b'X'))
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn workspace_namespace_read_handles_task_exit_after_lookup() {
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let namespace = fs::read_link("/proc/self/ns/user").unwrap();
+        let mut child = spawn_child(&["/bin/sleep".into(), "30".into()], &[]).unwrap();
+        let identity = read_process_identity(child.pid).unwrap();
+        // Pin the resolved namespace dentry, as readlink's path lookup does
+        // before proc_ns_readlink obtains the task. Then reap that task.
+        let link = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(format!("/proc/{}/ns/user", child.pid))
+            .unwrap();
+        let read_link = || {
+            let mut buffer = [0_u8; 128];
+            let length = unsafe {
+                libc::readlinkat(
+                    link.as_raw_fd(),
+                    c"".as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if length < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(std::path::PathBuf::from(OsString::from_vec(
+                    buffer[..length as usize].to_vec(),
+                )))
+            }
+        };
+        assert!(
+            super::workspace_namespace_matches(child.pid, identity, &namespace, read_link())
+                .unwrap()
+        );
+        child.child.kill().unwrap();
+        child.wait().unwrap();
+        let result = read_link();
+        assert_eq!(
+            result.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert!(
+            !super::workspace_namespace_matches(child.pid, identity, &namespace, result).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_recovery_skips_protected_foreign_processes_but_keeps_owned_errors() {
+        use std::fs;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Stdio;
+
+        // Namespace root may have CAP_SYS_PTRACE. Drop capabilities in an
+        // isolated copy of this test so the /proc failures are real there too.
+        const TEST: &str = "process::tests::workspace_recovery_skips_protected_foreign_processes_but_keeps_owned_errors";
+        const ISOLATED: &str = "NOOK_PROTECTED_RECOVERY_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import ctypes,os,sys\nclass Header(ctypes.Structure): _fields_=[('version',ctypes.c_uint32),('pid',ctypes.c_int)]\nclass Data(ctypes.Structure): _fields_=[('effective',ctypes.c_uint32),('permitted',ctypes.c_uint32),('inheritable',ctypes.c_uint32)]\nlibc=ctypes.CDLL(None); assert libc.prctl(38,1,0,0,0)==0; assert libc.capset(ctypes.byref(Header(0x20080522,0)),ctypes.byref((Data*2)()))==0; os.execv(sys.argv[1],sys.argv[1:])",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let mut foreign = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import ctypes,time; assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; print('protected',flush=True); time.sleep(30)",
+            ])
+            .env_remove(crate::workspace_session::SESSION_VARIABLE)
+            .env_remove(crate::workspace_session::PROCESS_VARIABLE)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(foreign.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "protected");
+        let foreign_path = std::path::PathBuf::from(format!("/proc/{}", foreign.id()));
+        assert_eq!(
+            std::fs::metadata(&foreign_path).unwrap().uid(),
+            std::fs::metadata("/proc/self").unwrap().uid(),
+            "the protected process must reach the same-uid candidate checks"
+        );
+        assert_eq!(
+            std::fs::read_link(foreign_path.join("ns/user"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read(foreign_path.join("environ"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let path = crate::workspace_session::session_path(Uuid::new_v4());
+        let started_after = read_process_identity(std::process::id())
+            .unwrap()
+            .start_time_ticks;
+        for claim in [None, Some(Uuid::new_v4())] {
+            let token = claim.unwrap_or_else(Uuid::new_v4);
+            let mut child = super::spawn_managed_child_in(
+                &["/bin/sleep".into(), "30".into()],
+                &[(
+                    crate::workspace_session::PROCESS_VARIABLE.into(),
+                    crate::workspace_session::member_process_marker(&path, token),
+                )],
+                token,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(foreign.id() < child.pid);
+            let result = super::cleanup_marked_workspace_processes(&path, claim, started_after);
+            let killed = child.try_wait().unwrap().is_some();
+            let foreign_alive = foreign.try_wait().unwrap().is_none();
+            // Reap both children even when exercising the unfixed scanner.
+            if !killed {
+                child.child.kill().unwrap();
+            }
+            child.wait().unwrap();
+            if result.is_err() || !killed || !foreign_alive {
+                let _ = foreign.kill();
+                foreign.wait().unwrap();
+            }
+            result.unwrap();
+            assert!(killed, "the later marked child must be killed");
+            assert!(foreign_alive, "the protected foreign process must survive");
+        }
+        foreign.kill().unwrap();
+        foreign.wait().unwrap();
+
+        // An exact marker observed before the process becomes protected still
+        // must not turn a failed pidfd validation into a successful cleanup.
+        let mut owned = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import ctypes,sys,time; print('ready',flush=True); sys.stdin.readline(); assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; print('protected',flush=True); time.sleep(30)",
+            ])
+            .env(crate::workspace_session::SESSION_VARIABLE, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(owned.stdout.take().unwrap());
+        ready.clear();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let identity = read_process_identity(owned.id()).unwrap();
+        let markers = super::RecoveryMarkers::new(&path, None);
+        assert!(markers.matches(&std::fs::read(format!("/proc/{}/environ", owned.id())).unwrap()));
+        owned.stdin.take().unwrap().write_all(b"protect\n").unwrap();
+        ready.clear();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "protected");
+        let namespace = fs::read_link("/proc/self/ns/user").unwrap();
+        let protected_namespace = fs::read_link(format!("/proc/{}/ns/user", owned.id()));
+        assert_eq!(
+            protected_namespace.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let namespace_result = super::workspace_namespace_matches(
+            owned.id(),
+            identity,
+            &namespace,
+            protected_namespace,
+        );
+        assert_eq!(
+            namespace_result.unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let result =
+            super::signal_marked_process(owned.id(), identity, &markers, ProcessSignal::Kill);
+        let owned_alive = owned.try_wait().unwrap().is_none();
+        owned.kill().unwrap();
+        owned.wait().unwrap();
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(owned_alive, "failed ownership validation must not signal");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_marker_kill_rejects_reused_identity_and_foreign_marker() {
+        let group_id = Uuid::new_v4();
+        let marker =
+            super::RecoveryMarkers::new(&crate::workspace_session::session_path(group_id), None);
+        let mut child = super::spawn_managed_child_in(
+            &["/bin/sleep".into(), "30".into()],
+            &[(
+                crate::workspace_session::SESSION_VARIABLE.into(),
+                crate::workspace_session::session_path(group_id).into_os_string(),
+            )],
+            group_id,
+            None,
+            None,
+        )
+        .unwrap();
+        let identity = read_process_identity(child.pid).unwrap();
+        let reused = ProcIdentity {
+            start_time_ticks: identity.start_time_ticks + 1,
+            ..identity
+        };
+        assert!(
+            !super::signal_marked_process(child.pid, reused, &marker, ProcessSignal::Kill).unwrap()
+        );
+        assert!(
+            !super::signal_marked_process(
+                child.pid,
+                identity,
+                &super::RecoveryMarkers::new(std::path::Path::new("/foreign/context.json"), None),
+                ProcessSignal::Kill
+            )
+            .unwrap()
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        // Scheduling state is transient; an otherwise valid sleeping/running
+        // identity must still authorize the pinned process.
+        let changed_state = ProcIdentity {
+            state: b'R',
+            ..read_process_identity(child.pid).unwrap()
+        };
+        assert!(
+            super::signal_marked_process(child.pid, changed_state, &marker, ProcessSignal::Kill)
+                .unwrap()
+        );
+        assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
+    }
+
+    #[test]
     fn zombie_and_reused_process_identities_are_dead() {
         let identity = ProcIdentity {
             state: b'Z',
@@ -2109,7 +3229,8 @@ mod tests {
             &std::fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap(),
         )
         .unwrap();
-        assert_eq!(first, second);
+        assert_eq!(first.pgid, second.pgid);
+        assert_eq!(first.start_time_ticks, second.start_time_ticks);
         assert!(first.start_time_ticks > 0);
     }
 
@@ -2334,7 +3455,36 @@ sys.exit(1)
         if !child.has_exited().unwrap() {
             child.signal(ProcessSignal::Terminate).unwrap();
         }
-        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "polled child did not exit");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            child.terminal.is_none(),
+            "polling must restore the terminal"
+        );
+
+        // Native workspace apps have null stdin, even when Nook runs in a TTY.
+        // Neither spawn nor the polling loop may hand them its foreground.
+        let mut native = super::spawn_managed_child_in(
+            &["/bin/sleep".into(), "10".into()],
+            &[],
+            Uuid::new_v4(),
+            None,
+            Some("native"),
+        )
+        .unwrap();
+        assert!(native.try_wait().unwrap().is_none());
+        let foreground = Command::new("python3")
+            .args(["-c", "import os; assert os.tcgetpgrp(0) == os.getpgrp()"])
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .unwrap();
+        native.signal(ProcessSignal::Kill).unwrap();
+        native.wait().unwrap();
+        native.join_output();
+        assert!(foreground.status.success(), "native app took the terminal");
     }
 
     #[test]
@@ -2476,11 +3626,17 @@ sys.exit(3)
             );
             thread::sleep(Duration::from_millis(20));
         }
-        child.follow_stopped_child();
-        assert!(
-            process_is_stopped(sibling_pid),
-            "wrapper SIGTSTP must stop the rest of its process group"
-        );
+        assert!(child.try_wait().unwrap().is_none());
+        // The shell can resume the wrapper before its sibling has processed
+        // the group stop signal. Wait for the observable state, not scheduling.
+        let sibling_stop_deadline = Instant::now() + Duration::from_secs(1);
+        while !process_is_stopped(sibling_pid) {
+            assert!(
+                Instant::now() < sibling_stop_deadline,
+                "wrapper SIGTSTP must stop the rest of its process group"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         let continue_deadline = Instant::now() + Duration::from_secs(1);
         while process_is_stopped(child.pid) {
             assert!(
@@ -2501,6 +3657,178 @@ sys.exit(3)
             spawn_child(&[OsString::from("/bin/sleep"), OsString::from("10")], &[]).unwrap();
         child.signal(ProcessSignal::Terminate).unwrap();
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGTERM);
+    }
+
+    #[test]
+    fn owned_cleanup_refuses_the_callers_or_supervisors_group() {
+        let identity = read_process_identity(std::process::id()).unwrap();
+        let mut lease = crate::state::Lease {
+            group_id: None,
+            workspace_supervisor: None,
+            lan: false,
+            id: Uuid::new_v4(),
+            hostname: "app.localhost".into(),
+            target: "http://127.0.0.1:3000".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            pid: std::process::id(),
+            pgid: identity.pgid,
+            process_start_time_ticks: identity.start_time_ticks,
+            state: LeaseState::Ready,
+        };
+        assert!(super::kill_owned_lease(&lease).is_err());
+        let mut child = spawn_child(&["/bin/sleep".into(), "10".into()], &[]).unwrap();
+        lease.pid = child.pid;
+        lease.pgid = child.pgid;
+        lease.process_start_time_ticks = child.start_time_ticks;
+        lease.workspace_supervisor = Some(crate::state::WorkspaceSupervisor {
+            pid: child.pid,
+            process_start_time_ticks: child.start_time_ticks,
+        });
+        let refused = super::kill_owned_lease(&lease).is_err();
+        let still_running = child.try_wait().unwrap().is_none();
+        lease.workspace_supervisor = None;
+        lease.process_start_time_ticks += 1;
+        let reused = super::signal_owned_lease(&lease, ProcessSignal::Terminate).unwrap();
+        let survived_reused = child.try_wait().unwrap().is_none();
+        lease.process_start_time_ticks -= 1;
+        let delivered = super::signal_owned_lease(&lease, ProcessSignal::Terminate).unwrap();
+        let code = child.wait().unwrap();
+        let missing = super::signal_owned_lease(&lease, ProcessSignal::Terminate).unwrap();
+        assert!(refused && still_running);
+        assert!(
+            !reused && survived_reused,
+            "a reused identity must report no delivery"
+        );
+        assert!(delivered, "a verified group signal must report delivery");
+        assert_eq!(code, 128 + libc::SIGTERM);
+        assert!(!missing, "a reaped process must report no delivery");
+    }
+
+    #[test]
+    fn owned_group_signal_handles_exit_after_verification() {
+        let mut child = spawn_child(&["/bin/sleep".into(), "30".into()], &[]).unwrap();
+        let lease = crate::state::Lease {
+            group_id: None,
+            workspace_supervisor: None,
+            lan: false,
+            id: Uuid::new_v4(),
+            hostname: "app.localhost".into(),
+            target: "http://127.0.0.1:3000".into(),
+            scheme: Scheme::Http,
+            tls: false,
+            pid: child.pid,
+            pgid: child.pgid,
+            process_start_time_ticks: child.start_time_ticks,
+            state: LeaseState::Ready,
+        };
+        assert_eq!(super::lease_liveness(&lease), Liveness::Alive);
+        child.child.kill().unwrap();
+        child.wait().unwrap();
+
+        // Model exit/reaping after ownership verification, before dispatch.
+        // Calling signal_owned_lease now would only exercise its early Dead path.
+        let result = super::signal_lease(&lease, ProcessSignal::Terminate);
+        assert_eq!(
+            result.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(!super::owned_group_signal_result(result).unwrap());
+        assert!(matches!(
+            super::owned_group_signal_result(Err(std::io::Error::from_raw_os_error(libc::EPERM))),
+            Err(super::Error::Spawn(error)) if error.raw_os_error() == Some(libc::EPERM)
+        ));
+    }
+
+    #[test]
+    fn prepared_port_can_be_released_twice_before_member_joins() {
+        let (store, path) = temporary_store();
+        let config = run_config(vec!["/bin/sleep", "10"], 30);
+        let operations = store.lock_operations().unwrap();
+        let reservation = reserve_port(None, false).unwrap();
+        let port = reservation.port;
+        let mut prepared = super::prepare_run(
+            &config,
+            reservation,
+            &store,
+            &mut Routes::default(),
+            &operations,
+            &mut LocalOnly,
+        )
+        .unwrap();
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err());
+        prepared.release_port();
+        prepared.release_port();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+        drop(listener);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn owned_cleanup_kills_the_members_entire_verified_group() {
+        for zombie_leader in [false, true] {
+            let (store, path) = temporary_store();
+            let marker = path.with_extension("descendant");
+            let config = run_config(
+                vec![
+                    "/bin/sh",
+                    "-c",
+                    "sleep 10 & echo $! > \"$1\"; wait",
+                    "nook-test",
+                    marker.to_str().unwrap(),
+                ],
+                30,
+            );
+            let mut running = start_run(&config, &store, &mut Routes::default()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let descendant = loop {
+                if let Ok(contents) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "member did not launch its descendant"
+                );
+                thread::sleep(Duration::from_millis(5));
+            };
+            let identity = read_process_identity(descendant).unwrap();
+            assert_eq!(identity.pgid, running.child.pgid);
+            let lease = store
+                .load()
+                .unwrap()
+                .leases
+                .remove(&running.lease_id)
+                .unwrap();
+            if zombie_leader {
+                // Kill only the leader and leave it unreaped: its recorded raw
+                // identity still proves ownership of the surviving descendant.
+                running.child.child.kill().unwrap();
+                while super::lease_liveness(&lease) != Liveness::Dead {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(read_process_identity(lease.pid).unwrap().state, b'Z');
+                assert_eq!(
+                    read_process_identity(descendant).unwrap().start_time_ticks,
+                    identity.start_time_ticks
+                );
+            }
+            super::kill_owned_lease(&lease).unwrap();
+            assert_eq!(running.child.wait().unwrap(), 128 + libc::SIGKILL);
+            while read_process_identity(descendant).is_some_and(|current| {
+                identity_liveness(current, identity.pgid, identity.start_time_ticks)
+                    == Liveness::Alive
+            }) {
+                assert!(
+                    Instant::now() < deadline,
+                    "member descendant survived group cleanup"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -2818,6 +4146,114 @@ sys.exit(3)
     }
 
     #[test]
+    fn workspace_stop_requires_an_associated_member_and_consistent_group() {
+        use crate::state::{Lease, WorkspaceGroup, WorkspaceSupervisor};
+
+        let (store, path) = temporary_store();
+        let group_id = Uuid::new_v4();
+        let supervisor = WorkspaceSupervisor {
+            pid: 100,
+            process_start_time_ticks: 10,
+        };
+        let runner = Lease {
+            id: group_id,
+            group_id: Some(group_id),
+            workspace_supervisor: Some(supervisor.clone()),
+            lan: false,
+            hostname: String::new(),
+            target: String::new(),
+            scheme: Scheme::Http,
+            tls: false,
+            pid: 200,
+            pgid: 200,
+            process_start_time_ticks: 20,
+            state: LeaseState::Starting,
+        };
+        let mut member = runner.clone();
+        member.id = Uuid::new_v4();
+        member.hostname = "api.localhost".into();
+        member.target = "http://127.0.0.1:3000".into();
+        let group = WorkspaceGroup {
+            supervisor,
+            runner: Some(runner),
+            session_path: None,
+        };
+        for case in [
+            "pending",
+            "pending_ready",
+            "runner_pid",
+            "runner_group",
+            "missing_group",
+            "missing_supervisor",
+            "wrong_supervisor",
+            "wrong_runner_owner",
+            "wrong_runner_group",
+            "wrong_runner_supervisor",
+            "active_starting",
+            "active_ready",
+            "native_starting",
+        ] {
+            let mut lease = member.clone();
+            let mut journal = group.clone();
+            if !matches!(case, "pending" | "pending_ready") {
+                lease.pid = 300;
+                lease.pgid = 300;
+                lease.process_start_time_ticks = 30;
+            }
+            match case {
+                "pending_ready" | "active_ready" => lease.state = LeaseState::Ready,
+                // Partial identity matches must fail closed, even with a different start time.
+                "runner_pid" => lease.pid = 200,
+                "runner_group" => lease.pgid = 200,
+                "missing_supervisor" => lease.workspace_supervisor = None,
+                "wrong_supervisor" => {
+                    lease
+                        .workspace_supervisor
+                        .as_mut()
+                        .unwrap()
+                        .process_start_time_ticks += 1;
+                }
+                "wrong_runner_owner" => journal.runner.as_mut().unwrap().id = Uuid::new_v4(),
+                "wrong_runner_group" => journal.runner.as_mut().unwrap().group_id = None,
+                "wrong_runner_supervisor" => {
+                    journal.runner.as_mut().unwrap().workspace_supervisor = None;
+                }
+                "native_starting" => journal.runner = None,
+                _ => {}
+            }
+            store
+                .mutate(|registry| {
+                    registry.leases.insert(lease.id, lease.clone());
+                    registry.workspace_groups.clear();
+                    if case != "missing_group" {
+                        registry.workspace_groups.insert(group_id, journal.clone());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let before = store.load().unwrap();
+            for force in [false, true] {
+                let mut system = ControlledStop::default();
+                let result = stop_managed(&store, "api.localhost", force, &mut system);
+                if matches!(case, "active_starting" | "active_ready" | "native_starting") {
+                    assert!(result.is_ok(), "{case}: {result:?}");
+                    assert_eq!(system.signals[0], ProcessSignal::Terminate, "{case}");
+                    assert_eq!(system.signals.len(), if force { 2 } else { 1 }, "{case}");
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "{case} force={force} must not signal the runner"
+                    );
+                    assert!(system.signals.is_empty(), "{case}");
+                    assert_eq!(system.alive_checks, 0, "{case}");
+                }
+                assert_eq!(store.load().unwrap(), before, "{case}");
+            }
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn force_stop_waits_two_controlled_seconds_then_kills_group() {
         let (store, path) = temporary_store();
         let config = run_config(vec!["/bin/sleep", "10"], 30);
@@ -2968,6 +4404,56 @@ mod windows_tests {
     }
 
     #[test]
+    fn owned_cleanup_requires_member_identity_and_matching_named_job() {
+        let id = Uuid::new_v4();
+        let foreign_id = Uuid::new_v4();
+        let argv = [
+            "cmd.exe".into(),
+            "/D".into(),
+            "/C".into(),
+            "ping -n 20 127.0.0.1 >nul".into(),
+        ];
+        let mut child = super::spawn_managed_child(&argv, &[], id).unwrap();
+        let mut foreign = super::spawn_managed_child(&argv, &[], foreign_id).unwrap();
+        let mut lease = Lease {
+            group_id: None,
+            workspace_supervisor: None,
+            lan: false,
+            id: foreign_id,
+            hostname: "app.localhost".into(),
+            target: "http://127.0.0.1:3000".into(),
+            scheme: Scheme::Http,
+            tls: true,
+            pid: child.pid,
+            pgid: child.pgid,
+            process_start_time_ticks: child.start_time_ticks,
+            state: LeaseState::Ready,
+        };
+        assert!(
+            super::kill_owned_lease(&lease).is_err(),
+            "a different named job must not be killed"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        let foreign_survived = foreign.try_wait().unwrap().is_none();
+        foreign.signal(ProcessSignal::Kill).unwrap();
+        foreign.wait().unwrap();
+        assert!(
+            foreign_survived,
+            "a mismatched job must not receive a cleanup signal"
+        );
+        lease.id = id;
+        lease.process_start_time_ticks += 1;
+        super::kill_owned_lease(&lease).unwrap();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a reused PID must not be signaled"
+        );
+        lease.process_start_time_ticks -= 1;
+        super::kill_owned_lease(&lease).unwrap();
+        assert_eq!(child.wait().unwrap(), 1);
+    }
+
+    #[test]
     fn path_resolves_cmd_package_shims() {
         let directory = std::env::temp_dir().join(format!("nook command shim {}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -2997,6 +4483,39 @@ mod windows_tests {
         .unwrap();
         assert_eq!(child.wait().unwrap(), 7);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn member_directory_wins_over_root_executables_and_relative_path_entries() {
+        let root = std::env::temp_dir().join(format!("nook member shim {}", Uuid::new_v4()));
+        let member = root.join("apps/api");
+        std::fs::create_dir_all(member.join("bin")).unwrap();
+        std::fs::write(root.join("dev.cmd"), "@exit /b 9\r\n").unwrap();
+        std::fs::write(member.join("dev.cmd"), "@exit /b 7\r\n").unwrap();
+        std::fs::write(member.join("bin/tool.cmd"), "@exit /b 8\r\n").unwrap();
+        let environment = [
+            (OsString::from("PATH"), root.as_os_str().to_owned()),
+            (OsString::from("PATHEXT"), OsString::from(".CMD")),
+        ];
+        for program in ["dev.cmd", "./dev.cmd"] {
+            let mut child = super::spawn_managed_child_in(
+                &[program.into()],
+                &environment,
+                Uuid::new_v4(),
+                Some(&member),
+                None,
+            )
+            .unwrap();
+            assert_eq!(child.wait().unwrap(), 7);
+        }
+        let resolved = super::resolve_windows_program(
+            std::ffi::OsStr::new("tool"),
+            &[(OsString::from("PATH"), OsString::from("bin"))],
+            Some(&member),
+        )
+        .unwrap();
+        assert_eq!(resolved, member.join("bin/tool.CMD"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3049,6 +4568,8 @@ mod windows_tests {
         let pid = std::process::id();
         let identity = read_process_identity(pid).unwrap();
         let mut lease = Lease {
+            group_id: None,
+            workspace_supervisor: None,
             lan: false,
             id: Uuid::new_v4(),
             hostname: "test.localhost".into(),

@@ -359,6 +359,18 @@ forwards interruption signals, and preserves Nook's exit code. It has no depende
 hooks and never downloads Nook or Caddy. Nook must still be installed separately and available in
 `PATH`. The wrapper requires Node.js 22 or newer and invokes `nook` or `nook.exe` through `PATH`.
 
+## Monorepo workspaces
+
+A version 2 `nook.toml` can declare several `[[apps]]`, each with its own directory,
+command and domain. `nook run` reserves their ports and routes before starting the
+apps, and resolves references such as `${api.upstream}` in a frontend's environment.
+Use `nook run --only api` to select one app, or `nook init --workspace` for a template.
+
+For existing package scripts using `nook-run`, run the root development command
+through `nook run --runner -- pnpm dev`. Each wrapper joins the prepared workspace
+session and receives its app's port and URLs; the runner continues to launch the
+package tasks. See [workspace configuration and runner setup](docs/WORKSPACES.md).
+
 ## Persistent aliases
 
 ```sh
@@ -806,14 +818,14 @@ are atomic and locked; do not edit this registry while Nook is running.
 
 ## Scope
 
-Nook manages one service per project, local Caddy routes, persistent aliases, supervised Linux or
-Windows process trees, and recovery on the next CLI invocation. Caddy may run natively on either
+Nook manages standalone services and declared multi-app workspaces, local Caddy routes,
+persistent aliases, supervised Linux or Windows process trees, and recovery on the next CLI invocation. Caddy may run natively on either
 platform. On Windows, native `caddy.exe` is the primary supported mode; Docker Desktop remains a
 secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-multiple services or workspaces, native macOS support, rewriting framework config files,
+automatic worktree isolation, native macOS support, rewriting framework config files,
 Angular-specific origin allow-lists, and public exposure outside Tailscale Funnel.
 Private Tailscale Serve and public Tailscale Funnel are opt-in, as described in [Tailscale](#tailscale).
 
