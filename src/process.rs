@@ -2157,9 +2157,7 @@ pub(crate) fn signal_owned_lease(lease: &Lease, signal: ProcessSignal) -> Result
     }
     #[cfg(unix)]
     {
-        signal_lease(lease, signal)
-            .map(|()| true)
-            .map_err(Error::Spawn)
+        owned_group_signal_result(signal_lease(lease, signal))
     }
     #[cfg(windows)]
     {
@@ -2169,6 +2167,17 @@ pub(crate) fn signal_owned_lease(lease: &Lease, signal: ProcessSignal) -> Result
         }
         .map(|()| true)
         .map_err(Error::Spawn)
+    }
+}
+
+#[cfg(unix)]
+fn owned_group_signal_result(result: io::Result<()>) -> Result<bool, Error> {
+    match result {
+        Ok(()) => Ok(true),
+        // The verified group can exit and be reaped before kill(2). No signal
+        // was delivered, so marker recovery must still inspect descendants.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Err(error) => Err(Error::Spawn(error)),
     }
 }
 
@@ -3567,6 +3576,41 @@ sys.exit(3)
         assert!(delivered, "a verified group signal must report delivery");
         assert_eq!(code, 128 + libc::SIGTERM);
         assert!(!missing, "a reaped process must report no delivery");
+    }
+
+    #[test]
+    fn owned_group_signal_handles_exit_after_verification() {
+        let mut child = spawn_child(&["/bin/sleep".into(), "30".into()], &[]).unwrap();
+        let lease = crate::state::Lease {
+            group_id: None,
+            workspace_supervisor: None,
+            lan: false,
+            id: Uuid::new_v4(),
+            hostname: "app.localhost".into(),
+            target: "http://127.0.0.1:3000".into(),
+            scheme: Scheme::Http,
+            tls: false,
+            pid: child.pid,
+            pgid: child.pgid,
+            process_start_time_ticks: child.start_time_ticks,
+            state: LeaseState::Ready,
+        };
+        assert_eq!(super::lease_liveness(&lease), Liveness::Alive);
+        child.child.kill().unwrap();
+        child.wait().unwrap();
+
+        // Model exit/reaping after ownership verification, before dispatch.
+        // Calling signal_owned_lease now would only exercise its early Dead path.
+        let result = super::signal_lease(&lease, ProcessSignal::Terminate);
+        assert_eq!(
+            result.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(!super::owned_group_signal_result(result).unwrap());
+        assert!(matches!(
+            super::owned_group_signal_result(Err(std::io::Error::from_raw_os_error(libc::EPERM))),
+            Err(super::Error::Spawn(error)) if error.raw_os_error() == Some(libc::EPERM)
+        ));
     }
 
     #[test]

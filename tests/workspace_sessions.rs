@@ -282,12 +282,14 @@ os.execv(sys.argv[1],sys.argv[1:])",
                     state
                         .get(key)
                         .is_none_or(|value| value.as_object().unwrap().is_empty()),
-                    "{state}"
+                    "{key} survived shutdown: {state}\n{}",
+                    self.logs()
                 );
             }
             assert!(
                 state["pending_operations"].as_array().unwrap().is_empty(),
-                "{state}"
+                "pending operations survived shutdown: {state}\n{}",
+                self.logs()
             );
             let context = fs::read_to_string(self.path("context")).unwrap();
             assert!(!Path::new(&context).exists(), "session survived shutdown");
