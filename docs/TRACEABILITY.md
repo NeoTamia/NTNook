@@ -44,6 +44,7 @@ This matrix links product requirements to implementation tickets and checks trac
 | Native workspace process groups, prefixed logs, individual leases and group cleanup | NOOK-61, NOOK-66, NOOK-64 | `tests/workspace.rs`; existing single-app process tests |
 | Existing package wrappers join an inherited workspace session without duplicate routes or app launches | NOOK-78 | Session tests and `tests/workspace_runners.mjs` |
 | Root Turbo and Lerna commands preserve task orchestration and apply per-app environment | NOOK-79, NOOK-80 | `tests/workspace_runners.mjs` (real pinned runners, strict Turbo env, non-HTTP tasks and cleanup); `docs/WORKSPACES.md` |
+| Additional runner compatibility: pnpm, Bun, Vite Task/Vite dev and direct Nx; bounded moon system-task and Yarn node-modules checks | NOOK-81, NOOK-82, NOOK-83, NOOK-84, NOOK-85, NOOK-86, NOOK-87 | `tests/workspace_runners.mjs` (real pinned tools, filters, native error policy and crash recovery); Bun wrapper argv/fallback tests; `docs/WORKSPACES.md` |
 | Documentation for requirements, safeguards, troubleshooting, and out-of-scope items | NOOK-31, NOOK-43 | `README.md`, `RELEASE.md` |
 | Linux and Windows gates compile, format, lint, run native Caddy integrations, and produce verifiable binaries | NOOK-34, NOOK-35, NOOK-38, NOOK-41, NOOK-43, NOOK-58 | `.github/workflows/ci-crate.yml`; both archives, SHA-256 files, installers and attestations through `.github/workflows/publish.yml` |
 
