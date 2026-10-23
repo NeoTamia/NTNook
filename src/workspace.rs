@@ -903,12 +903,11 @@ impl RunningWorkspace {
         mut warn: impl FnMut(&str),
     ) -> crate::Result<RunOutcome> {
         let started = Instant::now();
+        let mut shutdown_signal = ProcessSignal::Terminate;
         let result = (|| -> crate::Result<i32> {
             loop {
                 if let Some(signal) = self.signals.pending().first() {
-                    for (_, running) in &self.apps {
-                        let _ = running.child.signal_foreground(*signal);
-                    }
+                    shutdown_signal = *signal;
                     return Ok(if *signal == ProcessSignal::Interrupt {
                         130
                     } else {
@@ -934,7 +933,7 @@ impl RunningWorkspace {
                 thread::sleep(Duration::from_millis(20));
             }
         })();
-        let mut warnings = self.terminate();
+        let mut warnings = self.terminate(Some(shutdown_signal));
         let processes_clean = warnings.is_empty();
         let mut cleanup_error = None;
         for (_, running) in &mut self.apps {
@@ -960,27 +959,25 @@ impl RunningWorkspace {
         })
     }
 
-    fn terminate(&mut self) -> Vec<String> {
+    fn terminate(&mut self, signal: Option<ProcessSignal>) -> Vec<String> {
         if self.terminated {
             return Vec::new();
         }
         self.terminated = true;
-        for (_, running) in &self.apps {
-            let _ = running.child.signal_foreground(ProcessSignal::Terminate);
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if self
-                .apps
-                .iter_mut()
-                .all(|(_, app)| app.child.try_wait().ok().flatten().is_some())
-            {
-                break;
+        if let Some(signal) = signal {
+            for (_, running) in &self.apps {
+                let _ = running.child.signal_foreground(signal);
             }
-            if !self.signals.pending().is_empty() {
-                break;
+            // A shell leader can exit before its descendants finish handling
+            // the chosen signal. Preserve the tree's entire bounded grace,
+            // including when another supervisor signal arrives during cleanup.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                for (_, running) in &mut self.apps {
+                    let _ = running.child.try_wait();
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            thread::sleep(Duration::from_millis(20));
         }
         // Kill groups even after the leader exits: descendants may retain pipes.
         for (_, running) in &mut self.apps {
@@ -1000,7 +997,7 @@ impl RunningWorkspace {
 impl Drop for RunningWorkspace {
     fn drop(&mut self) {
         // Errors in terminal output or readiness must never orphan a process tree.
-        self.terminate();
+        self.terminate(None);
     }
 }
 

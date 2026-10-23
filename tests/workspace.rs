@@ -19,7 +19,22 @@ use support::caddy::CaddyHarness;
 const CHILD: &str = r#"
 import os, pathlib
 pathlib.Path('spawned').write_text(str(os.getpid()))
-import http.client, http.server, json, socket, sys, time
+import http.client, http.server, json, signal, socket, sys, time
+mode = os.environ.get('SHUTDOWN_HANDLER')
+if mode:
+    def stop(sig, frame):
+        def repeated(sig, frame):
+            pathlib.Path('duplicate').write_text(str(sig))
+        signal.signal(signal.SIGINT, repeated)
+        if mode == 'both':
+            signal.signal(signal.SIGTERM, repeated)
+        pathlib.Path('stopping').write_text(str(sig))
+        time.sleep(.35)
+        pathlib.Path('clean').write_text(str(sig))
+        sys.exit(0)
+    signal.signal(signal.SIGINT, signal.SIG_IGN if mode == 'stubborn' else stop)
+    if mode in ['both', 'stubborn']:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == 'stubborn' else stop)
 if os.environ.get('SPAWN_DESCENDANT'):
     import subprocess
     descendant = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
@@ -38,12 +53,12 @@ pathlib.Path('started.tmp').write_text(json.dumps(report))
 pathlib.Path('started.tmp').rename('started.json')
 print('child-stdout', flush=True)
 print('child-stderr', file=sys.stderr, flush=True)
-if os.environ.get('FAIL_AFTER_SIBLING'):
+if os.environ.get('FAIL_AFTER_SIBLING') or os.environ.get('EXIT_AFTER_SIBLING'):
     deadline = time.monotonic() + 5
     while not pathlib.Path('../api/started.json').exists():
         assert time.monotonic() < deadline, 'sibling never started'
         time.sleep(.01)
-    sys.exit(23)
+    sys.exit(int(os.environ.get('EXIT_AFTER_SIBLING', '23')))
 server.serve_forever()
 "#;
 
@@ -169,6 +184,136 @@ fn workspace_prepares_siblings_before_spawn_and_cleans_up_on_ctrl_c() {
         );
     }
     fixture.assert_clean(&reports);
+}
+
+#[test]
+fn workspace_ctrl_c_allows_async_cleanup_with_default_sigterm() {
+    if in_network_namespace("workspace_ctrl_c_allows_async_cleanup_with_default_sigterm") {
+        return;
+    }
+    let fixture = Workspace::new();
+    fixture.configure(false, None, "SHUTDOWN_HANDLER = 'interrupt'\n");
+    let mut running = fixture.start(&["run", "--only", "web"]);
+    let reports = fixture.wait_ready(&mut running, &["web"]);
+    running.signal(libc::SIGINT);
+    assert_eq!(running.wait().code(), Some(130), "{}", running.logs());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("apps/web/clean")).ok(),
+        Some(libc::SIGINT.to_string()),
+        "SIGTERM interrupted the async Ctrl-C handler: {}",
+        running.logs()
+    );
+    fixture.assert_clean(&reports);
+}
+
+#[test]
+fn workspace_shutdown_delivers_the_chosen_signal_once() {
+    if in_network_namespace("workspace_shutdown_delivers_the_chosen_signal_once") {
+        return;
+    }
+    for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+        let fixture = Workspace::new();
+        fixture.configure(false, None, "SHUTDOWN_HANDLER = 'both'\n");
+        let mut running = fixture.start(&["run", "--only", "web"]);
+        let reports = fixture.wait_ready(&mut running, &["web"]);
+        running.signal(signal);
+        assert_eq!(running.wait().code(), Some(code), "{}", running.logs());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("apps/web/clean")).ok(),
+            Some(signal.to_string()),
+            "{}",
+            running.logs()
+        );
+        assert!(
+            !fixture.root.join("apps/web/duplicate").exists(),
+            "shutdown delivered a second signal: {}",
+            running.logs()
+        );
+        fixture.assert_clean(&reports);
+    }
+}
+
+#[test]
+fn workspace_shell_leader_exit_preserves_descendant_cleanup() {
+    if in_network_namespace("workspace_shell_leader_exit_preserves_descendant_cleanup") {
+        return;
+    }
+    for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+        let fixture = Workspace::new();
+        let command = json!([
+            "/bin/sh",
+            "-c",
+            "trap 'exit 130' INT; trap 'exit 143' TERM; python3 -u child.py & wait $!"
+        ])
+        .to_string();
+        fixture.configure(false, Some(&command), "SHUTDOWN_HANDLER = 'both'\n");
+        let mut running = fixture.start(&["run", "--only", "web"]);
+        let reports = fixture.wait_ready(&mut running, &["web"]);
+        running.signal(signal);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fixture.root.join("apps/web/stopping").exists() {
+            assert!(Instant::now() < deadline, "{}", running.logs());
+            thread::sleep(Duration::from_millis(5));
+        }
+        // A further supervisor signal must not truncate the descendant's grace.
+        running.signal(signal);
+        assert_eq!(running.wait().code(), Some(code), "{}", running.logs());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("apps/web/clean")).ok(),
+            Some(signal.to_string()),
+            "shell exit bypassed descendant cleanup: {}",
+            running.logs()
+        );
+        assert!(!fixture.root.join("apps/web/duplicate").exists());
+        fixture.assert_clean(&reports);
+    }
+}
+
+#[test]
+fn workspace_shutdown_kills_stubborn_children_after_bounded_grace() {
+    if in_network_namespace("workspace_shutdown_kills_stubborn_children_after_bounded_grace") {
+        return;
+    }
+    let fixture = Workspace::new();
+    fixture.configure(false, None, "SHUTDOWN_HANDLER = 'stubborn'\n");
+    let mut running = fixture.start(&["run", "--only", "web"]);
+    let reports = fixture.wait_ready(&mut running, &["web"]);
+    let started = Instant::now();
+    running.signal(libc::SIGINT);
+    assert_eq!(running.wait().code(), Some(130), "{}", running.logs());
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{}",
+        running.logs()
+    );
+    fixture.assert_clean(&reports);
+}
+
+#[test]
+fn workspace_member_exit_sends_term_and_preserves_the_exit_code() {
+    if in_network_namespace("workspace_member_exit_sends_term_and_preserves_the_exit_code") {
+        return;
+    }
+    for code in [0, 23] {
+        let fixture = Workspace::new();
+        fixture.configure(false, None, &format!("EXIT_AFTER_SIBLING = '{code}'\n"));
+        let mut command = fixture.nook();
+        command.arg("run").env("SHUTDOWN_HANDLER", "both");
+        let mut running = Running::start(command, &fixture.root, "run");
+        assert_eq!(running.wait().code(), Some(code), "{}", running.logs());
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("apps/api/clean")).ok(),
+            Some(libc::SIGTERM.to_string()),
+            "{}",
+            running.logs()
+        );
+        assert!(!fixture.root.join("apps/api/duplicate").exists());
+        fixture.assert_clean(&[
+            fixture.report("api").unwrap(),
+            fixture.report("web").unwrap(),
+        ]);
+    }
 }
 
 #[test]
