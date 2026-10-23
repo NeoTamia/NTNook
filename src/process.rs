@@ -973,6 +973,7 @@ pub(crate) struct RunOutcome {
 pub(crate) enum StopError {
     State(String),
     NotManaged(String),
+    PendingMember(String),
     Stale(String),
     Signal(String),
 }
@@ -984,6 +985,10 @@ impl fmt::Display for StopError {
             Self::NotManaged(hostname) => {
                 write!(formatter, "no managed run exists for `{hostname}`")
             }
+            Self::PendingMember(hostname) => write!(
+                formatter,
+                "workspace app `{hostname}` has not started; pending member association"
+            ),
             Self::Stale(hostname) => write!(
                 formatter,
                 "managed run `{hostname}` is no longer the same process"
@@ -1026,18 +1031,40 @@ pub(crate) fn stop_managed(
     let _operations = store
         .lock_operations()
         .map_err(|error| StopError::State(error.to_string()))?;
-    let lease = store
-        .mutate(|registry| {
-            Ok(registry
-                .leases
-                .values()
-                .find(|lease| lease.hostname == hostname)
-                .cloned())
-        })
-        .map_err(|error: crate::state::Error| StopError::State(error.to_string()))?;
-    let lease = lease
-        .as_ref()
+    let registry = store
+        .load()
+        .map_err(|error| StopError::State(error.to_string()))?;
+    let lease = registry
+        .leases
+        .values()
+        .find(|lease| lease.hostname == hostname)
         .ok_or_else(|| StopError::NotManaged(hostname.to_owned()))?;
+    if let Some(group_id) = lease.group_id {
+        let group = registry.workspace_groups.get(&group_id).ok_or_else(|| {
+            StopError::State(format!("workspace group for `{hostname}` is missing"))
+        })?;
+        if lease.workspace_supervisor.as_ref() != Some(&group.supervisor) {
+            return Err(StopError::State(format!(
+                "workspace ownership for `{hostname}` does not match its group"
+            )));
+        }
+        if let Some(runner) = &group.runner {
+            if runner.id != group_id
+                || runner.group_id != Some(group_id)
+                || runner.workspace_supervisor.as_ref() != Some(&group.supervisor)
+            {
+                return Err(StopError::State(
+                    "workspace runner identity does not match its group".into(),
+                ));
+            }
+            // Prepared runner apps point to the runner until associate_member
+            // replaces them. Never let an individual stop signal that tree,
+            // including partial/mismatched identities in an inconsistent journal.
+            if lease.pid == runner.pid || lease.pgid == runner.pgid {
+                return Err(StopError::PendingMember(hostname.to_owned()));
+            }
+        }
+    }
     if system.liveness(lease) != Liveness::Alive {
         return Err(StopError::Stale(hostname.to_owned()));
     }
@@ -2356,15 +2383,46 @@ pub(crate) fn signal_marked_workspace_processes(
             Err(error) => return Err(error),
             Ok(_) => {}
         }
-        match fs::read_link(entry.path().join("ns/user")) {
-            Ok(candidate_namespace) if candidate_namespace != namespace => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-            Ok(_) => {}
+        if !workspace_namespace_matches(
+            pid,
+            identity,
+            &namespace,
+            fs::read_link(entry.path().join("ns/user")),
+        )? {
+            continue;
         }
         found |= signal_marked_process(pid, identity, &markers, signal)?;
     }
     Ok(found)
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_namespace_matches(
+    pid: u32,
+    expected: ProcIdentity,
+    namespace: &std::path::Path,
+    result: io::Result<std::path::PathBuf>,
+) -> io::Result<bool> {
+    match result {
+        Ok(candidate) => Ok(candidate == namespace),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // proc_ns_readlink also returns EACCES if the task disappears
+            // after resolving its namespace dentry. Only confirmed exit or
+            // PID reuse makes this harmless; unknown/live identity keeps the
+            // original permission error and leaves recovery pending.
+            let exited = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => parse_stat(&stat).is_some_and(|identity| {
+                    matches!(identity.state, b'Z' | b'X')
+                        || identity.start_time_ticks != expected.start_time_ticks
+                }),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                _ => false,
+            };
+            if exited { Ok(false) } else { Err(error) }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2884,7 +2942,60 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn workspace_namespace_read_handles_task_exit_after_lookup() {
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let namespace = fs::read_link("/proc/self/ns/user").unwrap();
+        let mut child = spawn_child(&["/bin/sleep".into(), "30".into()], &[]).unwrap();
+        let identity = read_process_identity(child.pid).unwrap();
+        // Pin the resolved namespace dentry, as readlink's path lookup does
+        // before proc_ns_readlink obtains the task. Then reap that task.
+        let link = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(format!("/proc/{}/ns/user", child.pid))
+            .unwrap();
+        let read_link = || {
+            let mut buffer = [0_u8; 128];
+            let length = unsafe {
+                libc::readlinkat(
+                    link.as_raw_fd(),
+                    c"".as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if length < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(std::path::PathBuf::from(OsString::from_vec(
+                    buffer[..length as usize].to_vec(),
+                )))
+            }
+        };
+        assert!(
+            super::workspace_namespace_matches(child.pid, identity, &namespace, read_link())
+                .unwrap()
+        );
+        child.child.kill().unwrap();
+        child.wait().unwrap();
+        let result = read_link();
+        assert_eq!(
+            result.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert!(
+            !super::workspace_namespace_matches(child.pid, identity, &namespace, result).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn workspace_recovery_skips_protected_foreign_processes_but_keeps_owned_errors() {
+        use std::fs;
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::fs::MetadataExt;
         use std::process::Stdio;
@@ -3002,6 +3113,22 @@ mod tests {
         ready.clear();
         output.read_line(&mut ready).unwrap();
         assert_eq!(ready.trim(), "protected");
+        let namespace = fs::read_link("/proc/self/ns/user").unwrap();
+        let protected_namespace = fs::read_link(format!("/proc/{}/ns/user", owned.id()));
+        assert_eq!(
+            protected_namespace.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        let namespace_result = super::workspace_namespace_matches(
+            owned.id(),
+            identity,
+            &namespace,
+            protected_namespace,
+        );
+        assert_eq!(
+            namespace_result.unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
         let result =
             super::signal_marked_process(owned.id(), identity, &markers, ProcessSignal::Kill);
         let owned_alive = owned.try_wait().unwrap().is_none();
@@ -4016,6 +4143,114 @@ sys.exit(3)
         fn sleep(&mut self, _duration: std::time::Duration) {
             self.sleeps += 1;
         }
+    }
+
+    #[test]
+    fn workspace_stop_requires_an_associated_member_and_consistent_group() {
+        use crate::state::{Lease, WorkspaceGroup, WorkspaceSupervisor};
+
+        let (store, path) = temporary_store();
+        let group_id = Uuid::new_v4();
+        let supervisor = WorkspaceSupervisor {
+            pid: 100,
+            process_start_time_ticks: 10,
+        };
+        let runner = Lease {
+            id: group_id,
+            group_id: Some(group_id),
+            workspace_supervisor: Some(supervisor.clone()),
+            lan: false,
+            hostname: String::new(),
+            target: String::new(),
+            scheme: Scheme::Http,
+            tls: false,
+            pid: 200,
+            pgid: 200,
+            process_start_time_ticks: 20,
+            state: LeaseState::Starting,
+        };
+        let mut member = runner.clone();
+        member.id = Uuid::new_v4();
+        member.hostname = "api.localhost".into();
+        member.target = "http://127.0.0.1:3000".into();
+        let group = WorkspaceGroup {
+            supervisor,
+            runner: Some(runner),
+            session_path: None,
+        };
+        for case in [
+            "pending",
+            "pending_ready",
+            "runner_pid",
+            "runner_group",
+            "missing_group",
+            "missing_supervisor",
+            "wrong_supervisor",
+            "wrong_runner_owner",
+            "wrong_runner_group",
+            "wrong_runner_supervisor",
+            "active_starting",
+            "active_ready",
+            "native_starting",
+        ] {
+            let mut lease = member.clone();
+            let mut journal = group.clone();
+            if !matches!(case, "pending" | "pending_ready") {
+                lease.pid = 300;
+                lease.pgid = 300;
+                lease.process_start_time_ticks = 30;
+            }
+            match case {
+                "pending_ready" | "active_ready" => lease.state = LeaseState::Ready,
+                // Partial identity matches must fail closed, even with a different start time.
+                "runner_pid" => lease.pid = 200,
+                "runner_group" => lease.pgid = 200,
+                "missing_supervisor" => lease.workspace_supervisor = None,
+                "wrong_supervisor" => {
+                    lease
+                        .workspace_supervisor
+                        .as_mut()
+                        .unwrap()
+                        .process_start_time_ticks += 1;
+                }
+                "wrong_runner_owner" => journal.runner.as_mut().unwrap().id = Uuid::new_v4(),
+                "wrong_runner_group" => journal.runner.as_mut().unwrap().group_id = None,
+                "wrong_runner_supervisor" => {
+                    journal.runner.as_mut().unwrap().workspace_supervisor = None;
+                }
+                "native_starting" => journal.runner = None,
+                _ => {}
+            }
+            store
+                .mutate(|registry| {
+                    registry.leases.insert(lease.id, lease.clone());
+                    registry.workspace_groups.clear();
+                    if case != "missing_group" {
+                        registry.workspace_groups.insert(group_id, journal.clone());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let before = store.load().unwrap();
+            for force in [false, true] {
+                let mut system = ControlledStop::default();
+                let result = stop_managed(&store, "api.localhost", force, &mut system);
+                if matches!(case, "active_starting" | "active_ready" | "native_starting") {
+                    assert!(result.is_ok(), "{case}: {result:?}");
+                    assert_eq!(system.signals[0], ProcessSignal::Terminate, "{case}");
+                    assert_eq!(system.signals.len(), if force { 2 } else { 1 }, "{case}");
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "{case} force={force} must not signal the runner"
+                    );
+                    assert!(system.signals.is_empty(), "{case}");
+                    assert_eq!(system.alive_checks, 0, "{case}");
+                }
+                assert_eq!(store.load().unwrap(), before, "{case}");
+            }
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
