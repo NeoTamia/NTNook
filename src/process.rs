@@ -2348,12 +2348,20 @@ pub(crate) fn signal_marked_workspace_processes(
 ) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let markers = RecoveryMarkers::new(path, claim);
-    let uid = fs::metadata("/proc/self")?.uid();
-    let namespace = fs::read_link("/proc/self/ns/user")?;
-    let uid_map = fs::read("/proc/self/uid_map")?;
+    let caller = std::process::id();
+    let uid = fs::metadata("/proc/self")
+        .map_err(|error| workspace_proc_error(caller, "", "metadata", error))?
+        .uid();
+    let namespace = fs::read_link("/proc/self/ns/user")
+        .map_err(|error| workspace_proc_error(caller, "ns/user", "readlink", error))?;
+    let (uid_map, operation) = read_workspace_proc_file(caller, "uid_map");
+    let uid_map =
+        uid_map.map_err(|error| workspace_proc_error(caller, "uid_map", operation, error))?;
     let mut found = false;
-    for entry in fs::read_dir("/proc")? {
-        let entry = entry?;
+    for entry in
+        fs::read_dir("/proc").map_err(|error| workspace_proc_error(0, "", "read_dir", error))?
+    {
+        let entry = entry.map_err(|error| workspace_proc_error(0, "", "next_entry", error))?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -2376,7 +2384,7 @@ pub(crate) fn signal_marked_workspace_processes(
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(workspace_proc_error(pid, "", "metadata", error)),
         };
         if metadata.uid() != uid {
             continue;
@@ -2399,10 +2407,11 @@ pub(crate) fn signal_marked_workspace_processes(
         }
         // Host processes mapped into a test's user namespace are not
         // candidates, even when their displayed uid happens to match.
-        match fs::read(entry.path().join("uid_map")) {
+        let (candidate_map, operation) = read_workspace_proc_file(pid, "uid_map");
+        match candidate_map {
             Ok(candidate_map) if candidate_map != uid_map => continue,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(workspace_proc_error(pid, "uid_map", operation, error)),
             Ok(_) => {}
         }
         if !workspace_namespace_matches(
@@ -2410,12 +2419,54 @@ pub(crate) fn signal_marked_workspace_processes(
             identity,
             &namespace,
             fs::read_link(entry.path().join("ns/user")),
-        )? {
+        )
+        .map_err(|error| workspace_proc_error(pid, "ns/user", "readlink", error))?
+        {
             continue;
         }
         found |= signal_marked_process(pid, identity, &markers, signal)?;
     }
     Ok(found)
+}
+
+#[cfg(target_os = "linux")]
+fn read_workspace_proc_file(pid: u32, entry: &str) -> (io::Result<Vec<u8>>, &'static str) {
+    use std::io::Read;
+    let mut file = match fs::File::open(format!("/proc/{pid}/{entry}")) {
+        Ok(file) => file,
+        Err(error) => return (Err(error), "open"),
+    };
+    let mut contents = Vec::new();
+    let result = file.read_to_end(&mut contents).map(|_| contents);
+    (result, "read")
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_proc_error(pid: u32, entry: &str, operation: &str, error: io::Error) -> io::Error {
+    use std::io::Write;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    let identity = stat.as_deref().and_then(parse_stat);
+    let flags = stat
+        .as_deref()
+        .and_then(|stat| stat.rsplit_once(") "))
+        .and_then(|(_, fields)| fields.split_whitespace().nth(6))
+        .and_then(|flags| flags.parse::<u64>().ok());
+    let exiting = flags.map(|flags| flags & 4 != 0); // Linux PF_EXITING.
+    let path = if pid == 0 {
+        "/proc".to_owned()
+    } else if entry == "pidfd" {
+        format!("pid={pid}")
+    } else {
+        format!("/proc/{pid}/{entry}")
+    };
+    // Keep the operation visible on CI without wrapping the caller's error
+    // (which would lose raw_os_error) or reporting comm/environment contents.
+    let _ = writeln!(
+        io::stderr().lock(),
+        "warning: workspace process inspection failed: {operation} {path}: {error}; errno={:?} identity={identity:?} flags={flags:?} exiting={exiting:?}",
+        error.raw_os_error(),
+    );
+    error
 }
 
 #[cfg(target_os = "linux")]
@@ -2472,7 +2523,7 @@ fn signal_marked_process(
         return if error.raw_os_error() == Some(libc::ESRCH) {
             Ok(false)
         } else {
-            Err(error)
+            Err(workspace_proc_error(pid, "pidfd", "pidfd_open", error))
         };
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
@@ -2483,12 +2534,10 @@ fn signal_marked_process(
     }) {
         return Ok(false);
     }
-    if !workspace_environment_matches(
-        pid,
-        expected,
-        markers,
-        fs::read(format!("/proc/{pid}/environ")),
-    )? {
+    let (environment, operation) = read_workspace_proc_file(pid, "environ");
+    if !workspace_environment_matches(pid, expected, markers, environment)
+        .map_err(|error| workspace_proc_error(pid, "environ", operation, error))?
+    {
         return Ok(false);
     }
     let signal = match signal {
@@ -2506,7 +2555,12 @@ fn signal_marked_process(
         )
     };
     if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-        return Err(io::Error::last_os_error());
+        return Err(workspace_proc_error(
+            pid,
+            "pidfd",
+            "pidfd_send_signal",
+            io::Error::last_os_error(),
+        ));
     }
     Ok(true)
 }
@@ -3187,10 +3241,9 @@ mod tests {
         let owned_alive = owned.try_wait().unwrap().is_none();
         owned.kill().unwrap();
         owned.wait().unwrap();
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
         assert!(owned_alive, "failed ownership validation must not signal");
     }
 

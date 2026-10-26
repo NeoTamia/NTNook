@@ -431,8 +431,8 @@ runner.on('exit', (code, signal) => {
           catch (error) { if (error.code === "ENOENT") return true; throw error; }
         }, "real runner child removed by prune");
       }
-      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).leases).length, 0);
-      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).workspace_groups ?? {}).length, 0);
+      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).leases).length, 0, realPrune.stdout + realPrune.stderr);
+      assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).workspace_groups ?? {}).length, 0, realPrune.stdout + realPrune.stderr);
       const prunedConfig = JSON.stringify(await adminConfig(`${admin}/config/`));
       assert.ok(!prunedConfig.includes("api.runner.localhost") && !prunedConfig.includes("web.runner.localhost"));
 
