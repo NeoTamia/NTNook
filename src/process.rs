@@ -2422,17 +2422,25 @@ fn workspace_namespace_matches(
             // after resolving its namespace dentry. Only confirmed exit or
             // PID reuse makes this harmless; unknown/live identity keeps the
             // original permission error and leaves recovery pending.
-            let exited = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Ok(stat) => parse_stat(&stat).is_some_and(|identity| {
-                    matches!(identity.state, b'Z' | b'X')
-                        || identity.start_time_ticks != expected.start_time_ticks
-                }),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-                _ => false,
-            };
-            if exited { Ok(false) } else { Err(error) }
+            if workspace_process_exited(pid, expected) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
         }
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_process_exited(pid: u32, expected: ProcIdentity) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => parse_stat(&stat).is_some_and(|identity| {
+            matches!(identity.state, b'Z' | b'X')
+                || identity.start_time_ticks != expected.start_time_ticks
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        _ => false,
     }
 }
 
@@ -2464,13 +2472,12 @@ fn signal_marked_process(
     }) {
         return Ok(false);
     }
-    let environment = match fs::read(format!("/proc/{pid}/environ")) {
-        Ok(environment) => environment,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if !markers.matches(&environment) {
+    if !workspace_environment_matches(
+        pid,
+        expected,
+        markers,
+        fs::read(format!("/proc/{pid}/environ")),
+    )? {
         return Ok(false);
     }
     let signal = match signal {
@@ -2491,6 +2498,30 @@ fn signal_marked_process(
         return Err(io::Error::last_os_error());
     }
     Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_environment_matches(
+    pid: u32,
+    expected: ProcIdentity,
+    markers: &RecoveryMarkers,
+    result: io::Result<Vec<u8>>,
+) -> io::Result<bool> {
+    match result {
+        Ok(environment) => Ok(markers.matches(&environment)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        // The task can exit after the pidfd identity check. Its /proc files
+        // can then deny access; only fresh exit/reuse evidence makes this
+        // harmless. A protected live or unknown owner keeps its raw error.
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && workspace_process_exited(pid, expected) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(windows)]
@@ -3150,6 +3181,96 @@ mod tests {
             std::io::ErrorKind::PermissionDenied
         );
         assert!(owned_alive, "failed ownership validation must not signal");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn workspace_environment_recheck_handles_exit_after_identity_validation() {
+        use std::io::{BufRead, BufReader, Write};
+
+        // Clear capabilities even under namespace root, so protected /proc
+        // reads really return EACCES rather than depending on the test user.
+        const TEST: &str =
+            "process::tests::workspace_environment_recheck_handles_exit_after_identity_validation";
+        const ISOLATED: &str = "NOOK_ENVIRONMENT_RECHECK_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import ctypes,os,sys; libc=ctypes.CDLL(None); assert libc.prctl(38,1,0,0,0)==0; header=(ctypes.c_uint32*2)(0x20080522,0); data=(ctypes.c_uint32*6)(); assert libc.capset(ctypes.byref(header),ctypes.byref(data))==0; os.execv(sys.argv[1],sys.argv[1:])",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let path = crate::workspace_session::session_path(Uuid::new_v4());
+        let markers = super::RecoveryMarkers::new(&path, None);
+        let mut child = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import ctypes,sys,time; print('ready',flush=True); sys.stdin.readline(); assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; print('protected',flush=True); time.sleep(30)",
+            ])
+            .env(crate::workspace_session::SESSION_VARIABLE, &path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let pid = child.id();
+        let identity = read_process_identity(pid).unwrap();
+        let environment = || std::fs::read(format!("/proc/{pid}/environ"));
+        assert!(
+            super::workspace_environment_matches(pid, identity, &markers, environment()).unwrap()
+        );
+        child.stdin.take().unwrap().write_all(b"protect\n").unwrap();
+        ready.clear();
+        output.read_line(&mut ready).unwrap();
+        assert_eq!(ready.trim(), "protected");
+        let live_error =
+            super::workspace_environment_matches(pid, identity, &markers, environment())
+                .unwrap_err();
+        let denied_environment = environment();
+        assert_eq!(
+            denied_environment.as_ref().unwrap_err().raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        // Defer classifying a real EACCES until the task has exited. Keep its
+        // zombie entry to test the state check rather than a missing path.
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        assert_eq!(read_process_identity(pid).unwrap().state, b'Z');
+        let recovered =
+            super::workspace_environment_matches(pid, identity, &markers, denied_environment);
+        // A fresh zombie environ open returns EACCES for an ordinary uid,
+        // but can reach ESRCH instead when namespace root passes DAC checks.
+        let after_exit =
+            super::workspace_environment_matches(pid, identity, &markers, environment());
+        child.wait().unwrap();
+        assert_eq!(live_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(live_error.raw_os_error(), Some(libc::EACCES));
+        assert!(!recovered.unwrap());
+        assert!(!after_exit.unwrap());
     }
 
     #[test]

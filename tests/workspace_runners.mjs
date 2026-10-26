@@ -410,7 +410,7 @@ runner.on('exit', (code, signal) => {
       }
       const afterFailure = JSON.parse(await readFile(registryPath, "utf8"));
       assert.equal(Object.keys(afterFailure.leases).length, 0);
-      assert.equal(Object.keys(afterFailure.workspace_groups ?? {}).length, 0);
+      assert.equal(Object.keys(afterFailure.workspace_groups ?? {}).length, 0, running.log());
       const failureConfig = JSON.stringify(await adminConfig(`${admin}/config/`));
       assert.ok(!failureConfig.includes("api.runner.localhost") && !failureConfig.includes("web.runner.localhost"));
       assert.equal(Object.keys(JSON.parse(await readFile(registryPath, "utf8")).workspace_groups ?? {}).length, 0);
