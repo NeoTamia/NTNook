@@ -2446,11 +2446,7 @@ fn workspace_proc_error(pid: u32, entry: &str, operation: &str, error: io::Error
     use std::io::Write;
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
     let identity = stat.as_deref().and_then(parse_stat);
-    let flags = stat
-        .as_deref()
-        .and_then(|stat| stat.rsplit_once(") "))
-        .and_then(|(_, fields)| fields.split_whitespace().nth(6))
-        .and_then(|flags| flags.parse::<u64>().ok());
+    let flags = stat.as_deref().and_then(workspace_proc_flags);
     let exiting = flags.map(|flags| flags & 4 != 0); // Linux PF_EXITING.
     let path = if pid == 0 {
         "/proc".to_owned()
@@ -2467,6 +2463,16 @@ fn workspace_proc_error(pid: u32, entry: &str, operation: &str, error: io::Error
         error.raw_os_error(),
     );
     error
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_proc_flags(stat: &str) -> Option<u64> {
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(6)?
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -2496,13 +2502,96 @@ fn workspace_namespace_matches(
 
 #[cfg(target_os = "linux")]
 fn workspace_process_exited(pid: u32, expected: ProcIdentity) -> bool {
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => parse_stat(&stat).is_some_and(|identity| {
-            matches!(identity.state, b'Z' | b'X')
-                || identity.start_time_ticks != expected.start_time_ticks
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
-        _ => false,
+    workspace_process_exited_after_stat(
+        pid,
+        expected,
+        fs::read_to_string(format!("/proc/{pid}/stat")),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn workspace_process_exited_after_stat(
+    pid: u32,
+    expected: ProcIdentity,
+    mut stat: io::Result<String>,
+) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // Linux can deny environ access after exit starts but before stat reaches
+    // Z/X. Only a verified PF_EXITING task gets a bounded wait. A pidfd also
+    // prevents mistaking a zombie leader with live threads for a dead process.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut pidfd: Option<OwnedFd> = None;
+    let mut group_exited = false;
+    loop {
+        let stat_text = match stat {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        };
+        let Some(identity) = parse_stat(&stat_text) else {
+            return false;
+        };
+        if identity.start_time_ticks != expected.start_time_ticks {
+            return true;
+        }
+        if identity.pgid != expected.pgid {
+            return false;
+        }
+        let zombie = matches!(identity.state, b'Z' | b'X');
+        if group_exited {
+            return zombie;
+        }
+        let exiting = workspace_proc_flags(&stat_text).is_some_and(|flags| flags & 4 != 0);
+        if !zombie && !exiting {
+            return false;
+        }
+        let fd = if let Some(fd) = &pidfd {
+            fd
+        } else {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                // Reaping may have raced pidfd_open. Still require fresh
+                // disappearance/reuse evidence rather than accepting errno.
+                return match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Ok(stat) => parse_stat(&stat).is_some_and(|identity| {
+                        identity.start_time_ticks != expected.start_time_ticks
+                    }),
+                    _ => false,
+                };
+            }
+            pidfd = Some(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+            // Revalidate after pinning: the numeric PID may have changed.
+            stat = fs::read_to_string(format!("/proc/{pid}/stat"));
+            continue;
+        };
+        let timeout = if exiting {
+            i32::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+        if result > 0 && pollfd.revents & libc::POLLIN != 0 {
+            group_exited = true;
+        } else if result >= 0
+            || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+            || Instant::now() >= deadline
+        {
+            return false;
+        }
+        stat = fs::read_to_string(format!("/proc/{pid}/stat"));
     }
 }
 
@@ -3335,6 +3424,224 @@ mod tests {
         assert_eq!(live_error.raw_os_error(), Some(libc::EACCES));
         assert!(!recovered.unwrap());
         assert!(!after_exit.unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_permission_race_revalidates_the_whole_exiting_process() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Child, ChildStdout, Stdio};
+
+        const TEST: &str =
+            "process::tests::workspace_permission_race_revalidates_the_whole_exiting_process";
+        const ISOLATED: &str = "NOOK_EXIT_REVALIDATION_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let status = Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import ctypes,os,sys; libc=ctypes.CDLL(None); assert libc.prctl(38,1,0,0,0)==0; header=(ctypes.c_uint32*2)(0x20080522,0); data=(ctypes.c_uint32*6)(); assert libc.capset(ctypes.byref(header),ctypes.byref(data))==0; os.execv(sys.argv[1],sys.argv[1:])",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--test-threads=1"])
+                .env(ISOLATED, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        // A blocked splice holds the pipe mutex. The victim owns its last
+        // writer reference, so exit blocks in pipe_release after PF_EXITING
+        // but before zombie state. No FUSE, timing sleeps or fake errno.
+        const FIXTURE: &str = r#"
+import os, pathlib, socket, subprocess, sys, time
+r, w = os.pipe()
+a, b = socket.socketpair()
+a.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+a.setblocking(False)
+filled = 0
+try:
+    while True:
+        filled += a.send(b'x' * 4096)
+except BlockingIOError:
+    pass
+a.setblocking(True)
+os.write(w, b'y' * 4096)
+splicer = subprocess.Popen([sys.executable, '-c', 'import os,sys; os.splice(int(sys.argv[1]),int(sys.argv[2]),4096)', str(r), str(a.fileno())], pass_fds=(r, a.fileno()))
+victim = None
+def stat(pid):
+    return pathlib.Path('/proc/'+str(pid)+'/stat').read_text().rsplit(') ',1)[1].split()
+def until(check):
+    deadline = time.monotonic() + 5
+    while not check():
+        assert time.monotonic() < deadline, 'native exit fixture timed out'
+        os.sched_yield()
+try:
+    until(lambda: stat(splicer.pid)[0] == 'S' and pathlib.Path('/proc/'+str(splicer.pid)+'/syscall').read_text().startswith(sys.argv[1]+' '))
+    code = '''import ctypes,os,sys,threading
+print('ready',flush=True)
+assert os.read(0,1)==b'P'
+assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0
+print('protected',flush=True)
+assert os.read(0,1)==b'X'
+if sys.argv[1]=='threaded':
+    def worker():
+        os.read(0,1)
+        os._exit(0)
+    threading.Thread(target=worker).start()
+    ctypes.CDLL(None).syscall(int(sys.argv[2]),0)
+else:
+    os._exit(0)
+'''
+    victim = subprocess.Popen([sys.executable, '-c', code, sys.argv[3], sys.argv[2]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, pass_fds=(w,))
+    os.close(w)
+    assert victim.stdout.readline() == b'ready\n'
+    print(victim.pid,flush=True)
+    for command in iter(lambda: os.read(0,1), b''):
+        if command == b'P':
+            victim.stdin.write(command); victim.stdin.flush()
+            assert victim.stdout.readline() == b'protected\n'
+            print('protected',flush=True)
+        elif command == b'X':
+            victim.stdin.write(command); victim.stdin.flush()
+            until(lambda: int(stat(victim.pid)[6]) & 4 and (stat(victim.pid)[0] == 'Z' if sys.argv[3] == 'threaded' else stat(victim.pid)[0] == 'D'))
+            print('exiting',flush=True)
+        elif command == b'R':
+            received = 0
+            while received < filled + 4096:
+                received += len(b.recv(65536))
+            splicer.wait(timeout=5)
+            if sys.argv[3] == 'threaded':
+                victim.stdin.write(b'R'); victim.stdin.flush()
+            os.waitid(os.P_PID, victim.pid, os.WEXITED | os.WNOWAIT)
+            print('released',flush=True)
+        elif command == b'D':
+            break
+finally:
+    splicer.kill(); splicer.wait()
+    if victim:
+        victim.kill(); victim.wait()
+"#;
+        struct Fixture {
+            child: Child,
+            output: BufReader<ChildStdout>,
+        }
+        impl Fixture {
+            fn command(&mut self, command: u8, expected: &str) {
+                self.child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(&[command])
+                    .unwrap();
+                self.child.stdin.as_mut().unwrap().flush().unwrap();
+                let mut line = String::new();
+                self.output.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), expected);
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.child.stdin.as_mut().unwrap().write_all(b"D");
+                let _ = self.child.wait();
+            }
+        }
+
+        for threaded in [false, true] {
+            let path = crate::workspace_session::session_path(Uuid::new_v4());
+            let markers = super::RecoveryMarkers::new(&path, None);
+            let mut child = Command::new("/usr/bin/python3")
+                .args(["-c", FIXTURE])
+                .arg(libc::SYS_splice.to_string())
+                .arg(libc::SYS_exit.to_string())
+                .arg(if threaded { "threaded" } else { "kernel" })
+                .env(crate::workspace_session::SESSION_VARIABLE, &path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            let pid = line.trim().parse().unwrap();
+            let mut fixture = Fixture { child, output };
+            let identity = read_process_identity(pid).unwrap();
+            assert!(markers.matches(&std::fs::read(format!("/proc/{pid}/environ")).unwrap()));
+            fixture.command(b'P', "protected");
+            let denied = || std::fs::read(format!("/proc/{pid}/environ"));
+            let error = super::workspace_environment_matches(pid, identity, &markers, denied())
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            let denied_before_exit = denied();
+            assert_eq!(
+                denied_before_exit.as_ref().unwrap_err().raw_os_error(),
+                Some(libc::EACCES)
+            );
+            let denied_wrong_group = denied();
+            fixture.command(b'X', "exiting");
+            let snapshot = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            assert_eq!(
+                parse_stat(&snapshot).unwrap().state,
+                if threaded { b'Z' } else { b'D' }
+            );
+            let started = Instant::now();
+            // Ordinary uid 1000 gets a real denied read during this held
+            // exit. Namespace root may reach ESRCH after mm teardown instead;
+            // there, defer the real EACCES captured just before exit began.
+            let during_exit = denied();
+            let denied_exit = if during_exit
+                .as_ref()
+                .is_err_and(|error| error.raw_os_error() == Some(libc::ESRCH))
+            {
+                denied_before_exit
+            } else {
+                during_exit
+            };
+            let held = super::workspace_environment_matches(pid, identity, &markers, denied_exit);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "exit revalidation was unbounded"
+            );
+            let error =
+                held.expect_err("an exiting leader is not proof that the whole process has exited");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+            let wrong_group = ProcIdentity {
+                pgid: identity.pgid + 1,
+                ..identity
+            };
+            assert_eq!(
+                super::workspace_environment_matches(
+                    pid,
+                    wrong_group,
+                    &markers,
+                    denied_wrong_group
+                )
+                .unwrap_err()
+                .raw_os_error(),
+                Some(libc::EACCES)
+            );
+            assert_eq!(
+                read_process_identity(pid).unwrap().state,
+                if threaded { b'Z' } else { b'D' }
+            );
+            for unknown in [
+                Ok("malformed stat".to_owned()),
+                Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+            ] {
+                assert!(!super::workspace_process_exited_after_stat(
+                    pid, identity, unknown
+                ));
+            }
+            // Delay classification at the actual stat-result seam: the
+            // snapshot still says PF_EXITING without confirmed group exit.
+            // Release by IPC and keep the unreaped zombie for revalidation.
+            fixture.command(b'R', "released");
+            assert!(
+                super::workspace_process_exited_after_stat(pid, identity, Ok(snapshot)),
+                "the PF_EXITING snapshot must be revalidated after the process finishes exiting"
+            );
+        }
     }
 
     #[test]
