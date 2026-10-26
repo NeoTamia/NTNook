@@ -965,7 +965,43 @@ impl RunningWorkspace {
             return Vec::new();
         }
         self.terminated = true;
+        let mut warnings = Vec::new();
         if let Some(signal) = signal {
+            #[cfg(target_os = "linux")]
+            {
+                let mut signaled_groups = Vec::new();
+                for (_, running) in &self.apps {
+                    match running.child.signal_workspace_group(signal) {
+                        Ok(true) => signaled_groups.push(running.child.pgid),
+                        Ok(false) => {}
+                        Err(error) => warnings.push(format!(
+                            "cannot signal workspace child {}: {error}",
+                            running.child.pid
+                        )),
+                    }
+                }
+                // Detached descendants and groups with reaped leaders need
+                // the same graceful signal, without repeating group delivery.
+                let signal_marked = || -> crate::Result<()> {
+                    let registry = self.store.load()?;
+                    let group = registry
+                        .workspace_groups
+                        .get(&self.group_id)
+                        .ok_or_else(|| invalid("workspace group ownership is missing"))?;
+                    process::signal_marked_workspace_processes(
+                        crate::workspace_session::recovery_path(self.group_id, group)?,
+                        None,
+                        group.supervisor.process_start_time_ticks,
+                        signal,
+                        &signaled_groups,
+                    )?;
+                    Ok(())
+                };
+                if let Err(error) = signal_marked() {
+                    warnings.push(format!("cannot signal workspace processes: {error}"));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             for (_, running) in &self.apps {
                 let _ = running.child.signal_foreground(signal);
             }
@@ -986,12 +1022,13 @@ impl RunningWorkspace {
             let _ = running.child.wait();
         }
         if let Err(error) = cleanup_group_processes(&self.store, self.group_id) {
-            return vec![format!("workspace process cleanup is pending: {error}")];
+            warnings.push(format!("workspace process cleanup is pending: {error}"));
+            return warnings;
         }
         for (_, running) in &mut self.apps {
             running.child.join_output();
         }
-        Vec::new()
+        warnings
     }
 }
 

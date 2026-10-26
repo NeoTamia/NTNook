@@ -164,7 +164,18 @@ pub(crate) struct ManagedChild {
 
 impl ManagedChild {
     pub(crate) fn signal(&self, signal: ProcessSignal) -> Result<(), Error> {
-        signal_managed_child(self, signal).map_err(Error::Spawn)
+        signal_managed_child(self, signal)
+            .map(|_| ())
+            .map_err(Error::Spawn)
+    }
+
+    /// Only actual group delivery may suppress a workspace's marker scan.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn signal_workspace_group(&self, signal: ProcessSignal) -> Result<bool, Error> {
+        match signal_managed_child(self, signal) {
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+            result => result.map_err(Error::Spawn),
+        }
     }
 
     pub(crate) fn wait(&mut self) -> Result<i32, Error> {
@@ -1647,7 +1658,7 @@ fn send_group_signal(pgid: i32, signal: i32) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Result<()> {
+fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Result<bool> {
     // A reaped leader's numeric PGID may already belong to another process.
     // Runner recovery separately finds marked descendants when this is absent.
     if child.workspace_owned
@@ -1655,14 +1666,14 @@ fn signal_managed_child(child: &ManagedChild, signal: ProcessSignal) -> io::Resu
             identity.pgid == child.pgid && identity.start_time_ticks == child.start_time_ticks
         })
     {
-        return Ok(());
+        return Ok(false);
     }
     let signal = match signal {
         ProcessSignal::Interrupt => libc::SIGINT,
         ProcessSignal::Terminate => libc::SIGTERM,
         ProcessSignal::Kill => libc::SIGKILL,
     };
-    send_group_signal(child.pgid, signal)
+    send_group_signal(child.pgid, signal).map(|()| true)
 }
 
 #[cfg(unix)]

@@ -291,6 +291,73 @@ fn workspace_shutdown_kills_stubborn_children_after_bounded_grace() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn workspace_detached_descendants_receive_graceful_shutdown() {
+    if in_network_namespace("workspace_detached_descendants_receive_graceful_shutdown") {
+        return;
+    }
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        native_descendant_shutdown(true, signal);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn workspace_reaped_leader_descendants_receive_graceful_shutdown() {
+    if in_network_namespace("workspace_reaped_leader_descendants_receive_graceful_shutdown") {
+        return;
+    }
+    native_descendant_shutdown(false, libc::SIGTERM);
+}
+
+#[cfg(target_os = "linux")]
+fn native_descendant_shutdown(detached: bool, signal: i32) {
+    let fixture = Workspace::new();
+    fs::write(
+        fixture.root.join("apps/web/launcher.py"),
+        format!(
+            "import pathlib,subprocess,sys,time\nchild=subprocess.Popen([sys.executable,'-u','child.py'],start_new_session={})\nwhile not pathlib.Path('exit-leader').exists(): time.sleep(.01)\nsys.exit(23)\n",
+            if detached { "True" } else { "False" }
+        ),
+    )
+    .unwrap();
+    let command = json!(["python3", "-u", "launcher.py"]).to_string();
+    fixture.configure(false, Some(&command), "SHUTDOWN_HANDLER = 'both'\n");
+    let mut running = fixture.start(&["run", "--only", "web"]);
+    let reports = fixture.wait_ready(&mut running, &["web"]);
+    let started = Instant::now();
+    if detached {
+        running.signal(signal);
+    } else {
+        // finish() reaps the leader before selecting SIGTERM for its tree.
+        fs::write(fixture.root.join("apps/web/exit-leader"), "").unwrap();
+    }
+    assert_eq!(
+        running.wait().code(),
+        Some(if detached { 128 + signal } else { 23 }),
+        "{}",
+        running.logs()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{}",
+        running.logs()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("apps/web/clean")).ok(),
+        Some(signal.to_string()),
+        "descendant missed graceful shutdown: {}",
+        running.logs()
+    );
+    assert!(
+        !fixture.root.join("apps/web/duplicate").exists(),
+        "{}",
+        running.logs()
+    );
+    fixture.assert_clean(&reports);
+}
+
+#[test]
 fn workspace_member_exit_sends_term_and_preserves_the_exit_code() {
     if in_network_namespace("workspace_member_exit_sends_term_and_preserves_the_exit_code") {
         return;
