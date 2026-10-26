@@ -170,27 +170,19 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
         },
         associate_member,
     )?);
-    let mut graceful = false;
+    let mut graceful = None;
     let result = (|| -> crate::Result<i32> {
         let store = Store::new(member.state_path().to_owned());
         loop {
             if let Some(code) = child.0.try_wait().map_err(process::RunError::from)? {
-                // `nook stop` signals the child group directly. Its shell
-                // leader can exit before descendants finish asynchronous
-                // cleanup, without signaling this wrapper or closing the root.
-                // Preserve the exit status and the same bounded tree grace.
-                graceful = true;
+                // A leader exit starts detached-descendant cleanup regardless
+                // of its status. Its original group may already have received
+                // `nook stop`, so do not deliver another signal to that group.
+                graceful = Some(None);
                 return Ok(code);
             }
             if let Some(signal) = signals.pending().first() {
-                // A closing root signals the entire owned tree itself, after
-                // freezing spawns. Do not forward its signal a second time.
-                if member.check_live().is_ok()
-                    || process::lease_liveness(member.supervisor()) != process::Liveness::Alive
-                {
-                    let _ = child.0.signal_foreground(*signal);
-                }
-                graceful = true;
+                graceful = Some(Some(*signal));
                 return Ok(if *signal == ProcessSignal::Interrupt {
                     130
                 } else {
@@ -200,13 +192,7 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
             // Recheck the context as well as the root identity: closing a live
             // root session must also end independent member process groups.
             if let Err(error) = member.check_live() {
-                // Root teardown closes the context before signaling children.
-                // Its close notification must not bypass the shutdown grace.
-                // A dead root cannot send that signal, so do it on its behalf.
-                if process::lease_liveness(member.supervisor()) != process::Liveness::Alive {
-                    let _ = child.0.signal_foreground(ProcessSignal::Terminate);
-                }
-                graceful = true;
+                graceful = Some(Some(ProcessSignal::Terminate));
                 return Err(error);
             }
             let owned = store
@@ -226,15 +212,23 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
             thread::sleep(Duration::from_millis(20));
         }
     })();
-    if graceful {
-        child.wait_for_shutdown(Instant::now() + Duration::from_secs(2));
-    }
+    let cleanup = if let Some(signal) = graceful {
+        member.shutdown_child(&mut child.0, signal)
+    } else {
+        child.stop();
+        member.cleanup_child(&child.0)
+    };
     child.stop();
-    let cleanup = member.cleanup_child(&child.0);
+    if cleanup.is_err() {
+        // A missing or replaced context cannot revoke this exact child/token's
+        // cleanup authority. Preserve the original error; this fallback never
+        // releases a claim.
+        let _ = member.cleanup_child(&child.0);
+    }
     drop(child);
     // Root teardown may already have removed the context. Child cleanup is the
     // important ordering boundary; a missing context cannot retain a live app.
-    if cleanup.is_ok() {
+    if graceful.is_none() && cleanup.is_ok() {
         let _ = member.finish();
     }
     cleanup?;

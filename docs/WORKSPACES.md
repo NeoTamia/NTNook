@@ -108,8 +108,10 @@ On an interrupt, termination signal, or orderly runner exit, Nook allows two
 seconds for application shutdown handlers before forcibly stopping remaining
 owned processes. The same grace period applies when signaling an individual
 session member or when its command leader exits, so shell descendants can finish
-cleanup before the member releases its claim. A member restart can therefore
-wait up to two seconds after its leader exits; the original exit status is kept.
+cleanup before the member releases its claim. A member restart waits for cleanup;
+the original exit status is kept. Individual member shutdowns are serialized,
+and root shutdown waits for any member cleanup already in progress. Concurrent
+stops can therefore take longer than two seconds in total.
 
 The root command retains the terminal foreground. Session members inherit the
 runner's streams without claiming the terminal, so the runner keeps its native

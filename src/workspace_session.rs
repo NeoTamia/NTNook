@@ -747,6 +747,68 @@ impl SessionMember {
         Ok(())
     }
 
+    /// Serialize local shutdown with root closing until this claim is cleaned.
+    /// A closing-first root owns graceful delivery; a local-first shutdown
+    /// removes its processes before the root can take its shutdown snapshot.
+    /// `None` means leader-exit cleanup: TERM only detached descendants.
+    pub(crate) fn shutdown_child(
+        &mut self,
+        child: &mut ManagedChild,
+        signal: Option<process::ProcessSignal>,
+    ) -> crate::Result<()> {
+        let mut locked = LockedContext::open(&self.path)?;
+        self.claim_in(&locked.context)?;
+        let delivery = (|| -> crate::Result<()> {
+            if locked.context.closing && process::lease_liveness(&self.supervisor) != Liveness::Dead
+            {
+                return Ok(());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let mut excluded = Vec::new();
+                if let Some(signal) = signal {
+                    if child
+                        .signal_workspace_group(signal)
+                        .map_err(process::RunError::from)?
+                    {
+                        excluded.push(child.pgid);
+                    }
+                } else {
+                    // Leader exit is a cleanup event, not evidence of a
+                    // particular signal. Never repeat an external group stop.
+                    excluded.push(child.pgid);
+                }
+                process::signal_marked_workspace_processes(
+                    &self.path,
+                    Some(self.token),
+                    self.supervisor.process_start_time_ticks,
+                    signal.unwrap_or(process::ProcessSignal::Terminate),
+                    &excluded,
+                )?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            if let Some(signal) = signal {
+                child
+                    .signal_foreground(signal)
+                    .map_err(process::RunError::from)?;
+            }
+            Ok(())
+        })();
+        // Reap a shell leader without shortening its descendants' grace.
+        // ponytail: local shutdowns serialize on the session lock; per-claim
+        // shutdown state is only needed if this contention becomes a problem.
+        // Keep the lock out of store operations and reentrant methods.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let _ = child.try_wait();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.signal(process::ProcessSignal::Kill);
+        let _ = child.wait();
+        self.finish_locked(&mut locked)?;
+        delivery
+    }
+
     pub(crate) fn config(&self, args: &RunArgs) -> crate::Result<ResolvedRunConfig> {
         validate_arguments(&self.app, args)?;
         let framework = if args.no_framework {
@@ -911,6 +973,10 @@ impl SessionMember {
     /// clear a claim is conservative: a live child must not be joined twice.
     pub(crate) fn finish(&mut self) -> crate::Result<()> {
         let mut locked = LockedContext::open(&self.path)?;
+        self.finish_locked(&mut locked)
+    }
+
+    fn finish_locked(&mut self, locked: &mut LockedContext) -> crate::Result<()> {
         let claim = self.claim_in(&locked.context)?;
         process::cleanup_workspace_member_processes(
             &self.path,

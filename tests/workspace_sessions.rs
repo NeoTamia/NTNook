@@ -98,7 +98,7 @@ for sig in [signal.SIGINT, signal.SIGTERM]:
     signal.signal(sig, signal.SIG_IGN if os.environ.get('STUBBORN') and role == 'api' else stop)
 if role != 'task':
     server = http.server.HTTPServer((os.environ['HOST'], int(os.environ['PORT'])), http.server.SimpleHTTPRequestHandler)
-    detached = subprocess.Popen([sys.executable, '-c', 'import signal,time;signal.signal(signal.SIGINT,signal.SIG_IGN);signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)'], start_new_session=True)
+    detached = subprocess.Popen([sys.executable, str(pathlib.Path(__file__).with_name('detached.py')), role], start_new_session=True)
     record(role + '-detached', str(detached.pid))
 if os.environ.get('NONDUMPABLE') and role == 'api':
     import ctypes
@@ -111,6 +111,25 @@ while True:
         os.read(0, 1)
     if pathlib.Path('exit-api').exists() and role == 'api':
         sys.exit(23)
+    time.sleep(.01)
+"#;
+
+    const DETACHED: &str = r#"
+import os, pathlib, signal, sys, time
+role = sys.argv[1]
+def stop(sig, frame):
+    def repeated(sig, frame):
+        pathlib.Path(role + '-detached-duplicate').write_text(str(sig))
+    signal.signal(signal.SIGINT, repeated)
+    signal.signal(signal.SIGTERM, repeated)
+    pathlib.Path(role + '-detached-stopping').write_text(str(sig))
+    time.sleep(.6)
+    pathlib.Path(role + '-detached-clean').write_text(str(sig))
+    sys.exit(0)
+for sig in [signal.SIGINT, signal.SIGTERM]:
+    signal.signal(sig, stop if os.environ.get('GRACEFUL_DETACHED') else signal.SIG_IGN)
+pathlib.Path(role + '-detached-ready').write_text(str(os.getpid()))
+while True:
     time.sleep(.01)
 "#;
 
@@ -175,11 +194,17 @@ while True:
         }
 
         fn start_with(stubborn: bool, nondumpable: bool, shell: bool) -> Self {
-            Self::start_options(stubborn, nondumpable, shell, false)
+            Self::start_options(stubborn, nondumpable, shell, false, false)
         }
 
         #[allow(unsafe_code)]
-        fn start_options(stubborn: bool, nondumpable: bool, shell: bool, tty: bool) -> Self {
+        fn start_options(
+            stubborn: bool,
+            nondumpable: bool,
+            shell: bool,
+            tty: bool,
+            detached: bool,
+        ) -> Self {
             use std::os::fd::FromRawFd;
             use std::os::unix::process::CommandExt;
 
@@ -195,6 +220,7 @@ while True:
             )
             .unwrap();
             fs::write(root.join("server.py"), SERVER).unwrap();
+            fs::write(root.join("detached.py"), DETACHED).unwrap();
             fs::write(root.join("runner.py"), RUNNER).unwrap();
             let mut manifest = "format_version = 2\nname = 'grace'\n".to_owned();
             for role in ["api", "web"] {
@@ -262,6 +288,7 @@ os.execv(sys.argv[1],sys.argv[1:])",
                 .envs(nondumpable.then_some(("NONDUMPABLE", "1")))
                 .envs(shell.then_some(("SHELL_MEMBER", "1")))
                 .envs(tty.then_some(("TEST_TTY", "1")))
+                .envs(detached.then_some(("GRACEFUL_DETACHED", "1")))
                 .args(["run", "--runner", "--", "python3", "runner.py"])
                 .stdout(Stdio::from(File::create(root.join("run.stdout")).unwrap()))
                 .stderr(Stdio::from(File::create(root.join("run.stderr")).unwrap()))
@@ -273,9 +300,15 @@ os.execv(sys.argv[1],sys.argv[1:])",
                 terminal,
             };
             fixture.until(|fixture| {
-                ["api/api-pid", "web/web-pid", "task-pid"]
-                    .iter()
-                    .all(|file| fixture.path(file).exists())
+                [
+                    "api/api-pid",
+                    "web/web-pid",
+                    "task-pid",
+                    "api/api-detached-ready",
+                    "web/web-detached-ready",
+                ]
+                .iter()
+                .all(|file| fixture.path(file).exists())
                     && (!tty
                         || ["api/api-tty", "web/web-tty", "task-tty"]
                             .iter()
@@ -314,6 +347,31 @@ os.execv(sys.argv[1],sys.argv[1:])",
         }
         fn state(&self) -> Value {
             serde_json::from_slice(&fs::read(self.path("state/nook/state.json")).unwrap()).unwrap()
+        }
+        fn context(&self) -> Value {
+            let path = fs::read_to_string(self.path("context")).unwrap();
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+        }
+        fn wrapper(&self) -> i32 {
+            self.context()["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|member| member["app_id"] == "api")
+                .unwrap()["wrapper"]["pid"]
+                .as_i64()
+                .unwrap() as i32
+        }
+        fn assert_detached_cleanup(&self, sig: i32) {
+            assert_eq!(
+                fs::read_to_string(self.path("api/api-detached-clean")).ok(),
+                Some(sig.to_string()),
+                "detached descendant missed graceful cleanup: {}",
+                self.logs()
+            );
+            for file in ["api/api-duplicate", "api/api-detached-duplicate"] {
+                assert!(!self.path(file).exists(), "duplicate signal: {file}");
+            }
         }
         fn wait(&mut self) -> ExitStatus {
             let deadline = Instant::now() + Duration::from_secs(7);
@@ -369,6 +427,8 @@ os.execv(sys.argv[1],sys.argv[1:])",
                 "web/web-duplicate",
                 "task-duplicate",
                 "runner-duplicate",
+                "api/api-detached-duplicate",
+                "web/web-detached-duplicate",
             ] {
                 assert!(
                     !self.path(file).exists(),
@@ -450,7 +510,7 @@ os.execv(sys.argv[1],sys.argv[1:])",
         ) {
             return;
         }
-        let mut fixture = Fixture::start_options(false, false, false, true);
+        let mut fixture = Fixture::start_options(false, false, false, true, false);
         let runner = fixture.pid("runner-pgid");
         let foreground =
             || unsafe { libc::tcgetpgrp(fixture.terminal.as_ref().unwrap().as_raw_fd()) };
@@ -587,6 +647,181 @@ os.execv(sys.argv[1],sys.argv[1:])",
             assert_eq!(fixture.wait().code(), Some(143));
             fixture.clean();
         }
+    }
+
+    #[test]
+    fn member_detached_cleanup_preserves_claim_status_port_and_siblings() {
+        if namespace("shutdown::member_detached_cleanup_preserves_claim_status_port_and_siblings") {
+            return;
+        }
+        for sig in [Some(libc::SIGINT), Some(libc::SIGTERM), None] {
+            let mut fixture = Fixture::start_options(false, false, false, false, true);
+            let previous_pid = fixture.pid("api/api-pid");
+            let target = fixture.state()["leases"]
+                .as_object()
+                .unwrap()
+                .values()
+                .find(|lease| lease["hostname"] == "api.grace.localhost")
+                .unwrap()["target"]
+                .clone();
+            let started = Instant::now();
+            if let Some(sig) = sig {
+                signal(fixture.wrapper(), sig);
+            } else {
+                fs::write(fixture.path("api/exit-api"), "").unwrap();
+            }
+            fixture.until(|fixture| {
+                fixture.path("api/api-detached-stopping").exists()
+                    || fixture.path("api-exit").exists()
+            });
+            assert!(
+                fixture.path("api/api-detached-stopping").exists(),
+                "detached descendant never received a graceful signal"
+            );
+            assert!(
+                fixture.context()["members"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|member| member["app_id"] == "api"),
+                "claim released during cleanup"
+            );
+            assert!(
+                !fixture.path("api-exit").exists(),
+                "wrapper exited during cleanup"
+            );
+            fixture.until(|fixture| fixture.path("api-exit").exists());
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(
+                fs::read_to_string(fixture.path("api-exit")).unwrap(),
+                sig.map_or(23, |sig| 128 + sig).to_string()
+            );
+            fixture.assert_detached_cleanup(sig.unwrap_or(libc::SIGTERM));
+            assert!(!alive(fixture.pid("api/api-detached")));
+            assert!(alive(fixture.pid("web/web-pid")));
+            assert!(alive(fixture.pid("web/web-detached")));
+            assert!(!fixture.path("web/web-detached-stopping").exists());
+            fs::write(fixture.path("restart-api"), "").unwrap();
+            fixture.until(|fixture| {
+                fs::read_to_string(fixture.path("api/api-pid"))
+                    .ok()
+                    .is_some_and(|pid| pid.parse::<i32>().unwrap() != previous_pid)
+            });
+            assert!(fixture.state()["leases"].as_object().unwrap().values().any(
+                |lease| lease["hostname"] == "api.grace.localhost" && lease["target"] == target
+            ));
+            signal(fixture.child.id() as i32, libc::SIGTERM);
+            assert_eq!(fixture.wait().code(), Some(143));
+            fixture.clean();
+        }
+    }
+
+    #[test]
+    fn nook_stop_gives_detached_descendants_grace_without_resignaling_group() {
+        if namespace(
+            "shutdown::nook_stop_gives_detached_descendants_grace_without_resignaling_group",
+        ) {
+            return;
+        }
+        for shell in [false, true] {
+            let mut fixture = Fixture::start_options(false, false, shell, false, true);
+            let output = Command::new(env!("CARGO_BIN_EXE_nook"))
+                .current_dir(fixture.caddy.root())
+                .env("XDG_CONFIG_HOME", fixture.path("config"))
+                .env("XDG_STATE_HOME", fixture.path("state"))
+                .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+                .env_remove("NOOK_WORKSPACE_SESSION")
+                .args(["stop", "api.grace.localhost"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fixture.until(|fixture| fixture.path("api-exit").exists());
+            assert_eq!(
+                fs::read_to_string(fixture.path("api-exit")).unwrap(),
+                if shell { "143" } else { "0" }
+            );
+            fixture.assert_detached_cleanup(libc::SIGTERM);
+            assert!(alive(fixture.pid("web/web-pid")));
+            assert!(alive(fixture.pid("web/web-detached")));
+            assert!(!fixture.path("web/web-detached-stopping").exists());
+            signal(fixture.child.id() as i32, libc::SIGTERM);
+            assert_eq!(fixture.wait().code(), Some(143));
+            fixture.clean();
+        }
+    }
+
+    #[test]
+    fn root_closing_during_member_grace_does_not_repeat_detached_signal() {
+        if namespace("shutdown::root_closing_during_member_grace_does_not_repeat_detached_signal") {
+            return;
+        }
+        for local in [false, true] {
+            let mut fixture = Fixture::start_options(false, false, false, false, true);
+            if local {
+                signal(fixture.wrapper(), libc::SIGTERM);
+                fixture.until(|fixture| {
+                    fixture.path("api/api-detached-stopping").exists()
+                        || fixture.path("api-exit").exists()
+                });
+                assert!(fixture.path("api/api-detached-stopping").exists());
+            }
+            signal(fixture.child.id() as i32, libc::SIGTERM);
+            assert_eq!(fixture.wait().code(), Some(143));
+            fixture.assert_detached_cleanup(libc::SIGTERM);
+            assert_eq!(
+                fs::read_to_string(fixture.path("web/web-detached-clean")).unwrap(),
+                libc::SIGTERM.to_string()
+            );
+            fixture.clean();
+        }
+    }
+
+    #[test]
+    fn missing_context_still_cleans_the_members_owned_detached_processes() {
+        if namespace("shutdown::missing_context_still_cleans_the_members_owned_detached_processes")
+        {
+            return;
+        }
+        let mut fixture = Fixture::start(false);
+        let root = fixture.child.id() as i32;
+        let context = fs::read_to_string(fixture.path("context")).unwrap();
+        let lock = File::open(Path::new(&context).with_file_name("context.lock")).unwrap();
+        lock.lock().unwrap();
+        // Keep root recovery from masking a wrapper's missing-context cleanup.
+        // Holding its session lock first also keeps the paused root out of it.
+        signal(root, libc::SIGSTOP);
+        fixture.until(|_| {
+            fs::read_to_string(format!("/proc/{root}/stat"))
+                .unwrap()
+                .rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('T'))
+        });
+        let bytes = fs::read(&context).unwrap();
+        let permissions = fs::metadata(&context).unwrap().permissions();
+        fs::remove_file(&context).unwrap();
+        drop(lock);
+        fixture.until(|fixture| {
+            fixture.path("api-exit").exists() && fixture.path("web-exit").exists()
+        });
+        let detached_survived = ["api/api-detached", "web/web-detached"]
+            .iter()
+            .any(|file| alive(fixture.pid(file)));
+        assert_eq!(fs::read_to_string(fixture.path("api-exit")).unwrap(), "1");
+        // Restore the private context so ordinary root teardown remains testable.
+        fs::write(&context, bytes).unwrap();
+        fs::set_permissions(&context, permissions).unwrap();
+        signal(root, libc::SIGCONT);
+        signal(root, libc::SIGTERM);
+        assert_eq!(fixture.wait().code(), Some(143));
+        fixture.clean();
+        assert!(
+            !detached_survived,
+            "context loss skipped exact-token cleanup"
+        );
     }
 
     #[test]
