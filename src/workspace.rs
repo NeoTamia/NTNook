@@ -175,10 +175,11 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
         let store = Store::new(member.state_path().to_owned());
         loop {
             if let Some(code) = child.0.try_wait().map_err(process::RunError::from)? {
-                // Root shutdown may have signaled the group before this tick.
-                // A leader's exit must not bypass its descendants' grace, but
-                // an unsolicited exit in a live session still cleans up now.
-                graceful = !signals.pending().is_empty() || member.check_live().is_err();
+                // `nook stop` signals the child group directly. Its shell
+                // leader can exit before descendants finish asynchronous
+                // cleanup, without signaling this wrapper or closing the root.
+                // Preserve the exit status and the same bounded tree grace.
+                graceful = true;
                 return Ok(code);
             }
             if let Some(signal) = signals.pending().first() {

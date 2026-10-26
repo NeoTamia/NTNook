@@ -157,7 +157,7 @@ pub(crate) struct ManagedChild {
     #[cfg(unix)]
     terminal: Option<TerminalForeground>,
     #[cfg(unix)]
-    inherits_stdin: bool,
+    terminal_job_control: bool,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -250,7 +250,7 @@ impl ManagedChild {
 
     #[cfg(unix)]
     fn sync_terminal(&mut self) {
-        if !self.inherits_stdin {
+        if !self.terminal_job_control {
             return;
         }
         if self.terminal.is_none() && !process_is_stopped(self.pid) {
@@ -1171,12 +1171,21 @@ pub(crate) fn spawn_managed_child_in(
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
     }
-    configure_child(&mut command);
+    // Session members keep the runner's inherited streams, but must never
+    // take its foreground or propagate a background stdin stop to its group.
+    // The root runner carries SESSION_VARIABLE; only members carry PROCESS_VARIABLE.
+    let terminal_job_control = prefix.is_none()
+        && !environment
+            .iter()
+            .any(|(key, _)| key == crate::workspace_session::PROCESS_VARIABLE);
+    configure_child(&mut command, terminal_job_control);
     // Acquire before spawn: Command::spawn only returns after exec, so the
     // child claims the TTY in pre_exec. Nook keeps SIGTTOU ignored so later
     // wrapper writes survive `stty tostop`.
     #[cfg(unix)]
-    let terminal = prefix.is_none().then(TerminalForeground::acquire).flatten();
+    let terminal = terminal_job_control
+        .then(TerminalForeground::acquire)
+        .flatten();
     let mut child = command.spawn().map_err(Error::Spawn)?;
     let pid = child.id();
     #[cfg(unix)]
@@ -1227,7 +1236,7 @@ pub(crate) fn spawn_managed_child_in(
         #[cfg(unix)]
         terminal,
         #[cfg(unix)]
-        inherits_stdin: prefix.is_none(),
+        terminal_job_control,
         #[cfg(windows)]
         job,
     })
@@ -1385,14 +1394,14 @@ fn join_child_process_group(pid: u32) {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn configure_child(command: &mut Command) {
+fn configure_child(command: &mut Command, terminal_job_control: bool) {
     // SAFETY: this closure runs after fork and before exec. It only invokes
     // async-signal-safe libc syscalls and constructs errors from errno.
     // The child claims the TTY here because Command::spawn returns only after
     // exec; permanently ignoring SIGTTIN would turn a too-early stdin read
     // into EIO instead of blocking until the handoff.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -1402,7 +1411,9 @@ fn configure_child(command: &mut Command) {
             if libc::getppid() == 1 {
                 libc::raise(libc::SIGTERM);
             }
-            claim_controlling_terminal();
+            if terminal_job_control {
+                claim_controlling_terminal();
+            }
             Ok(())
         });
     }
@@ -1613,7 +1624,7 @@ fn effective_windows_env(environment: &[(OsString, OsString)], name: &str) -> Op
 }
 
 #[cfg(windows)]
-fn configure_child(command: &mut Command) {
+fn configure_child(command: &mut Command, _terminal_job_control: bool) {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
 
@@ -2816,7 +2827,7 @@ mod tests {
                 "import os,subprocess; p=subprocess.Popen(['/bin/sleep','30']); open(os.environ['NOOK_WORKER_PID'],'w').write(str(p.pid))",
             ])
             .env("NOOK_WORKER_PID", &marker);
-        configure_child(&mut command);
+        configure_child(&mut command, true);
         let mut leader = command.spawn().unwrap();
         let leader_pid = leader.id();
         assert!(leader.wait().unwrap().success());

@@ -104,7 +104,11 @@ if os.environ.get('NONDUMPABLE') and role == 'api':
     import ctypes
     assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0
 record(role + '-pid', str(os.getpid()))
+if os.environ.get('TEST_TTY'):
+    record(role + '-tty', str(int(os.isatty(0))))
 while True:
+    if pathlib.Path('read-stdin').exists():
+        os.read(0, 1)
     if pathlib.Path('exit-api').exists() and role == 'api':
         sys.exit(23)
     time.sleep(.01)
@@ -118,19 +122,21 @@ def stop(sig, frame):
         pathlib.Path('runner-duplicate').write_text(str(sig))
     signal.signal(signal.SIGINT, repeated)
     signal.signal(signal.SIGTERM, repeated)
-    time.sleep(.05)
+    # A parallel runner waits briefly for its foreground tasks to handle Ctrl-C.
+    time.sleep(.5 if os.environ.get('TEST_TTY') else .05)
     pathlib.Path('runner-clean').write_text(str(sig))
     sys.exit(0)
 for sig in [signal.SIGINT, signal.SIGTERM]:
     signal.signal(sig, stop)
 pathlib.Path('context').write_text(os.environ['NOOK_WORKSPACE_SESSION'])
+pathlib.Path('runner-pgid').write_text(str(os.getpgrp()))
 def member(role):
     argv = [sys.executable, str(root/'server.py'), role]
     if os.environ.get('SHELL_MEMBER'):
         argv = ['/bin/sh', '-c', 'trap "exit 130" INT; trap "exit 143" TERM; "$@" & wait "$!"', 'nook-test-shell', *argv]
     return subprocess.Popen([os.environ['TEST_NOOK'], 'run', '--', *argv], cwd=root/role)
 children = {role: member(role) for role in ['api', 'web']}
-task = subprocess.Popen([sys.executable, 'server.py', 'task'], start_new_session=True)
+task = subprocess.Popen([sys.executable, 'server.py', 'task'], start_new_session=not os.environ.get('TEST_TTY'))
 while True:
     protected = root/'api/api-pid'
     if os.environ.get('NONDUMPABLE') and protected.exists() and not (root/'api-unreadable').exists():
@@ -160,6 +166,7 @@ while True:
     struct Fixture {
         caddy: caddy::CaddyHarness,
         child: Child,
+        terminal: Option<File>,
     }
 
     impl Fixture {
@@ -168,6 +175,14 @@ while True:
         }
 
         fn start_with(stubborn: bool, nondumpable: bool, shell: bool) -> Self {
+            Self::start_options(stubborn, nondumpable, shell, false)
+        }
+
+        #[allow(unsafe_code)]
+        fn start_options(stubborn: bool, nondumpable: bool, shell: bool, tty: bool) -> Self {
+            use std::os::fd::FromRawFd;
+            use std::os::unix::process::CommandExt;
+
             let caddy = caddy::CaddyHarness::start_on_standard_ports();
             let root = caddy.root();
             fs::create_dir_all(root.join("config/nook")).unwrap();
@@ -206,6 +221,36 @@ os.execv(sys.argv[1],sys.argv[1:])",
             } else {
                 Command::new(env!("CARGO_BIN_EXE_nook"))
             };
+            let terminal = tty.then(|| {
+                let (mut master, mut slave) = (-1, -1);
+                assert_eq!(
+                    unsafe {
+                        libc::openpty(
+                            &mut master,
+                            &mut slave,
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                        )
+                    },
+                    0
+                );
+                let (master, slave) =
+                    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+                command.stdin(Stdio::from(slave));
+                // The child becomes a real controlling-terminal session leader.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::setsid() == -1
+                            || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                master
+            });
             let child = command
                 .current_dir(root)
                 .env("XDG_CONFIG_HOME", root.join("config"))
@@ -216,16 +261,25 @@ os.execv(sys.argv[1],sys.argv[1:])",
                 .envs(stubborn.then_some(("STUBBORN", "1")))
                 .envs(nondumpable.then_some(("NONDUMPABLE", "1")))
                 .envs(shell.then_some(("SHELL_MEMBER", "1")))
+                .envs(tty.then_some(("TEST_TTY", "1")))
                 .args(["run", "--runner", "--", "python3", "runner.py"])
                 .stdout(Stdio::from(File::create(root.join("run.stdout")).unwrap()))
                 .stderr(Stdio::from(File::create(root.join("run.stderr")).unwrap()))
                 .spawn()
                 .unwrap();
-            let mut fixture = Self { caddy, child };
+            let mut fixture = Self {
+                caddy,
+                child,
+                terminal,
+            };
             fixture.until(|fixture| {
                 ["api/api-pid", "web/web-pid", "task-pid"]
                     .iter()
                     .all(|file| fixture.path(file).exists())
+                    && (!tty
+                        || ["api/api-tty", "web/web-tty", "task-tty"]
+                            .iter()
+                            .all(|file| fixture.path(file).exists()))
             });
             fixture
         }
@@ -383,6 +437,156 @@ os.execv(sys.argv[1],sys.argv[1:])",
             String::from_utf8_lossy(&output.stderr)
         );
         true
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn tty_parallel_members_leave_foreground_with_runner_and_ctrl_c_stops_workspace() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        if namespace(
+            "shutdown::tty_parallel_members_leave_foreground_with_runner_and_ctrl_c_stops_workspace",
+        ) {
+            return;
+        }
+        let mut fixture = Fixture::start_options(false, false, false, true);
+        let runner = fixture.pid("runner-pgid");
+        let foreground =
+            || unsafe { libc::tcgetpgrp(fixture.terminal.as_ref().unwrap().as_raw_fd()) };
+        assert_eq!(foreground(), runner, "a member stole the runner's terminal");
+        for file in ["api/api-tty", "web/web-tty", "task-tty"] {
+            assert_eq!(
+                fs::read_to_string(fixture.path(file)).unwrap(),
+                "1",
+                "{file} must inherit stdin"
+            );
+        }
+        let api = fixture.pid("api/api-pid");
+        let web = fixture.pid("web/web-pid");
+        assert_eq!(unsafe { libc::getpgid(api) }, api);
+        assert_eq!(unsafe { libc::getpgid(web) }, web);
+        assert_ne!(api, runner);
+        assert_ne!(web, runner);
+        signal(api, libc::SIGSTOP);
+        fixture.until(|_| stopped(api));
+        signal(api, libc::SIGCONT);
+        fixture.until(|_| !stopped(api));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            unsafe { libc::tcgetpgrp(fixture.terminal.as_ref().unwrap().as_raw_fd()) },
+            runner,
+            "resume stole the terminal"
+        );
+        // Background terminal reads stop only the member, never the runner.
+        fs::write(fixture.path("api/read-stdin"), "").unwrap();
+        fixture.until(|_| stopped(api));
+        assert!(!stopped(runner), "background member stopped the runner");
+        assert_eq!(
+            unsafe { libc::tcgetpgrp(fixture.terminal.as_ref().unwrap().as_raw_fd()) },
+            runner
+        );
+        // VINTR goes through the terminal driver, not kill(2).
+        fixture.terminal.as_mut().unwrap().write_all(&[3]).unwrap();
+        // The runner handles SIGINT and exits successfully; Nook preserves it.
+        assert_eq!(fixture.wait().code(), Some(0));
+        fixture.clean();
+    }
+
+    fn stopped(pid: i32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('T'))
+        })
+    }
+
+    #[test]
+    fn stop_shell_member_preserves_tree_grace_and_same_port_restart() {
+        if namespace("shutdown::stop_shell_member_preserves_tree_grace_and_same_port_restart") {
+            return;
+        }
+        for (force, stubborn) in [(false, false), (true, false), (true, true)] {
+            let mut fixture = Fixture::start_with(stubborn, false, true);
+            let previous_pid = fixture.pid("api/api-pid");
+            let state = fixture.state();
+            let lease = state["leases"]
+                .as_object()
+                .unwrap()
+                .values()
+                .find(|lease| lease["hostname"] == "api.grace.localhost")
+                .unwrap();
+            let target = lease["target"].clone();
+            assert_ne!(
+                lease["pid"].as_i64(),
+                Some(i64::from(previous_pid)),
+                "must stop the shell leader"
+            );
+            let started = Instant::now();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_nook"));
+            command
+                .current_dir(fixture.caddy.root())
+                .env("XDG_CONFIG_HOME", fixture.path("config"))
+                .env("XDG_STATE_HOME", fixture.path("state"))
+                .env("NOOK_DISABLE_UPDATE_CHECK", "1")
+                .env_remove("NOOK_WORKSPACE_SESSION")
+                .args(["stop", "api.grace.localhost"]);
+            if force {
+                command.arg("--force");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // While the async handler is running its claim must still exist.
+            if !stubborn {
+                fixture.until(|fixture| fixture.path("api/api-stopping").exists());
+                let context = fs::read_to_string(fixture.path("context")).unwrap();
+                let context: Value = serde_json::from_slice(&fs::read(context).unwrap()).unwrap();
+                assert!(
+                    context["members"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|member| member["app_id"] == "api"),
+                    "claim released before descendant cleanup"
+                );
+            }
+            fixture.until(|fixture| fixture.path("api-exit").exists());
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "member shutdown exceeded its bound"
+            );
+            assert_eq!(
+                fixture.path("api/api-clean").exists(),
+                !stubborn,
+                "stop killed descendant before asynchronous cleanup"
+            );
+            assert!(!alive(previous_pid));
+            assert!(!alive(fixture.pid("api/api-detached")));
+            assert!(alive(fixture.pid("web/web-pid")));
+            assert!(alive(fixture.pid("task-pid")));
+            assert!(!fixture.path("runner-clean").exists());
+            assert!(!fixture.path("web/web-clean").exists());
+            fs::write(fixture.path("restart-api"), "").unwrap();
+            fixture.until(|fixture| {
+                fs::read_to_string(fixture.path("api/api-pid"))
+                    .ok()
+                    .is_some_and(|pid| pid.parse::<i32>().unwrap() != previous_pid)
+            });
+            assert!(fixture.state()["leases"].as_object().unwrap().values().any(
+                |lease| lease["hostname"] == "api.grace.localhost" && lease["target"] == target
+            ));
+            // Root teardown must also finish when a member is already inside
+            // its leader-exit grace, rather than depending on the wrapper exit.
+            let restarted = fixture.pid("api/api-pid");
+            fs::write(fixture.path("api/exit-api"), "").unwrap();
+            fixture.until(|_| !alive(restarted));
+            signal(fixture.child.id() as i32, libc::SIGTERM);
+            assert_eq!(fixture.wait().code(), Some(143));
+            fixture.clean();
+        }
     }
 
     #[test]

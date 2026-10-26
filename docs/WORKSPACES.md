@@ -107,7 +107,16 @@ When the root command exits, Nook stops the remaining children and removes route
 On an interrupt, termination signal, or orderly runner exit, Nook allows two
 seconds for application shutdown handlers before forcibly stopping remaining
 owned processes. The same grace period applies when signaling an individual
-session member.
+session member or when its command leader exits, so shell descendants can finish
+cleanup before the member releases its claim. A member restart can therefore
+wait up to two seconds after its leader exits; the original exit status is kept.
+
+The root command retains the terminal foreground. Session members inherit the
+runner's streams without claiming the terminal, so the runner keeps its native
+output formatting. A background member reading terminal stdin may be suspended
+by the operating system; it does not suspend the runner or take its foreground.
+Use the runner's input controls for interactive tasks. Standalone commands keep
+their normal terminal job control.
 
 The tested Yarn foreach, direct Nx and Lerna continuous-task configurations keep
 persistent siblings alive after a member error. Nook keeps the session and its
