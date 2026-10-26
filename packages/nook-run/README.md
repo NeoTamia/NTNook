@@ -2,6 +2,13 @@
 
 Run a JavaScript development command through a system-installed [Nook](https://github.com/NeoTamia/NTNook) CLI and get actionable installation guidance when Nook is missing.
 
+When started inside a Nook workspace runner session, the same wrapper joins its
+app's prepared configuration. Package scripts need no second wrapper. See
+[monorepo workspaces](https://github.com/NeoTamia/NTNook/blob/dev/docs/WORKSPACES.md)
+for runner setup (Turbo, Lerna, pnpm, Bun, Vite Task, direct Nx, and the bounded
+moon/Yarn checks), Turbo's environment allowlist, and the root
+`nook run --runner -- <dev command>` invocation.
+
 ## Install
 
 ```sh
@@ -41,7 +48,10 @@ LAN mode can also be enabled with `lan = true` in `nook.toml` or `nook.local.tom
 The local file overrides the shared file, including `lan = false`; `--lan` and `--no-lan`
 override either setting.
 
-The command inherits the terminal and environment, forwards `SIGINT` and `SIGTERM`, and returns the launched process's exit code.
+The command inherits the terminal and environment, forwards `SIGINT` and
+`SIGTERM`, and returns the launched process's exit code. Existing scripts also work with
+Bun's forced runtime (`bun run --bun`); the wrapper preserves a leading command
+separator that Bun removes from JavaScript arguments.
 
 When Nook is not installed, `nook-run` prints a warning and runs the command after `--` directly.
 This lets the project start on a new development machine without Nook's local domains or HTTPS

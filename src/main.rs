@@ -11,6 +11,9 @@ mod reconcile;
 mod state;
 mod tailscale;
 mod update;
+mod workspace;
+mod workspace_config;
+mod workspace_session;
 
 use std::fmt;
 use std::io;

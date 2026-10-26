@@ -23,7 +23,7 @@ async function temporaryDirectory(t) {
 
 function runLauncher(args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [launcher, ...args], {
+    const child = spawn(options.runtime ?? process.execPath, [launcher, ...args], {
       cwd: options.cwd,
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -71,6 +71,19 @@ test("warns and runs the command directly when Nook is missing", async (t) => {
   assert.match(result.stderr, /nook-installer\.sh/);
   assert.match(result.stderr, /local domains and HTTPS will be unavailable/);
   assert.equal(result.stdout, '["an argument"]\n');
+});
+
+test("never runs an unmanaged fallback when a workspace marker is present", async (t) => {
+  const directory = await temporaryDirectory(t);
+  for (const marker of ["", path.join(directory, "stale-session.json")]) {
+    const result = await runLauncher(["--", process.execPath, "-e", 'console.log("unmanaged")'], {
+      env: { ...process.env, PATH: directory, NOOK_WORKSPACE_SESSION: marker },
+    });
+    assert.equal(result.code, 127);
+    assert.match(result.stderr, /cannot join the workspace session/);
+    assert.doesNotMatch(result.stderr, /running the command directly/);
+    assert.equal(result.stdout, "");
+  }
 });
 
 test("selects installation guidance for the host platform", () => {
@@ -121,6 +134,7 @@ writeFileSync(process.env.NOOK_RUN_RECORD, JSON.stringify({
   argv: process.argv.slice(2),
   cwd: process.cwd(),
   marker: process.env.NOOK_RUN_MARKER,
+  session: process.env.NOOK_WORKSPACE_SESSION,
 }));
 `,
   );
@@ -140,6 +154,7 @@ writeFileSync(process.env.NOOK_RUN_RECORD, JSON.stringify({
     env: {
       ...process.env,
       NOOK_RUN_MARKER: "inherited",
+      NOOK_WORKSPACE_SESSION: "opaque-session-context",
       NOOK_RUN_RECORD: recordPath,
       PATH: `${directory}${path.delimiter}${process.env.PATH ?? ""}`,
     },
@@ -150,6 +165,7 @@ writeFileSync(process.env.NOOK_RUN_RECORD, JSON.stringify({
   assert.deepEqual(record.argv, ["run", ...args]);
   assert.equal(record.cwd, directory);
   assert.equal(record.marker, "inherited");
+  assert.equal(record.session, "opaque-session-context");
 });
 
 test("preserves Nook's exit code", async (t) => {
@@ -229,4 +245,43 @@ setInterval(() => {}, 1000);
 
   assert.deepEqual(exit, { code: 143, signal: null });
   assert.equal(await readFile(signalPath, "utf8"), "SIGTERM");
+});
+
+const bunRuntime = process.env.NOOK_TEST_BUN;
+
+test("Bun preserves the command boundary, Nook options and child separators", { skip: !bunRuntime }, async (t) => {
+  const directory = await temporaryDirectory(t);
+  await createFakeNook(directory, "console.log(JSON.stringify(process.argv.slice(2)));\n");
+  for (const args of [
+    ["--", "fake app", "argument with spaces", "--", "--name", "child"],
+    ["--name", "web", "--", "fake-app", "--", "child"],
+    ["--help"],
+    [],
+  ]) {
+    const result = await runLauncher(args, {
+      runtime: bunRuntime,
+      env: { ...process.env, PATH: directory },
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), ["run", ...args]);
+  }
+});
+
+test("Bun standalone fallback preserves argv and refuses a stale session", { skip: !bunRuntime }, async (t) => {
+  const directory = await temporaryDirectory(t);
+  const args = ["--", process.execPath, "-e", "console.log(JSON.stringify(process.argv.slice(1)))", "--", "literal value", "--"];
+  const environment = { ...process.env, PATH: directory };
+  delete environment.NOOK_WORKSPACE_SESSION;
+  const result = await runLauncher(args, { runtime: bunRuntime, env: environment });
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), ["literal value", "--"]);
+  assert.match(result.stderr, /running the command directly/);
+
+  const session = await runLauncher(args, {
+    runtime: bunRuntime,
+    env: { ...environment, NOOK_WORKSPACE_SESSION: "stale-session" },
+  });
+  assert.equal(session.code, 127);
+  assert.equal(session.stdout, "");
+  assert.match(session.stderr, /refusing to start an unmanaged command/);
 });

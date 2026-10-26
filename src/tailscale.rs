@@ -571,7 +571,21 @@ fn owner_state(
     if registry.aliases.values().any(|alias| alias.id == owner_id) {
         return Owner::Alive;
     }
-    match registry.leases.get(&owner_id).map(liveness) {
+    let live = registry.leases.get(&owner_id).map(|lease| {
+        let member = liveness(lease);
+        match lease.workspace_supervisor.as_ref() {
+            None => member,
+            Some(supervisor) => match crate::process::workspace_supervisor_liveness(supervisor) {
+                // The runner still owns the route while restarting a member.
+                Liveness::Alive => Liveness::Alive,
+                Liveness::Dead if member == Liveness::Dead => Liveness::Dead,
+                // Reconciliation must finish owned child cleanup before Serve
+                // can discard a workspace registration.
+                Liveness::Dead | Liveness::Indeterminate => Liveness::Indeterminate,
+            },
+        }
+    });
+    match live {
         Some(Liveness::Alive) => Owner::Alive,
         Some(Liveness::Indeterminate) => Owner::Unknown,
         Some(Liveness::Dead) | None => Owner::Gone,
@@ -1524,6 +1538,8 @@ mod tests {
             preserve_host: false,
         };
         let lease = Lease {
+            group_id: None,
+            workspace_supervisor: None,
             lan: false,
             id: Uuid::new_v4(),
             hostname: "run.localhost".into(),
@@ -1550,6 +1566,30 @@ mod tests {
         assert_eq!(
             owner_state(&registry, Uuid::new_v4(), &mut unknown),
             Owner::Gone
+        );
+        let pid = std::process::id();
+        let identity = crate::process::read_process_identity(pid).unwrap();
+        registry
+            .leases
+            .get_mut(&lease.id)
+            .unwrap()
+            .workspace_supervisor = Some(crate::state::WorkspaceSupervisor {
+            pid,
+            process_start_time_ticks: identity.start_time_ticks,
+        });
+        assert_eq!(owner_state(&registry, lease.id, &mut dead), Owner::Alive);
+        registry
+            .leases
+            .get_mut(&lease.id)
+            .unwrap()
+            .workspace_supervisor
+            .as_mut()
+            .unwrap()
+            .process_start_time_ticks += 1;
+        assert_eq!(owner_state(&registry, lease.id, &mut dead), Owner::Gone);
+        assert_eq!(
+            owner_state(&registry, lease.id, &mut unknown),
+            Owner::Unknown
         );
     }
 

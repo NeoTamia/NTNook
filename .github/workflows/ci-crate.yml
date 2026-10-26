@@ -8,6 +8,10 @@ on:
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - "src/**"
+      - "packages/nook-run/bin/**"
+      - "packages/nook-run/test/**"
+      - "packages/nook-run/README.md"
+      - "docs/WORKSPACES.md"
       - "tests/**"
       - "docker/**"
       - "README.md"
@@ -22,6 +26,10 @@ on:
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - "src/**"
+      - "packages/nook-run/bin/**"
+      - "packages/nook-run/test/**"
+      - "packages/nook-run/README.md"
+      - "docs/WORKSPACES.md"
       - "tests/**"
       - "docker/**"
       - "README.md"
@@ -77,6 +85,19 @@ jobs:
 
       - name: Lint
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Install Node for monorepo runner tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.1
+          package-manager-cache: false
+
+      - name: Test real monorepo runners
+        run: |
+          cargo build --locked
+          npm install --prefix target/workspace-runner-tools --no-audit --no-fund turbo@2.11.10 lerna@10.1.1 pnpm@12.15.0 bun@1.4.4 vite-plus@1.4.0 nx@24.0.0 @moonrepo/cli@2.6.2 @yarnpkg/cli-dist@4.18.1
+          NOOK_TEST_BUN="$PWD/target/workspace-runner-tools/node_modules/.bin/bun" node --test packages/nook-run/test/nook-run.test.js
+          NOOK_RUNNER_DIRECT=1 node --test tests/workspace_runners.mjs
 
       - name: Build release binary
         run: |
