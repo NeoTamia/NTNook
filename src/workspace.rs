@@ -226,6 +226,18 @@ pub(crate) fn prepare(
         }
         workspace.apps.retain(|app| app.id == id);
     }
+    // All routes are prepared before leases are committed. Check the whole
+    // selection here: the registry cannot detect collisions within this batch.
+    let mut lan_names = BTreeMap::new();
+    for app in workspace.apps.iter().filter(|app| app.config.lan) {
+        let hostname = crate::lan::hostname(&app.config.hostname);
+        if let Some(other) = lan_names.insert(hostname.clone(), &app.id) {
+            return Err(invalid(format!(
+                "apps `{other}` and `{}` resolve to the same LAN hostname `{hostname}`; choose distinct app names (--force cannot replace a sibling)",
+                app.id
+            )));
+        }
+    }
     let signals = ForwardedSignals::new()?;
     let mut apps = Vec::new();
     let mut values = BTreeMap::new();
@@ -1242,6 +1254,43 @@ mod tests {
         assert_eq!(interpolate(&raw, &values).unwrap().as_bytes(), b"\x80-4321");
         assert!(interpolate(OsStr::new("${api.port"), &values).is_err());
         assert!(interpolate(OsStr::new("${api.nope}"), &values).is_err());
+    }
+
+    #[test]
+    fn selected_apps_cannot_share_a_normalized_lan_hostname_even_with_force() {
+        let fixture = Fixture::new();
+        let config = |force: bool| {
+            let mut config = fixture.workspace([&["server"], &["server"]]);
+            for (app, hostname) in config
+                .apps
+                .iter_mut()
+                .zip(["api.localhost", "api.local.localhost"])
+            {
+                app.config.hostname = hostname.into();
+                app.config.lan = true;
+                app.config.force = force;
+            }
+            config
+        };
+        for force in [false, true] {
+            let error = prepare(config(force), None)
+                .err()
+                .expect("duplicate LAN names must fail before route installation");
+            let message = error.to_string();
+            assert!(
+                message.contains("same LAN hostname `api.local`"),
+                "{message}"
+            );
+            assert!(
+                message.contains("web") && message.contains("api"),
+                "{message}"
+            );
+            assert!(fixture.store.load().unwrap().leases.is_empty());
+        }
+        assert!(prepare(config(true), Some("web")).is_ok());
+        let mut local_only = config(true);
+        local_only.apps[1].config.lan = false;
+        assert!(prepare(local_only, None).is_ok());
     }
 
     #[test]
