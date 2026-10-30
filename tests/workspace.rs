@@ -510,6 +510,184 @@ fn workspace_supervisor_sigkill_then_prune_leaves_no_children_or_routes() {
     fixture.assert_clean(&reports);
 }
 
+#[test]
+fn linked_worktrees_keep_native_and_runner_apps_isolated_through_caddy_and_lan() {
+    if in_network_namespace(
+        "linked_worktrees_keep_native_and_runner_apps_isolated_through_caddy_and_lan",
+    ) {
+        return;
+    }
+    for runner in [false, true] {
+        let fixture = Workspace::new();
+        fixture.configure(true, None, "");
+        let manifest = fixture.root.join("nook.toml");
+        let original = fs::read_to_string(&manifest).unwrap().replace(
+            "PEER_URL = '${web.url}'",
+            "PEER_LAN = '${web.lan_url}'\nPEER_URL = '${web.url}'",
+        );
+        fs::write(
+            &manifest,
+            original.replacen(
+                "format_version = 2",
+                "format_version = 2\nworktree = true",
+                1,
+            ),
+        )
+        .unwrap();
+        fs::write(fixture.root.join("runner.py"), r#"
+import os, subprocess, time
+children = [subprocess.Popen([os.environ['TEST_NOOK'], 'run', '--', 'python3', '-u', 'child.py'], cwd='apps/' + app) for app in ['api', 'web']]
+while all(child.poll() is None for child in children): time.sleep(.02)
+"#).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&fixture.root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["add", "nook.toml", "apps", "runner.py"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ]);
+        let linked = fixture.caddy.root().join("agent-b");
+        git(&["worktree", "add", "--detach", linked.to_str().unwrap()]);
+        let start = |root: &std::path::Path, label: &str| {
+            let mut command = fixture.nook();
+            command
+                .current_dir(root)
+                .env("TEST_NOOK", env!("CARGO_BIN_EXE_nook"))
+                .args(["run", "--lan", &format!("--worktree={label}")]);
+            if runner {
+                command.args(["--runner", "--", "python3", "runner.py"]);
+            }
+            Running::start(command, &fixture.root, label)
+        };
+        // Start concurrently, sharing the same registry and Caddy instance.
+        let mut first = start(&fixture.root, "agent-a");
+        let mut second = start(&linked, "agent-b");
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let reports = loop {
+            let reports: Vec<Value> = [&fixture.root, &linked]
+                .into_iter()
+                .flat_map(|root| {
+                    ["api", "web"].map(|app| root.join(format!("apps/{app}/started.json")))
+                })
+                .filter_map(|path| {
+                    fs::read(path)
+                        .ok()
+                        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+                })
+                .collect();
+            let state = fixture.state();
+            let leases = state["leases"].as_object().unwrap();
+            if reports.len() == 4
+                && leases.len() == 4
+                && leases.values().all(|lease| lease["state"] == "ready")
+            {
+                break reports;
+            }
+            assert!(
+                first.child.try_wait().unwrap().is_none(),
+                "{}",
+                first.logs()
+            );
+            assert!(
+                second.child.try_wait().unwrap().is_none(),
+                "{}",
+                second.logs()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "{}\n{}",
+                first.logs(),
+                second.logs()
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let ports: std::collections::BTreeSet<_> = reports
+            .iter()
+            .map(|r| r["env"]["PORT"].as_str().unwrap())
+            .collect();
+        assert_eq!(ports.len(), 4);
+        let get = |host: &str| {
+            let mut stream = TcpStream::connect(("127.0.0.1", 80)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            write!(
+                stream,
+                "GET /started.json HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            response
+        };
+        for (offset, label) in [(0, "agent-a"), (2, "agent-b")] {
+            assert_eq!(
+                reports[offset]["env"]["PEER_URL"],
+                format!("http://frontend.{label}.project.localhost")
+            );
+            assert_eq!(
+                reports[offset]["env"]["PEER_LAN"],
+                format!("http://frontend.{label}.project.local")
+            );
+            assert_eq!(
+                reports[offset]["env"]["PEER_PORT"],
+                reports[offset + 1]["env"]["PORT"]
+            );
+            for (index, app) in ["api", "frontend"].iter().enumerate() {
+                let host = format!("{app}.{label}.project");
+                assert_eq!(
+                    reports[offset + index]["env"]["NOOK_LAN_URL"],
+                    format!("http://{host}.local")
+                );
+                for suffix in ["localhost", "local"] {
+                    let response = get(&format!("{host}.{suffix}"));
+                    assert!(response.contains(reports[offset + index]["cwd"].as_str().unwrap()));
+                }
+            }
+        }
+        let before = fixture.state();
+        let mut collision = fixture.nook();
+        collision
+            .current_dir(&linked)
+            .args(["run", "--worktree=agent-a", "--force", "--lan"]);
+        let output = collision.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("another worktree"));
+        assert_eq!(fixture.state()["leases"], before["leases"]);
+        // A killed supervisor is recovered without removing the other worktree.
+        first.signal(libc::SIGKILL);
+        first.wait();
+        assert!(fixture.run(&["prune"]).success());
+        assert_eq!(fixture.state()["leases"].as_object().unwrap().len(), 2);
+        assert!(second.child.try_wait().unwrap().is_none());
+        for suffix in ["localhost", "local"] {
+            get(&format!("frontend.agent-b.project.{suffix}"));
+        }
+        assert!(!fixture.caddy.config_json().contains("agent-a.project"));
+        second.signal(libc::SIGINT);
+        second.wait();
+        fixture.assert_clean(&reports);
+        assert!(!fixture.caddy.config_json().contains("agent-b.project"));
+    }
+}
+
 struct Workspace {
     root: PathBuf,
     caddy: CaddyHarness,

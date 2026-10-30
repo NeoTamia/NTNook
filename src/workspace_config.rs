@@ -219,6 +219,12 @@ fn load_inner(
             ));
         }
         let mut settings = member.settings;
+        if settings.contains_key("worktree") {
+            return Err(invalid(
+                &path,
+                "worktree is a root workspace option; remove it from [[apps]]",
+            ));
+        }
         if settings.contains_key("format_version") {
             return Err(invalid(
                 &path,
@@ -291,11 +297,11 @@ fn load_inner(
                 format!("app `{}` requires a nonempty command argv", member.id),
             ));
         }
-        if resolved.tailscale || resolved.funnel || resolved.lan {
+        if resolved.tailscale || resolved.funnel {
             return Err(invalid(
                 &path,
                 format!(
-                    "app `{}`: Tailscale, Funnel, and LAN exposure are not supported by native workspaces yet; disable them with --no-tailscale and --no-lan",
+                    "app `{}`: managed Tailscale Serve and Funnel are not supported by workspaces; use --lan with an externally configured tunnel to Caddy, or disable with --no-tailscale",
                     member.id
                 ),
             ));
@@ -408,7 +414,7 @@ fn validate_environment(path: &Path, apps: &[WorkspaceApp]) -> Result<(), config
                     )
                 })?;
                 let (id, field) = token.rsplit_once('.').ok_or_else(|| invalid(path, format!("invalid environment token `${{{token}}}`; expected ${{id.url}}, ${{id.upstream}}, ${{id.host}}, or ${{id.port}}")))?;
-                if !matches!(field, "url" | "upstream" | "host" | "port") {
+                if !matches!(field, "url" | "lan_url" | "upstream" | "host" | "port") {
                     return Err(invalid(
                         path,
                         format!("unsupported environment token `${{{token}}}`"),
@@ -423,6 +429,12 @@ fn validate_environment(path: &Path, apps: &[WorkspaceApp]) -> Result<(), config
                         ),
                     )
                 })?;
+                if field == "lan_url" && !target.config.lan {
+                    return Err(invalid(
+                        path,
+                        format!("`${{{token}}}` requires LAN mode on app `{id}`"),
+                    ));
+                }
                 references.insert(&target.id);
                 remaining = rest;
             }
@@ -744,21 +756,21 @@ mod tests {
     }
 
     #[test]
-    fn exposure_options_fail_before_a_workspace_is_returned() {
+    fn managed_tailscale_options_fail_before_a_workspace_is_returned() {
         let directory = Directory::new();
         directory.workspace(API);
-        for flag in ["--tailscale", "--funnel", "--lan"] {
+        for flag in ["--tailscale", "--funnel"] {
             assert!(
                 directory
                     .load(&[flag])
                     .unwrap_err()
                     .to_string()
-                    .contains("not supported by native workspaces")
+                    .contains("not supported by workspaces")
             );
         }
-        for field in ["tailscale", "funnel", "lan"] {
+        for field in ["tailscale", "funnel"] {
             directory.workspace(&format!("{API}{field} = true\n"));
-            directory.error("not supported by native workspaces");
+            directory.error("not supported by workspaces");
             assert!(directory.load(&["--no-tailscale", "--no-lan"]).is_ok());
         }
     }

@@ -300,6 +300,7 @@ pub(crate) enum RunError {
     Process(Error),
     Exposure(Box<dyn std::error::Error + Send + Sync>),
     Conflict(String),
+    WorktreeConflict(String),
     LanHostnameConflict { hostname: String, project: String },
 }
 
@@ -310,6 +311,10 @@ impl fmt::Display for RunError {
             Self::Route(error) => error.fmt(formatter),
             Self::Process(error) => error.fmt(formatter),
             Self::Exposure(error) => error.fmt(formatter),
+            Self::WorktreeConflict(hostname) => write!(
+                formatter,
+                "hostname `{hostname}` belongs to another worktree or an unscoped run; choose another worktree identifier (--force cannot replace it)"
+            ),
             Self::Conflict(hostname) => write!(
                 formatter,
                 "hostname `{hostname}` is already managed by Nook; use --force to replace it"
@@ -329,7 +334,9 @@ impl std::error::Error for RunError {
             Self::Route(error) => Some(error),
             Self::Process(error) => Some(error),
             Self::Exposure(error) => Some(error.as_ref()),
-            Self::Conflict(_) | Self::LanHostnameConflict { .. } => None,
+            Self::Conflict(_) | Self::WorktreeConflict(_) | Self::LanHostnameConflict { .. } => {
+                None
+            }
         }
     }
 }
@@ -495,6 +502,18 @@ pub(crate) fn prepare_run(
             });
         }
     }
+    let identity = config.worktree.as_ref().map(|identity| &identity.key);
+    if registry.leases.values().any(|lease| {
+        lease.hostname == config.hostname
+            && lease.worktree.as_ref().map(|identity| &identity.key) != identity
+    }) || (identity.is_some()
+        && registry
+            .aliases
+            .values()
+            .any(|alias| alias.hostname == config.hostname))
+    {
+        return Err(RunError::WorktreeConflict(config.hostname.clone()));
+    }
     let displaced = {
         let aliases = registry
             .aliases
@@ -611,6 +630,51 @@ pub(crate) fn spawn_prepared_run(
     let owner_id = prepared.owner_id;
     let exposed = prepared.exposed.clone();
     let mut warnings = prepared.warnings.clone();
+    let (argv, environment) = child_command(config, port, &exposed);
+    prepared
+        .reservation
+        .take()
+        .expect("port is reserved until spawn")
+        .release();
+    after_release(port);
+    let environment: Vec<_> = extra_environment
+        .iter()
+        .cloned()
+        .chain(environment)
+        .collect();
+    let child = spawn_managed_child_in(&argv, &environment, owner_id, directory, prefix)?;
+    let lan = if config.lan {
+        match crate::lan::Advertisement::start(&config.hostname, 80, owner_id) {
+            Ok(advertisement) => Some(advertisement),
+            Err(error) => {
+                warnings.push(format!("cannot announce the LAN hostname: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
+    Ok(RunningChild {
+        child,
+        lease_id: owner_id,
+        hostname: config.hostname.clone(),
+        port,
+        warning,
+        tls: config.tls,
+        bind_address: config.bind_address,
+        readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
+        signals,
+        lan,
+    })
+}
+
+/// Shared launch settings for native apps and externally-run workspace members.
+pub(crate) fn child_command(
+    config: &ResolvedRunConfig,
+    port: u16,
+    exposed: &[(OsString, OsString)],
+) -> (Vec<OsString>, Vec<(OsString, OsString)>) {
     let argv = substitute_port(&config.command, port);
     let framework = config.framework.resolve(&argv);
     let tailscale_hostname = exposed
@@ -657,43 +721,8 @@ pub(crate) fn spawn_prepared_run(
             environment.push((variable.into(), value));
         }
     }
-    prepared
-        .reservation
-        .take()
-        .expect("port is reserved until spawn")
-        .release();
-    after_release(port);
-    let environment: Vec<_> = extra_environment
-        .iter()
-        .cloned()
-        .chain(environment)
-        .chain(exposed)
-        .collect();
-    let child = spawn_managed_child_in(&argv, &environment, owner_id, directory, prefix)?;
-    let lan = if config.lan {
-        match crate::lan::Advertisement::start(&config.hostname, 80, owner_id) {
-            Ok(advertisement) => Some(advertisement),
-            Err(error) => {
-                warnings.push(format!("cannot announce the LAN hostname: {error}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
-    Ok(RunningChild {
-        child,
-        lease_id: owner_id,
-        hostname: config.hostname.clone(),
-        port,
-        warning,
-        tls: config.tls,
-        bind_address: config.bind_address,
-        readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
-        signals,
-        lan,
-    })
+    environment.extend_from_slice(exposed);
+    (argv, environment)
 }
 
 /// Persist ownership only once the caller's entire spawn phase succeeded.
@@ -741,6 +770,7 @@ pub(crate) fn commit_prepared_runs(
             registry.leases.insert(
                 prepared.owner_id,
                 Lease {
+                    worktree: config.worktree.clone(),
                     group_id,
                     workspace_supervisor: group_id.and_then(|id| {
                         registry
@@ -3102,6 +3132,7 @@ mod tests {
             .unwrap();
             if persisted_runner {
                 group.runner = Some(crate::state::Lease {
+                    worktree: None,
                     group_id: Some(group_id),
                     workspace_supervisor: Some(group.supervisor.clone()),
                     lan: false,
@@ -4166,6 +4197,7 @@ sys.exit(3)
     fn owned_cleanup_refuses_the_callers_or_supervisors_group() {
         let identity = read_process_identity(std::process::id()).unwrap();
         let mut lease = crate::state::Lease {
+            worktree: None,
             group_id: None,
             workspace_supervisor: None,
             lan: false,
@@ -4212,6 +4244,7 @@ sys.exit(3)
     fn owned_group_signal_handles_exit_after_verification() {
         let mut child = spawn_child(&["/bin/sleep".into(), "30".into()], &[]).unwrap();
         let lease = crate::state::Lease {
+            worktree: None,
             group_id: None,
             workspace_supervisor: None,
             lan: false,
@@ -4403,6 +4436,43 @@ sys.exit(3)
         ));
         first.child.signal(ProcessSignal::Terminate).unwrap();
         first.finish(&store, &mut routes).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn worktree_collision_cannot_replace_another_worktree_even_with_force() {
+        let (store, path) = temporary_store();
+        let mut routes = Routes::default();
+        let mut config = run_config(vec!["/bin/sleep", "30"], 30);
+        config.worktree = Some(crate::worktree::Identity {
+            key: "first-worktree".into(),
+            label: "same-label".into(),
+        });
+        let mut first = start_run(&config, &store, &mut routes).unwrap();
+        let original = store.load().unwrap();
+        config.force = true;
+        for identity in [
+            None,
+            Some(crate::worktree::Identity {
+                key: "second-worktree".into(),
+                label: "same-label".into(),
+            }),
+        ] {
+            config.worktree = identity;
+            assert!(matches!(
+                start_run(&config, &store, &mut routes),
+                Err(super::RunError::WorktreeConflict(_))
+            ));
+            assert_eq!(store.load().unwrap(), original);
+            assert_eq!(routes.owners["api.localhost"], first.lease_id);
+        }
+        config.worktree = original.leases[&first.lease_id].worktree.clone();
+        let mut replacement = start_run(&config, &store, &mut routes).unwrap();
+        first.child.signal(ProcessSignal::Terminate).unwrap();
+        first.finish(&store, &mut routes).unwrap();
+        assert_eq!(routes.owners["api.localhost"], replacement.lease_id);
+        replacement.child.signal(ProcessSignal::Terminate).unwrap();
+        replacement.finish(&store, &mut routes).unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -4659,6 +4729,7 @@ sys.exit(3)
             process_start_time_ticks: 10,
         };
         let runner = Lease {
+            worktree: None,
             id: group_id,
             group_id: Some(group_id),
             workspace_supervisor: Some(supervisor.clone()),
@@ -4920,6 +4991,7 @@ mod windows_tests {
         let mut child = super::spawn_managed_child(&argv, &[], id).unwrap();
         let mut foreign = super::spawn_managed_child(&argv, &[], foreign_id).unwrap();
         let mut lease = Lease {
+            worktree: None,
             group_id: None,
             workspace_supervisor: None,
             lan: false,
@@ -5072,6 +5144,7 @@ mod windows_tests {
         let pid = std::process::id();
         let identity = read_process_identity(pid).unwrap();
         let mut lease = Lease {
+            worktree: None,
             group_id: None,
             workspace_supervisor: None,
             lan: false,

@@ -1334,6 +1334,7 @@ mod tests {
 
     fn lease(hostname: &str) -> Lease {
         Lease {
+            worktree: None,
             group_id: None,
             workspace_supervisor: None,
             lan: false,

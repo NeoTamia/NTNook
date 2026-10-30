@@ -30,6 +30,10 @@ const MAX_CONTEXT_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionApp {
+    #[serde(default)]
+    pub(crate) worktree: Option<crate::worktree::Identity>,
+    #[serde(default)]
+    pub(crate) lan: bool,
     pub(crate) id: String,
     #[serde(with = "os_path")]
     pub(crate) directory: PathBuf,
@@ -116,6 +120,7 @@ fn identity_lease(pid: u32, id: Uuid, group_id: Uuid) -> crate::Result<Lease> {
     let identity = process::read_process_identity(pid)
         .ok_or_else(|| invalid(format!("cannot verify process identity for PID {pid}")))?;
     Ok(Lease {
+        worktree: None,
         id,
         group_id: Some(group_id),
         workspace_supervisor: None,
@@ -819,13 +824,13 @@ impl SessionMember {
             framework_choice(&self.app.framework)?
         };
         Ok(ResolvedRunConfig {
-            worktree: None,
+            worktree: self.app.worktree.clone(),
             hostname: self.app.hostname.clone(),
             command: args.command.clone(),
             tls: self.app.tls,
             tailscale: false,
             funnel: false,
-            lan: false,
+            lan: self.app.lan,
             app_port: Some(self.app.port),
             strict_port: self.app.strict_port,
             force: false,
@@ -1036,6 +1041,11 @@ fn validate_arguments(app: &SessionApp, args: &RunArgs) -> crate::Result<()> {
             "members cannot use --runner, --only, --config, --local, or --force; configure the root session",
         ));
     }
+    if args.worktree.is_some() || args.no_worktree {
+        return Err(invalid(
+            "member worktree overrides are incompatible with a workspace session; configure the root session",
+        ));
+    }
     if args.tailscale || args.funnel || args.lan {
         return Err(invalid(
             "member exposure overrides are incompatible with a workspace session",
@@ -1072,6 +1082,8 @@ mod tests {
             fs::create_dir_all(root.join("other")).unwrap();
             let root = fs::canonicalize(root).unwrap();
             let app = SessionApp {
+                worktree: None,
+                lan: false,
                 id: "web".into(),
                 directory: root.join("app"),
                 lease_id: Uuid::new_v4(),

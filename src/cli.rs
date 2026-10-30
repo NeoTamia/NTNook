@@ -72,7 +72,7 @@ pub(crate) struct InitArgs {
     pub(crate) no_worktree: bool,
 
     /// Create a multi-app workspace configuration.
-    #[arg(long, conflicts_with = "local")]
+    #[arg(long)]
     pub(crate) workspace: bool,
     /// Create nook.local.toml instead of nook.toml.
     #[arg(long)]
@@ -472,7 +472,19 @@ fn init_command(
 }
 
 fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Result<String> {
-    if arguments.workspace {
+    let local_workspace = arguments.local
+        && crate::config::read_optional(&directory.join("nook.toml"))?
+            .map(|contents| {
+                crate::config::parse::<toml::Value>(&directory.join("nook.toml"), &contents)
+            })
+            .transpose()?
+            .is_some_and(|config| {
+                config
+                    .get("format_version")
+                    .and_then(toml::Value::as_integer)
+                    == Some(2)
+            });
+    if arguments.workspace || local_workspace {
         return workspace_config_template(arguments, directory);
     }
     let mut contents = String::from("format_version = 1\n\n");
@@ -578,6 +590,30 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
 }
 
 fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::Result<String> {
+    if arguments.local {
+        if !arguments.command.is_empty()
+            || arguments.no_tls
+            || arguments.lan
+            || arguments.no_lan
+            || arguments.app_port.is_some()
+            || arguments.strict_port
+            || arguments.readiness_warn_after.is_some()
+            || arguments.run_bind_address.is_some()
+            || arguments.framework.is_some()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "workspace local app overrides must be written in [[apps]] entries; use init --local for root name/worktree options").into());
+        }
+        let mut contents = String::from("format_version = 2\n\n");
+        if let Some(name) = &arguments.name {
+            contents.push_str(&format!(
+                "name = {}\n\n",
+                toml_string(&crate::config::project_name(name)?)
+            ));
+        }
+        contents.push_str(&worktree_config_template(arguments)?);
+        return Ok(contents);
+    }
     let name = match arguments.name.as_deref() {
         Some(name) => crate::config::project_name(name)?,
         None => crate::config::infer_project_name(directory)?,
@@ -1558,6 +1594,14 @@ fn run_workspace_command(
                 config.hostname,
                 app.port
             )?;
+            if config.lan {
+                writeln!(
+                    errors,
+                    "nook: app={} lan_url=http://{}",
+                    app.app.id,
+                    crate::lan::hostname(&config.hostname)
+                )?;
+            }
             if let Some(path) = &config.ignored_local_config {
                 writeln!(
                     errors,
@@ -2698,6 +2742,7 @@ mod tests {
             registry.leases.insert(
                 id,
                 Lease {
+                    worktree: None,
                     group_id: None,
                     workspace_supervisor: None,
                     lan: false,

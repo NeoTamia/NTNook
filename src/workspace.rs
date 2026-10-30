@@ -128,18 +128,6 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
     let mut signals = ForwardedSignals::new()?;
     member.wait_for_release()?;
     let port = member.app().port;
-    let argv = process::substitute_port(&config.command, port);
-    let framework = config.framework.resolve(&argv);
-    let argv = match framework {
-        Some(framework) => framework.inject_argv(
-            argv,
-            port,
-            config.bind_address,
-            &config.hostname,
-            config.strict_port,
-        ),
-        None => argv,
-    };
     let mut environment = member.app().environment.clone();
     environment.retain(|(key, _)| {
         key != SESSION_VARIABLE && key != crate::workspace_session::PROCESS_VARIABLE
@@ -148,15 +136,8 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
         crate::workspace_session::PROCESS_VARIABLE.into(),
         member.process_marker(),
     ));
-    environment.extend(process::child_environment(
-        port,
-        config.bind_address,
-        &config.hostname,
-        config.tls,
-    ));
-    if let Some(framework) = framework {
-        environment.extend(framework.environment(port, config.bind_address, &config.hostname));
-    }
+    let (argv, launch_environment) = process::child_command(&config, port, &[]);
+    environment.extend(launch_environment);
     let mut child = ChildTree::new(member.spawn_child(
         || {
             Ok(process::spawn_managed_child_in(
@@ -265,6 +246,12 @@ pub(crate) fn prepare(
                 app.config.hostname
             ),
         );
+        if app.config.lan {
+            values.insert(
+                format!("{}.lan_url", app.id),
+                format!("http://{}", crate::lan::hostname(&app.config.hostname)),
+            );
+        }
         values.insert(
             format!("{}.upstream", app.id),
             format!("http://{}", SocketAddr::new(address, port)),
@@ -311,12 +298,12 @@ fn interpolate(value: &OsStr, values: &BTreeMap<String, String>) -> crate::Resul
     while let Some((_, after)) = rest.split_once("${") {
         let Some((reference, after)) = after.split_once('}') else {
             return Err(invalid(
-                "unterminated workspace interpolation; expected ${id.url}, ${id.upstream}, ${id.host}, or ${id.port}",
+                "unterminated workspace interpolation; expected ${id.url}, ${id.lan_url}, ${id.upstream}, ${id.host}, or ${id.port}",
             ));
         };
         if !values.contains_key(reference) {
             return Err(invalid(format!(
-                "unknown workspace reference `${{{reference}}}`; references must name a selected application and url, upstream, host, or port"
+                "unknown workspace reference `${{{reference}}}`; references must name a selected application and url, lan_url (with LAN enabled), upstream, host, or port"
             )));
         }
         rest = after;
@@ -502,6 +489,7 @@ impl PreparedWorkspace {
         };
         let operations = store.lock_operations()?;
         let mut prepared_runs = Vec::new();
+        let mut advertisements = Vec::new();
         let mut runner = None;
         let mut unstarted_owner = None;
         let mut committed = false;
@@ -516,6 +504,18 @@ impl PreparedWorkspace {
                     &mut process::LocalOnly,
                 )?);
             }
+            for (app, run) in self.apps.iter().zip(&prepared_runs) {
+                if app.app.config.lan {
+                    match crate::lan::Advertisement::start(
+                        &app.app.config.hostname,
+                        80,
+                        run.owner_id,
+                    ) {
+                        Ok(advertisement) => advertisements.push(advertisement),
+                        Err(error) => warn(&format!("cannot announce the LAN hostname: {error}")),
+                    }
+                }
+            }
             let apps = self
                 .apps
                 .iter()
@@ -523,6 +523,8 @@ impl PreparedWorkspace {
                 .map(|(app, run)| {
                     let config = &app.app.config;
                     SessionApp {
+                        worktree: config.worktree.clone(),
+                        lan: config.lan,
                         id: app.app.id.clone(),
                         directory: app.app.directory.clone(),
                         lease_id: run.owner_id,
@@ -576,6 +578,7 @@ impl PreparedWorkspace {
                 .map_err(process::RunError::from)?,
             );
             let lease = Lease {
+                worktree: None,
                 id: self.group_id,
                 group_id: Some(self.group_id),
                 workspace_supervisor: Some(root_supervisor.clone()),
@@ -672,6 +675,12 @@ impl PreparedWorkspace {
                 }
                 if let Some(code) = runner.child.0.try_wait().map_err(process::RunError::from)? {
                     return Ok(code);
+                }
+                advertisements.retain_mut(|advertisement| !advertisement.is_displaced(store));
+                for advertisement in &advertisements {
+                    for warning in advertisement.warnings() {
+                        warn(&warning);
+                    }
                 }
                 runner.owner.poll_joins(|app, _wrapper| {
                     let registry = store.load()?;
@@ -1297,6 +1306,79 @@ mod tests {
     }
 
     #[test]
+    fn two_worktrees_keep_their_urls_ports_leases_and_cleanup_independent() {
+        let fixture = Fixture::new();
+        let config = |label: &str| {
+            let mut config = fixture.workspace([&["/bin/sleep", "30"], &["/bin/sleep", "30"]]);
+            for app in &mut config.apps {
+                let identity = crate::worktree::Identity {
+                    key: label.into(),
+                    label: label.into(),
+                };
+                app.config.hostname =
+                    crate::worktree::hostname(&app.config.hostname, &identity, Some("demo"))
+                        .unwrap();
+                app.config.worktree = Some(identity);
+            }
+            config.apps[0]
+                .environment
+                .insert("API".into(), "${api.url} ${api.upstream}".into());
+            config
+        };
+        let first = prepare(config("agent-a"), None).unwrap();
+        let second = prepare(config("agent-b"), None).unwrap();
+        let ports: std::collections::BTreeSet<_> = first
+            .apps
+            .iter()
+            .chain(&second.apps)
+            .map(|app| app.port)
+            .collect();
+        assert_eq!(ports.len(), 4);
+        assert_eq!(
+            first.apps[0].environment[0].1.to_string_lossy(),
+            format!(
+                "https://api.agent-a.demo.localhost http://127.0.0.1:{}",
+                first.apps[1].port
+            )
+        );
+        assert_eq!(
+            second.apps[0].environment[0].1.to_string_lossy(),
+            format!(
+                "https://api.agent-b.demo.localhost http://127.0.0.1:{}",
+                second.apps[1].port
+            )
+        );
+        let mut routes = Routes::default();
+        let mut first = first.start(&fixture.store, &mut routes).unwrap();
+        let mut second = second.start(&fixture.store, &mut routes).unwrap();
+        assert_eq!(fixture.store.load().unwrap().leases.len(), 4);
+        first.apps[0].1.child.signal(ProcessSignal::Kill).unwrap();
+        first.finish(&fixture.store, &mut routes, |_| {}).unwrap();
+        let remaining = fixture.store.load().unwrap();
+        assert_eq!(remaining.leases.len(), 2);
+        assert_eq!(routes.owners.len(), 2);
+        for (_, app) in &mut second.apps {
+            assert!(app.child.try_wait().unwrap().is_none());
+            assert_eq!(
+                remaining.leases[&app.lease_id]
+                    .worktree
+                    .as_ref()
+                    .unwrap()
+                    .key,
+                "agent-b"
+            );
+        }
+        second.apps[0]
+            .1
+            .child
+            .signal(ProcessSignal::Terminate)
+            .unwrap();
+        second.finish(&fixture.store, &mut routes, |_| {}).unwrap();
+        assert!(fixture.store.load().unwrap().leases.is_empty());
+        assert!(routes.owners.is_empty());
+    }
+
+    #[test]
     fn partial_spawn_failure_restores_forced_alias_and_stops_started_group() {
         let fixture = Fixture::new();
         let mut config = fixture.workspace([
@@ -1490,6 +1572,7 @@ mod tests {
         let lease_id = Uuid::new_v4();
         let identity = process::read_process_identity(std::process::id()).unwrap();
         let owner = Lease {
+            worktree: None,
             group_id: Some(group_id),
             workspace_supervisor: None,
             lan: false,
@@ -1504,6 +1587,8 @@ mod tests {
             state: LeaseState::Starting,
         };
         let app = SessionApp {
+            worktree: None,
+            lan: false,
             id: "web".into(),
             directory: fixture.root.join("web"),
             lease_id,
