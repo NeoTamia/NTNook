@@ -61,3 +61,18 @@ cargo build --locked --release
 ```
 
 Integration tests are isolated in temporary directories, use Caddy `2.11.x`, install no CA, and clean up their processes. The MVP release requires every linked MVP ticket to be resolved; Tailscale work remains explicitly post-MVP and pending.
+
+## Git worktrees (NOOK-74)
+
+- NOOK-75: bool/string `worktree` configuration and CLI overrides, DNS identity,
+  detached HEAD/subdirectories, workspace-wide naming and `nook init` generation:
+  `worktree::tests::*`, `tests/cli_init.rs::*worktree*`.
+- NOOK-76: persisted worktree ownership, cross-worktree force rejection, shared
+  runner context, LAN routes/advertisements and `${id.lan_url}`:
+  `process::tests::worktree_collision_*`, `workspace::tests::two_worktrees_*`.
+- NOOK-77: `tests/workspace.rs::linked_worktrees_keep_native_and_runner_apps_isolated_through_caddy_and_lan`
+  uses real Git linked worktrees and Caddy, concurrent native/runner launches,
+  four ports, sibling URLs, local/LAN routing, collisions and crash + prune.
+  The shared config/identity tests run on Windows too; this process/network scenario
+  is Unix-only. External tunnel provisioning is outside Nook; Funnel is excluded
+  from worktree mode. See `docs/WORKSPACES.md` for the network contract.

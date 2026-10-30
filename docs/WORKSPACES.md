@@ -42,6 +42,7 @@ resolves environment references:
 | Reference | Value |
 | --- | --- |
 | `${api.url}` | Public route, for example `https://api.shop.localhost` |
+| `${api.lan_url}` | LAN route, for example `http://api.shop.local` (requires LAN on that app) |
 | `${api.upstream}` | Actual application address, for example `http://127.0.0.1:41001` |
 | `${api.host}` | Application bind IP, for example `127.0.0.1` |
 | `${api.port}` | Actual allocated port, including any fallback |
@@ -310,5 +311,92 @@ paths, makes no network installs during execution, and installs no CA.
 `NOOK_TEST_RUNNERS=pnpm,bun,bun-runtime` selects focused fixtures; unknown names
 fail. CI runs the full matrix with the pinned tool installations above.
 
-Worktree-specific domain isolation is tracked separately in NOOK-74, after the
-monorepo work. It is not inferred from branch names by this workspace format.
+## Git worktrees
+
+Enable isolation in the shared manifest, before any `[[apps]]` table:
+
+```toml
+format_version = 2
+name = "shop"
+worktree = true
+```
+
+`worktree` accepts `true` (automatic identity), `false` (disabled), or a single
+DNS label such as `"agent-a"`. It is a root workspace setting shared by every
+app. Member-file worktree settings apply only when the member runs standalone;
+`worktree` inside a root `[[apps]]` entry is rejected. Version 1 configurations
+accept the same option for standalone apps.
+
+```sh
+nook init --workspace --worktree
+nook init --local --worktree=agent-a
+nook run --worktree
+nook run --worktree=agent-a --only api
+nook run --worktree=agent-a --runner -- pnpm dev
+nook run --no-worktree
+```
+
+The optional CLI identifier uses `=`. `--worktree` without a value selects
+automatic identity, even if a file supplies an explicit label. `--no-worktree`
+disables the mode. Precedence is CLI > applicable `nook.local.toml` > `nook.toml`;
+the default is disabled. With `--config`, local overrides still require `--local`.
+A version 2 local override needs only `format_version = 2` and `worktree = "agent-a"`.
+`nook init --local` detects an existing version 2 manifest and generates that
+format. `nook init --worktree` writes `true`, never the current inferred identity.
+
+For `name = "shop"` and `worktree = "agent-a"`, default domains become
+`api.agent-a.shop.localhost` and `web.agent-a.shop.localhost`. An explicit app name
+ending in `.shop` keeps that namespace and receives the same insertion. Other
+explicit app names, and standalone names, receive the worktree label as a prefix:
+`custom-api.localhost` becomes `agent-a.custom-api.localhost`.
+`--name` continues to name the project/workspace; `--worktree` names its copy.
+Keep the shared project name explicit to retain the same namespace in differently
+named worktree directories. A standalone invocation still loads its own config;
+it does not discover or launch a parent workspace automatically.
+
+Automatic labels use the normalized worktree directory name followed by 12 hex
+characters from SHA-256 of its canonical Git administrative-directory path. Git
+resolves linked worktrees, nested invocation directories and detached HEAD.
+Switching branches does not change the identity. Moving/renaming a worktree can
+change its directory-derived label; moving the repository can also change the
+hash. Use an explicit label when URLs must survive a move, and stop old runs
+before moving their directories. Worktree mode requires Git and a working tree;
+disabled mode does not introduce this requirement.
+
+Ports and sibling URLs are resolved before any app or runner starts. Each
+execution retains independent UUID ownership; worktree identity is also recorded
+on its leases. An active hostname belonging to a different worktree is rejected,
+even with `--force`. Explicit replacement within the same worktree remains
+available. `nook list`, `nook stop <full-hostname>`, Ctrl-C and `nook prune` retain
+their existing scope and preserve other worktrees.
+
+### LAN and tunnels to Caddy
+
+Use `nook run --lan`, or `lan = true` on selected apps, with either native launches
+or an external runner. Caddy serves `http://api.agent-a.shop.local`, with a separate
+mDNS advertisement for each owned app. Each app receives `NOOK_LAN_URL`; use
+`${api.lan_url}` for browser-facing sibling configuration and `${api.upstream}`
+for local server-to-server requests. `${api.url}` continues to denote the local
+`.localhost` route.
+
+An externally configured private tunnel can forward traffic to Caddy. It must
+preserve the selected app's Host header, or map its public hostname to that app's
+Caddy hostname. Configure remote DNS and tunnel routing separately: `.localhost`
+always refers to the client, and `.local` mDNS discovery does not automatically
+cross a tunnel. If the tunnel reaches a `.localhost` route, allow its immediate
+source address in `caddy_client_ip_ranges`; LAN routes use the existing LAN
+listener policy. A single shared tunnel hostname without another routing key
+cannot distinguish multiple apps. Nook does not create tunnel endpoints or DNS
+records in this mode.
+
+The existing managed per-app `--tailscale` Serve mode remains a standalone feature;
+it is not the external tunnel-to-Caddy setup above and is still rejected for
+multi-app workspaces. Funnel is rejected whenever worktree mode is enabled,
+including when inherited from configuration. Disable it explicitly or use private
+network access. Funnel's existing non-worktree behavior is unchanged.
+
+Nook does not create/remove Git worktrees, orchestrate agents, or isolate databases
+and application files. The worktree integration test starts two real linked
+worktrees concurrently through Caddy in native and runner modes, checks local/LAN
+routing and sibling URLs, rejects collisions, and verifies SIGKILL + prune leaves
+the other worktree serving.

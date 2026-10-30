@@ -241,6 +241,7 @@ nook run --name legacy --no-tls -- ./server
 - `--no-tls` uses the HTTP frontend exclusively;
 - `--lan` exposes `http://<name>.local` through Caddy and announces the name via mDNS;
 - `--no-lan` disables LAN mode enabled in a project configuration;
+- `--worktree[=ID]` isolates this Git worktree; `--no-worktree` overrides file configuration;
 - `--run-bind-address <IP>` overrides the project and global bind address (IPv4 or IPv6), also injected as `HOST`;
 - `--app-port <port>` requests a port, with an explicit fallback if it is occupied;
 - `--strict-port` disables that fallback and requires `--app-port`;
@@ -365,6 +366,15 @@ A version 2 `nook.toml` can declare several `[[apps]]`, each with its own direct
 command and domain. `nook run` reserves their ports and routes before starting the
 apps, and resolves references such as `${api.upstream}` in a frontend's environment.
 Use `nook run --only api` to select one app, or `nook init --workspace` for a template.
+
+To run several Git worktrees concurrently, add `worktree = true` at the root of
+`nook.toml`, or pass `--worktree=agent-a`. Apps then receive domains such as
+`api.agent-a.shop.localhost`, with independent ports and lifecycle ownership.
+`nook.local.toml` can override the label, and `--no-worktree` disables the mode.
+Generate these settings with `nook init --worktree` or
+`nook init --local --worktree=agent-a`. LAN and externally configured tunnels to
+Caddy retain per-worktree routing; Funnel is unavailable in worktree mode.
+See [Git worktrees](docs/WORKSPACES.md#git-worktrees) for naming, overrides and limits.
 
 For existing package scripts using `nook-run`, run the root development command
 through `nook run --runner -- pnpm dev`. Each wrapper joins the prepared workspace
@@ -825,7 +835,7 @@ secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
 Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
-automatic worktree isolation, native macOS support, rewriting framework config files,
+native macOS support, rewriting framework config files,
 Angular-specific origin allow-lists, and public exposure outside Tailscale Funnel.
 Private Tailscale Serve and public Tailscale Funnel are opt-in, as described in [Tailscale](#tailscale).
 
