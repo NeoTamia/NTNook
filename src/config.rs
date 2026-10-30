@@ -57,6 +57,7 @@ pub(crate) enum Error {
         path: PathBuf,
         reason: String,
     },
+    InvalidWorktree(String),
     MissingCommand,
     MissingName,
     InvalidName {
@@ -101,6 +102,9 @@ impl fmt::Display for Error {
                 "invalid workspace configuration {}: {reason}",
                 path.display()
             ),
+            Self::InvalidWorktree(reason) => {
+                write!(formatter, "invalid worktree configuration: {reason}")
+            }
             Self::MissingCommand => write!(
                 formatter,
                 "a child command is required after `--` or in nook.toml"
@@ -139,6 +143,7 @@ impl std::error::Error for Error {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectConfig {
+    pub(crate) worktree: Option<crate::worktree::Setting>,
     format_version: u32,
     pub(crate) name: Option<String>,
     command: Option<Vec<String>>,
@@ -213,6 +218,7 @@ impl Default for GlobalConfig {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct ResolvedRunConfig {
+    pub(crate) worktree: Option<crate::worktree::Identity>,
     pub(crate) hostname: String,
     pub(crate) command: Vec<OsString>,
     pub(crate) tls: bool,
@@ -434,6 +440,7 @@ pub(crate) fn merge_project(
     Some(ProjectConfig {
         format_version: local.format_version,
         name: local.name.or(base.name),
+        worktree: local.worktree.or(base.worktree),
         command: local.command.or(base.command),
         tls: local.tls.or(base.tls),
         tailscale: local.tailscale.or(base.tailscale),
@@ -466,6 +473,7 @@ pub(crate) fn merge_run(
     let project = project.unwrap_or(ProjectConfig {
         format_version: FORMAT_VERSION,
         name: None,
+        worktree: None,
         command: None,
         tls: None,
         tailscale: None,
@@ -497,7 +505,24 @@ pub(crate) fn merge_run(
     let funnel = !arguments.no_tailscale
         && !arguments.tailscale
         && (arguments.funnel || project.funnel.unwrap_or(false));
+    let worktree = crate::worktree::resolve(
+        crate::worktree::setting(
+            &arguments.worktree,
+            arguments.no_worktree,
+            project.worktree.clone(),
+        )
+        .as_ref(),
+        current_directory,
+    )?;
+    if worktree.is_some() && funnel {
+        return Err(Error::InvalidWorktree("Funnel is not supported in worktree mode; use --no-tailscale or --tailscale for private Serve".into()));
+    }
+    let hostname = match &worktree {
+        Some(identity) => crate::worktree::hostname(&hostname, identity, None)?,
+        None => hostname,
+    };
     Ok(ResolvedRunConfig {
+        worktree,
         hostname,
         command,
         tls: if arguments.no_tls {
@@ -1406,6 +1431,7 @@ mod tests {
 
     fn project() -> ProjectConfig {
         ProjectConfig {
+            worktree: None,
             format_version: 1,
             name: Some("project".into()),
             command: Some(vec!["project-command".into()]),

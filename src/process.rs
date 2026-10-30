@@ -4828,6 +4828,7 @@ sys.exit(3)
 
     fn run_config(command: Vec<&str>, readiness: u64) -> ResolvedRunConfig {
         ResolvedRunConfig {
+            worktree: None,
             hostname: "api.localhost".into(),
             command: command.into_iter().map(OsString::from).collect(),
             tls: true,

@@ -64,6 +64,13 @@ pub(crate) enum CompletionKind {
 
 #[derive(Debug, Args)]
 pub(crate) struct InitArgs {
+    /// Isolate this Git worktree; optionally choose its DNS label.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ID", conflicts_with = "no_worktree")]
+    pub(crate) worktree: Option<String>,
+    /// Disable worktree isolation even when enabled in configuration.
+    #[arg(long)]
+    pub(crate) no_worktree: bool,
+
     /// Create a multi-app workspace configuration.
     #[arg(long, conflicts_with = "local")]
     pub(crate) workspace: bool,
@@ -197,8 +204,15 @@ pub(crate) struct CaExportArgs {
     pub(crate) force: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct RunArgs {
+    /// Isolate this Git worktree; optionally choose its DNS label.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ID", conflicts_with = "no_worktree")]
+    pub(crate) worktree: Option<String>,
+    /// Disable worktree isolation even when enabled in configuration.
+    #[arg(long)]
+    pub(crate) no_worktree: bool,
+
     /// Run an external workspace task runner; pass its command after --.
     #[arg(long, conflicts_with = "only")]
     pub(crate) runner: bool,
@@ -462,6 +476,7 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
         return workspace_config_template(arguments, directory);
     }
     let mut contents = String::from("format_version = 1\n\n");
+    contents.push_str(&worktree_config_template(arguments)?);
     let name = match arguments.name.as_deref() {
         Some(name) => crate::config::project_name(name)?,
         None => crate::config::infer_project_name(directory)?,
@@ -591,8 +606,9 @@ fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::R
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut contents = format!(
-        "format_version = 2\nname = {}\n\n# Add one [[apps]] entry per application. Paths are relative to this file.\n[[apps]]\nid = \"web\"\ndir = \".\"\ncommand = {}\n",
+        "format_version = 2\nname = {}\n\n{}# Add one [[apps]] entry per application. Paths are relative to this file.\n[[apps]]\nid = \"web\"\ndir = \".\"\ncommand = {}\n",
         toml_string(&name),
+        worktree_config_template(arguments)?,
         toml::Value::Array(command)
     );
     if arguments.no_tls {
@@ -621,6 +637,21 @@ fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::R
     }
     contents.push_str("\n# Example: env = { API_URL = \"${api.url}\" }\n");
     Ok(contents)
+}
+
+fn worktree_config_template(arguments: &InitArgs) -> crate::Result<String> {
+    let setting = crate::worktree::setting(&arguments.worktree, arguments.no_worktree, None);
+    let value = match setting {
+        Some(crate::worktree::Setting::Enabled(value)) => format!("worktree = {value}"),
+        Some(crate::worktree::Setting::Named(label)) => format!(
+            "worktree = {}",
+            toml_string(&crate::worktree::validate_label(&label)?)
+        ),
+        None => "# worktree = true".into(),
+    };
+    Ok(format!(
+        "# Isolate Git worktrees: true = automatic, false = disabled, or a DNS label.\n# Use nook.local.toml for a worktree-specific override, e.g. worktree = \"agent-a\".\n{value}\n\n"
+    ))
 }
 
 fn toml_string(value: &str) -> String {

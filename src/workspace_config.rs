@@ -26,6 +26,7 @@ pub(crate) struct WorkspaceApp {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    worktree: Option<crate::worktree::Setting>,
     format_version: u32,
     name: Option<String>,
     command: Option<Vec<String>>,
@@ -116,6 +117,7 @@ fn load_inner(
                 ));
             }
             manifest.name = local.name.or(manifest.name);
+            manifest.worktree = local.worktree.or(manifest.worktree);
             let mut overridden = BTreeSet::new();
             for member in local.apps {
                 if !overridden.insert(member.id.clone()) {
@@ -150,6 +152,18 @@ fn load_inner(
             .or_else(|| root.file_name().and_then(|name| name.to_str()))
             .ok_or(config::Error::MissingName)?,
     )?;
+    let worktree = crate::worktree::resolve(
+        crate::worktree::setting(
+            &arguments.worktree,
+            arguments.no_worktree,
+            manifest.worktree,
+        )
+        .as_ref(),
+        &root,
+    )?;
+    let mut member_arguments = arguments.clone();
+    member_arguments.worktree = None;
+    member_arguments.no_worktree = true;
     let mut ids = BTreeSet::new();
     let mut apps: Vec<WorkspaceApp> = Vec::new();
     for member in manifest.apps {
@@ -249,14 +263,25 @@ fn load_inner(
         let hostname = config::normalize_hostname(project.name.as_deref().unwrap())?;
         let environment = project.env.take().unwrap_or_default();
         let mut resolved = config::merge_run(
-            arguments,
+            &member_arguments,
             Some(project),
             None,
             &directory,
             default_bind_address,
         )?;
         // --name names the workspace; explicit member names remain authoritative.
-        resolved.hostname = hostname;
+        resolved.hostname = match &worktree {
+            Some(identity) => {
+                crate::worktree::hostname(&hostname, identity, Some(&workspace_name))?
+            }
+            None => hostname,
+        };
+        resolved.worktree = worktree.clone();
+        if worktree.is_some() && resolved.funnel {
+            return Err(config::Error::InvalidWorktree(
+                "Funnel is not supported in worktree mode".into(),
+            ));
+        }
         resolved.ignored_local_config = ignored_root_local.clone().or_else(|| {
             (!use_local && member_local.exists() && member_local != path).then_some(member_local)
         });

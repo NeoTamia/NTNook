@@ -819,6 +819,7 @@ impl SessionMember {
             framework_choice(&self.app.framework)?
         };
         Ok(ResolvedRunConfig {
+            worktree: None,
             hostname: self.app.hostname.clone(),
             command: args.command.clone(),
             tls: self.app.tls,
