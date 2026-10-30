@@ -64,8 +64,15 @@ pub(crate) enum CompletionKind {
 
 #[derive(Debug, Args)]
 pub(crate) struct InitArgs {
+    /// Isolate this Git worktree; optionally choose its DNS label.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ID", conflicts_with = "no_worktree")]
+    pub(crate) worktree: Option<String>,
+    /// Disable worktree isolation even when enabled in configuration.
+    #[arg(long)]
+    pub(crate) no_worktree: bool,
+
     /// Create a multi-app workspace configuration.
-    #[arg(long, conflicts_with = "local")]
+    #[arg(long)]
     pub(crate) workspace: bool,
     /// Create nook.local.toml instead of nook.toml.
     #[arg(long)]
@@ -197,8 +204,15 @@ pub(crate) struct CaExportArgs {
     pub(crate) force: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub(crate) struct RunArgs {
+    /// Isolate this Git worktree; optionally choose its DNS label.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ID", conflicts_with = "no_worktree")]
+    pub(crate) worktree: Option<String>,
+    /// Disable worktree isolation even when enabled in configuration.
+    #[arg(long)]
+    pub(crate) no_worktree: bool,
+
     /// Run an external workspace task runner; pass its command after --.
     #[arg(long, conflicts_with = "only")]
     pub(crate) runner: bool,
@@ -458,10 +472,23 @@ fn init_command(
 }
 
 fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Result<String> {
-    if arguments.workspace {
+    let local_workspace = arguments.local
+        && crate::config::read_optional(&directory.join("nook.toml"))?
+            .map(|contents| {
+                crate::config::parse::<toml::Value>(&directory.join("nook.toml"), &contents)
+            })
+            .transpose()?
+            .is_some_and(|config| {
+                config
+                    .get("format_version")
+                    .and_then(toml::Value::as_integer)
+                    == Some(2)
+            });
+    if arguments.workspace || local_workspace {
         return workspace_config_template(arguments, directory);
     }
     let mut contents = String::from("format_version = 1\n\n");
+    contents.push_str(&worktree_config_template(arguments)?);
     let name = match arguments.name.as_deref() {
         Some(name) => crate::config::project_name(name)?,
         None => crate::config::infer_project_name(directory)?,
@@ -563,6 +590,30 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
 }
 
 fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::Result<String> {
+    if arguments.local {
+        if !arguments.command.is_empty()
+            || arguments.no_tls
+            || arguments.lan
+            || arguments.no_lan
+            || arguments.app_port.is_some()
+            || arguments.strict_port
+            || arguments.readiness_warn_after.is_some()
+            || arguments.run_bind_address.is_some()
+            || arguments.framework.is_some()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "workspace local app overrides must be written in [[apps]] entries; use init --local for root name/worktree options").into());
+        }
+        let mut contents = String::from("format_version = 2\n\n");
+        if let Some(name) = &arguments.name {
+            contents.push_str(&format!(
+                "name = {}\n\n",
+                toml_string(&crate::config::project_name(name)?)
+            ));
+        }
+        contents.push_str(&worktree_config_template(arguments)?);
+        return Ok(contents);
+    }
     let name = match arguments.name.as_deref() {
         Some(name) => crate::config::project_name(name)?,
         None => crate::config::infer_project_name(directory)?,
@@ -591,8 +642,9 @@ fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::R
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut contents = format!(
-        "format_version = 2\nname = {}\n\n# Add one [[apps]] entry per application. Paths are relative to this file.\n[[apps]]\nid = \"web\"\ndir = \".\"\ncommand = {}\n",
+        "format_version = 2\nname = {}\n\n{}# Add one [[apps]] entry per application. Paths are relative to this file.\n[[apps]]\nid = \"web\"\ndir = \".\"\ncommand = {}\n",
         toml_string(&name),
+        worktree_config_template(arguments)?,
         toml::Value::Array(command)
     );
     if arguments.no_tls {
@@ -621,6 +673,21 @@ fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::R
     }
     contents.push_str("\n# Example: env = { API_URL = \"${api.url}\" }\n");
     Ok(contents)
+}
+
+fn worktree_config_template(arguments: &InitArgs) -> crate::Result<String> {
+    let setting = crate::worktree::setting(&arguments.worktree, arguments.no_worktree, None);
+    let value = match setting {
+        Some(crate::worktree::Setting::Enabled(value)) => format!("worktree = {value}"),
+        Some(crate::worktree::Setting::Named(label)) => format!(
+            "worktree = {}",
+            toml_string(&crate::worktree::validate_label(&label)?)
+        ),
+        None => "# worktree = true".into(),
+    };
+    Ok(format!(
+        "# Isolate Git worktrees: true = automatic, false = disabled, or a DNS label.\n# Use nook.local.toml for a worktree-specific override, e.g. worktree = \"agent-a\".\n{value}\n\n"
+    ))
 }
 
 fn toml_string(value: &str) -> String {
@@ -1527,6 +1594,14 @@ fn run_workspace_command(
                 config.hostname,
                 app.port
             )?;
+            if config.lan {
+                writeln!(
+                    errors,
+                    "nook: app={} lan_url=http://{}",
+                    app.app.id,
+                    crate::lan::hostname(&config.hostname)
+                )?;
+            }
             if let Some(path) = &config.ignored_local_config {
                 writeln!(
                     errors,
@@ -2667,6 +2742,7 @@ mod tests {
             registry.leases.insert(
                 id,
                 Lease {
+                    worktree: None,
                     group_id: None,
                     workspace_supervisor: None,
                     lan: false,

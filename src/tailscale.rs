@@ -1538,6 +1538,7 @@ mod tests {
             preserve_host: false,
         };
         let lease = Lease {
+            worktree: None,
             group_id: None,
             workspace_supervisor: None,
             lan: false,

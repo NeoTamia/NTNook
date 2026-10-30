@@ -166,3 +166,68 @@ fn temporary_directory() -> std::path::PathBuf {
     fs::create_dir(&directory).unwrap();
     directory
 }
+
+#[test]
+fn init_worktree_options_are_top_level_and_do_not_capture_current_identity() {
+    let directory = temporary_directory();
+    for workspace in [false, true] {
+        for (flag, expected) in [
+            ("--worktree", toml::Value::Boolean(true)),
+            ("--no-worktree", toml::Value::Boolean(false)),
+            ("--worktree=Agent-A", toml::Value::String("agent-a".into())),
+        ] {
+            let mut args = vec!["init", "--print", flag];
+            if workspace {
+                args.push("--workspace");
+            }
+            let output = nook(&directory, &args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let parsed: toml::Value =
+                toml::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+            assert_eq!(parsed["worktree"], expected);
+            if workspace {
+                assert!(parsed["apps"][0].get("worktree").is_none());
+            }
+        }
+    }
+    assert!(
+        !nook(&directory, &["init", "--print", "--worktree=bad.label"])
+            .status
+            .success()
+    );
+    assert!(
+        !nook(
+            &directory,
+            &["init", "--print", "--worktree", "--no-worktree"]
+        )
+        .status
+        .success()
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn init_local_worktree_override_uses_the_existing_workspace_format() {
+    let directory = temporary_directory();
+    assert!(
+        nook(&directory, &["init", "--workspace", "--worktree"])
+            .status
+            .success()
+    );
+    assert!(
+        nook(&directory, &["init", "--local", "--worktree=agent-a"])
+            .status
+            .success()
+    );
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(directory.join("nook.local.toml")).unwrap()).unwrap();
+    assert_eq!(config["format_version"].as_integer(), Some(2));
+    assert_eq!(config["worktree"].as_str(), Some("agent-a"));
+    assert!(config.get("apps").is_none());
+    assert!(config.get("name").is_none());
+    fs::remove_dir_all(directory).unwrap();
+}
