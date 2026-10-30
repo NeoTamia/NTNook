@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.0](https://github.com/NeoTamia/NTNook/compare/v0.10.0...v0.11.0) (2026-10-30)
+
+
+### ✨ Features
+
+* **worktree:** Configure isolated names from files, CLI and init ([caf0645](https://github.com/NeoTamia/NTNook/commit/caf0645703b5145c85cad2af6d48847ed6855de3))
+* **worktree:** Preserve run ownership and isolate workspace LAN access ([fe0692e](https://github.com/NeoTamia/NTNook/commit/fe0692ea03aa4a82947b562901c9d71ada41054b))
+
+
+### 🐛 Bug Fixes
+
+* **workspace:** Improve runner diagnostics and group visibility ([caa1e9a](https://github.com/NeoTamia/NTNook/commit/caa1e9ac8ff42138a894fa9b3ff622cf32e9fded))
+* **workspace:** Reject colliding LAN names before preparing routes ([8a49d7b](https://github.com/NeoTamia/NTNook/commit/8a49d7bfa132765fd3d948d11e17d1d88bc79702))
+
+
+### 📚 Documentation
+
+* **worktree:** Explain naming, overrides and private network access ([3f867df](https://github.com/NeoTamia/NTNook/commit/3f867dfb6826d9e93898bc99af4684de31fa5cf2))
+
 ## [0.10.0](https://github.com/NeoTamia/NTNook/compare/v0.9.0...v0.10.0) (2026-10-26)
 
 
