@@ -55,7 +55,10 @@ ready to serve requests; apps should retain their normal startup retry logic.
 Output is prefixed by app ID. Ctrl-C stops the workspace and removes its
 managed routes. A startup failure stops already-started children and cleans up.
 Individual members remain visible through `nook list` and can be stopped by
-hostname. There is no permanent workspace daemon.
+hostname. Workspace rows include `group=<UUID>` in `nook list`: apps from the
+same invocation share that identifier, in both native and runner mode. Standalone
+runs and aliases have no group column. `nook list` has no JSON output mode.
+There is no permanent workspace daemon.
 
 ## Existing workspace runner scripts
 
@@ -154,11 +157,32 @@ Keep the project's existing dependencies and task settings alongside this
 configuration. Nook applies per-app ports and URLs after the wrapper starts, so
 they are not a shared root `PORT`.
 
+Before launching a runner, Nook checks the root `turbo.json` and warns when tasks
+lack an allowlist for `NOOK_WORKSPACE_SESSION` in strict mode (also the default
+when `envMode` is omitted). The diagnostic suggests `globalPassThroughEnv` or
+per-task `passThroughEnv`; `globalEnv`, task `env`, wildcard allowlists and explicit
+loose mode are also recognized. This is a root-configuration advisory, not a
+Turbo task-graph evaluation: package overrides, `turbo.jsonc`, CLI/environment
+overrides and task selection hidden inside scripts are not evaluated.
+
 ### Lerna
 
 Lerna runs the existing package `dev` scripts. Configure enough concurrency for
 the selected long-running tasks and use the project's normal Nx task pipeline.
 Nook does not alter dependency order, `.env` files or caching settings.
+
+The integration gate covers modern Lerna 10.1.1 with its Nx task runner, existing
+`nook-run` package scripts, package-local working directories, native `--scope`
+filtering, and each app's `.env` loading. The `.env` loader belongs to Lerna/Nx,
+not Nook; `--load-env-files=false` disables it. Nook's resolved app environment
+(including custom `[apps.env]`, `PORT`, `HOST` and `NOOK_URL`) takes precedence
+when starting the server, while other `.env` values are inherited.
+
+Legacy Lerna runners without Nx and their `.env` behavior are not validated.
+Nook does not provide legacy bootstrap/link support or emulate Nx scheduling,
+cache invalidation or `.env` file precedence. Keep persistent development tasks
+uncached with enough concurrency; selected HTTP scripts must retain `nook-run`.
+A task failure can leave siblings running until the runner exits (see above).
 
 ### pnpm
 

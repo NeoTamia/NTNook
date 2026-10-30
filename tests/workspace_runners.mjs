@@ -140,7 +140,7 @@ import path from 'node:path';
 const id = path.basename(process.cwd());
 const info = {id, pid:process.pid, cwd:process.cwd(), port:process.env.PORT,
   host:process.env.HOST, url:process.env.NOOK_URL, api:process.env.API_UPSTREAM,
-  label:process.env.APP_LABEL, bun:process.versions.bun ?? null,
+  label:process.env.APP_LABEL, dotenv:process.env.NOOK_TEST_DOTENV ?? null, bun:process.versions.bun ?? null,
   session:process.env.NOOK_WORKSPACE_SESSION ?? null, recovery:process.env.NOOK_WORKSPACE_PROCESS ?? null};
 `;
 const serverSource = `
@@ -188,6 +188,7 @@ for (const { id: runner, command, filter } of runners.filter(({ id }) => !select
         PATH: [path.dirname(nook), path.join(tools, "node_modules/.bin"), process.env.PATH].join(path.delimiter),
       };
       delete environment.NOOK_WORKSPACE_SESSION;
+      delete environment.NOOK_TEST_DOTENV;
       caddy = launch("caddy", ["run", "--config", path.join(root, "caddy.json")], { cwd: root, env: environment });
       await waitFor(() => adminConfig(`${admin}/config/`), "Caddy readiness");
       await writeFile(path.join(root, "config/nook/config.toml"), `format_version = 1\ncaddy_admin = "${admin}"\n`);
@@ -263,6 +264,9 @@ export default {
 };
 `);
         }
+        if (runner === "lerna" && id !== "watcher") {
+          await writeFile(path.join(dir, ".env"), `NOOK_TEST_DOTENV=${id}-dotenv\nAPP_LABEL=dotenv-must-not-override-nook\nPORT=1\nHOST=invalid.example\nNOOK_URL=http://invalid.example\n`);
+        }
         if (id !== "watcher") {
           await writeFile(path.join(dir, "nook.toml"), `format_version = 1\nname = "${id}.runner"\ntls = false\n`);
         }
@@ -332,6 +336,7 @@ API_UPSTREAM = "\${api.upstream}"
       for (const info of infos) {
         assert.equal(info.cwd, path.join(root, "apps", info.id));
         assert.equal(info.label, `${info.id}-env`);
+        if (runner === "lerna") assert.equal(info.dotenv, `${info.id}-dotenv`, "Lerna loads each package's .env while Nook retains its resolved environment");
         assert.equal(await readFile(path.join(info.cwd, "claims"), "utf8"), "claim\n", "one wrapper invocation per selected app");
         assert.equal(info.bun !== null, runner === "bun-runtime", "Bun --bun controls the actual server runtime");
       }

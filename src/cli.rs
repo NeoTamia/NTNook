@@ -1775,6 +1775,9 @@ fn write_registry_list(
             crate::state::LeaseState::Ready => "ready",
         };
         write!(output, "run\t{state}\t{}\t{}", lease.hostname, lease.target)?;
+        if let Some(group_id) = lease.group_id {
+            write!(output, "\tgroup={group_id}")?;
+        }
         write_tailscale_columns(registry, lease.id, &lease.hostname, lease.tls, output)?;
     }
     for alias in registry.aliases.values() {
@@ -2773,6 +2776,45 @@ mod tests {
         assert!(output.contains("run\tstarting\tstarting.localhost"));
         assert!(output.contains("run\tready\tready.localhost"));
         assert!(output.contains("alias\tpersistent\talias.localhost"));
+    }
+
+    #[test]
+    fn list_output_identifies_workspace_groups() {
+        let mut registry = Registry::empty();
+        let group = Uuid::new_v4();
+        for (name, group_id) in [("api", Some(group)), ("web", Some(group)), ("solo", None)] {
+            let id = Uuid::new_v4();
+            registry.leases.insert(
+                id,
+                Lease {
+                    id,
+                    group_id,
+                    worktree: None,
+                    workspace_supervisor: None,
+                    hostname: format!("{name}.localhost"),
+                    target: "http://127.0.0.1:3000".into(),
+                    scheme: Scheme::Http,
+                    tls: false,
+                    lan: false,
+                    pid: 1,
+                    pgid: 1,
+                    process_start_time_ticks: 1,
+                    state: LeaseState::Ready,
+                },
+            );
+        }
+        let mut output = Vec::new();
+        write_registry_list(&registry, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        for name in ["api", "web"] {
+            assert!(
+                output.contains(&format!(
+                    "{name}.localhost\thttp://127.0.0.1:3000\tgroup={group}\n"
+                )),
+                "{output}"
+            );
+        }
+        assert!(output.contains("solo.localhost\thttp://127.0.0.1:3000\n"));
     }
 
     #[test]

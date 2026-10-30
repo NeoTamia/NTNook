@@ -482,6 +482,71 @@ impl Drop for RunnerTree {
     }
 }
 
+// This is a root-config advisory: the runner owns CLI overrides, package
+// configurations and task selection, which may be hidden behind npm scripts.
+fn turbo_environment_warning(root: &std::path::Path) -> Option<String> {
+    let path = root.join("turbo.json");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(format!("cannot check {}: {error}", path.display())),
+    };
+    let config: serde_json::Value = match serde_json::from_str(&source) {
+        Ok(config) => config,
+        Err(error) => {
+            return Some(format!(
+                "cannot check {} for Turbo strict environment filtering: {error}",
+                path.display()
+            ));
+        }
+    };
+    if config["envMode"] == "loose"
+        || turbo_allows_session(&config["globalPassThroughEnv"])
+        || turbo_allows_session(&config["globalEnv"])
+    {
+        return None;
+    }
+    let tasks = config["tasks"].as_object()?;
+    let missing: Vec<_> = tasks
+        .iter()
+        .filter(|(_, task)| {
+            !turbo_allows_session(&task["passThroughEnv"]) && !turbo_allows_session(&task["env"])
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}: tasks [{}] do not allow {SESSION_VARIABLE} in the root config. If run with Turbo strict mode (the default), wrappers may lose the Nook workspace session. Add \"globalPassThroughEnv\": [\"{SESSION_VARIABLE}\"] to turbo.json, or passThroughEnv on each participating task. Check package configs and runner overrides if already configured elsewhere.",
+        path.display(),
+        missing.join(", ")
+    ))
+}
+
+fn turbo_allows_session(value: &serde_json::Value) -> bool {
+    fn matches(pattern: &str, name: &str) -> bool {
+        match pattern.split_once('*') {
+            Some((prefix, rest)) => name.strip_prefix(prefix).is_some_and(|suffix| {
+                (0..=suffix.len()).any(|offset| matches(rest, &suffix[offset..]))
+            }),
+            None => pattern == name,
+        }
+    }
+    let Some(patterns) = value.as_array() else {
+        return false;
+    };
+    let patterns: Vec<_> = patterns.iter().filter_map(|value| value.as_str()).collect();
+    patterns
+        .iter()
+        .any(|pattern| !pattern.starts_with('!') && matches(pattern, SESSION_VARIABLE))
+        && !patterns.iter().any(|pattern| {
+            pattern
+                .strip_prefix('!')
+                .is_some_and(|pattern| matches(pattern, SESSION_VARIABLE))
+        })
+}
+
 impl PreparedWorkspace {
     pub(crate) fn run_runner(
         mut self,
@@ -492,6 +557,9 @@ impl PreparedWorkspace {
     ) -> crate::Result<RunOutcome> {
         if command.is_empty() {
             return Err(invalid("--runner requires a root dev command after --"));
+        }
+        if let Some(warning) = turbo_environment_warning(&self.root) {
+            warn(&warning);
         }
         let identity = process::read_process_identity(std::process::id())
             .ok_or_else(|| invalid("cannot identify workspace supervisor"))?;
@@ -1555,6 +1623,64 @@ mod tests {
             ports
                 .iter()
                 .all(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, *port)).is_ok())
+        );
+    }
+
+    #[test]
+    fn turbo_environment_advisory_respects_allowlists_and_loose_mode() {
+        let fixture = Fixture::new();
+        assert!(turbo_environment_warning(&fixture.root).is_none());
+        for config in [
+            r#"{"tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["OTHER"],"tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["NOOK_*","!NOOK_WORKSPACE_SESSION"],"tasks":{"dev":{}}}"#,
+            r#"{"tasks":{"dev":{"passThroughEnv":["NOOK_WORKSPACE_SESSION"]},"other":{}}}"#,
+        ] {
+            fs::write(fixture.root.join("turbo.json"), config).unwrap();
+            assert!(
+                turbo_environment_warning(&fixture.root).is_some(),
+                "{config}"
+            );
+        }
+        for config in [
+            r#"{"envMode":"loose","tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["NOOK_WORKSPACE_SESSION"],"tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["NOOK_*"],"tasks":{"dev":{}}}"#,
+            r#"{"globalEnv":["NOOK_WORKSPACE_SESSION"],"tasks":{"dev":{}}}"#,
+            r#"{"tasks":{"dev":{"passThroughEnv":["NOOK_WORKSPACE_SESSION"]}}}"#,
+            r#"{"tasks":{"dev":{"env":["NOOK_WORKSPACE_SESSION"]}}}"#,
+        ] {
+            fs::write(fixture.root.join("turbo.json"), config).unwrap();
+            assert!(
+                turbo_environment_warning(&fixture.root).is_none(),
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_runner_warns_about_incomplete_turbo_strict_environment() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.root.join("turbo.json"),
+            r#"{"envMode":"strict","tasks":{"dev":{"cache":false,"persistent":true}}}"#,
+        )
+        .unwrap();
+        let plan = prepare(fixture.workspace([&["unused"], &["unused"]]), None).unwrap();
+        let mut warnings = Vec::new();
+        plan.run_runner(
+            &["/usr/bin/true".into()],
+            &fixture.store,
+            &mut Routes::default(),
+            |warning| warnings.push(warning.to_owned()),
+        )
+        .unwrap();
+        assert!(
+            warnings.iter().any(|warning| warning.contains("turbo.json")
+                && warning.contains("strict")
+                && warning.contains("NOOK_WORKSPACE_SESSION")
+                && warning.contains("globalPassThroughEnv")),
+            "{warnings:?}"
         );
     }
 
