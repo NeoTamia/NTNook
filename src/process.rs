@@ -540,14 +540,22 @@ pub(crate) fn prepare_run(
         .ok_or(Error::ProcessIdentity(std::process::id()))?;
     if config.lan {
         let hostname = crate::lan::hostname(&config.hostname);
-        if let Some(lease) = registry.leases.values().find(|lease| {
-            lease.lan
-                && lease.hostname != config.hostname
-                && crate::lan::hostname(&lease.hostname) == hostname
+        let mut owners = registry
+            .leases
+            .values()
+            .map(|lease| (&lease.hostname, lease.lan))
+            .chain(
+                registry
+                    .preparing
+                    .values()
+                    .map(|entry| (&entry.hostname, entry.lan)),
+            );
+        if let Some((project, _)) = owners.find(|(project, lan)| {
+            *lan && **project != config.hostname && crate::lan::hostname(project) == hostname
         }) {
             return Err(RunError::LanHostnameConflict {
                 hostname,
-                project: lease.hostname.clone(),
+                project: project.clone(),
             });
         }
     }
@@ -606,6 +614,7 @@ pub(crate) fn prepare_run(
             owner_id,
             crate::state::StartingRun {
                 hostname: config.hostname.clone(),
+                lan: config.lan,
                 tls: config.tls,
                 cancelled: false,
                 supervisor: WorkspaceSupervisor {

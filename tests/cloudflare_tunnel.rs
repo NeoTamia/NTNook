@@ -293,8 +293,8 @@ fn workspace_urls_exist_before_any_application_spawns() {
 }
 
 #[test]
-fn aliases_cannot_replace_routes_reserved_by_starting_runs() {
-    if isolated("aliases_cannot_replace_routes_reserved_by_starting_runs") {
+fn aliases_and_lan_runs_cannot_replace_routes_reserved_by_starting_runs() {
+    if isolated("aliases_and_lan_runs_cannot_replace_routes_reserved_by_starting_runs") {
         return;
     }
     for workspace in [false, true] {
@@ -304,8 +304,9 @@ fn aliases_cannot_replace_routes_reserved_by_starting_runs() {
         let config = fs::read_to_string(&config_path).unwrap();
         fs::write(config_path, config.replace("seconds = 3", "seconds = 20")).unwrap();
         if workspace {
-            fs::write(root.join("nook.toml"), "format_version=2\nname='shop'\n[[apps]]\nid='web'\ndir='.'\ntunnel='cloudflare'\ncommand=['python3','app.py']\n").unwrap();
+            fs::write(root.join("nook.toml"), "format_version=2\nname='shop'\n[[apps]]\nid='web'\ndir='.'\nlan=true\ntunnel='cloudflare'\ncommand=['python3','app.py']\n").unwrap();
         }
+        fs::write(root.join("intruder.toml"), "format_version=1\n").unwrap();
         let name = if workspace { "web.shop" } else { "web" };
         let mut command = nook(root);
         command.arg("run");
@@ -315,6 +316,7 @@ fn aliases_cannot_replace_routes_reserved_by_starting_runs() {
                 name,
                 "--tunnel",
                 "cloudflare",
+                "--lan",
                 "--",
                 "python3",
                 "app.py",
@@ -346,10 +348,41 @@ fn aliases_cannot_replace_routes_reserved_by_starting_runs() {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            let mut collision = nook(root);
+            collision.args([
+                "run",
+                "--config",
+                "intruder.toml",
+                "--name",
+                &format!("{name}.local"),
+                "--lan",
+            ]);
+            if force {
+                collision.arg("--force");
+            }
+            let output = collision
+                .args([
+                    "--",
+                    "python3",
+                    "-c",
+                    "from pathlib import Path; Path('intruder-started').touch()",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "colliding LAN run must be rejected"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("LAN hostname"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         assert_eq!(c.config_json(), before);
         assert!(state(root)["aliases"].as_object().unwrap().is_empty());
         assert!(!root.join("app-env.json").exists());
+        assert!(!root.join("intruder-started").exists());
         let registry = state(root);
         let id = registry["tunnels"]
             .as_object()

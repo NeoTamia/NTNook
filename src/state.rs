@@ -839,6 +839,8 @@ mod tests {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartingRun {
     pub(crate) hostname: String,
+    #[serde(default)]
+    pub(crate) lan: bool,
     pub(crate) tls: bool,
     pub(crate) supervisor: WorkspaceSupervisor,
     pub(crate) cancelled: bool,

@@ -1753,6 +1753,7 @@ mod tests {
             owner,
             crate::state::StartingRun {
                 hostname: "starting.localhost".into(),
+                lan: false,
                 tls: true,
                 cancelled: false,
                 supervisor: crate::state::WorkspaceSupervisor {
