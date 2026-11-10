@@ -15,6 +15,11 @@ fn main() {
         "docker"
     });
     fs::copy(env::current_exe().unwrap(), docker).unwrap();
+    // On Windows, Rust searches the executable's directory before System32,
+    // but an inherited PATH comes after System32 (which may contain Docker).
+    // Keep Nook beside the fake so this test never reaches the installed daemon.
+    let nook_binary = root.join(if cfg!(windows) { "nook.exe" } else { "nook" });
+    fs::copy(env!("CARGO_BIN_EXE_nook"), &nook_binary).unwrap();
     fs::write(root.join("compose.yaml"), "services: {}\n").unwrap();
     fs::write(root.join("local env"), "VALUE=private\n").unwrap();
     let model = json!({"name":"app","services":{"web":{"ports":[{"target":8080,"protocol":"udp"}],"labels":{"io.ntnook.route.http.port":"8080"}}}});
@@ -25,7 +30,7 @@ fn main() {
     )
     .unwrap();
     let nook = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_nook"))
+        Command::new(&nook_binary)
             .args(args)
             .current_dir(&root)
             .env("PATH", &path)
@@ -77,8 +82,9 @@ fn main() {
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr).contains("HTTP over TCP"),
-        "{}",
-        String::from_utf8_lossy(&rejected.stderr)
+        "{}\nFake Docker calls: {}",
+        String::from_utf8_lossy(&rejected.stderr),
+        fs::read_to_string(root.join("calls.jsonl")).unwrap_or_else(|_| "<none>".into())
     );
     let calls: Vec<Vec<String>> = fs::read_to_string(root.join("calls.jsonl"))
         .unwrap()
