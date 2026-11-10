@@ -336,7 +336,7 @@ impl SessionOwner {
         // creating even the directory, so SIGKILL at any later write is recoverable.
         let path = journal_group_at(&Store::new(state_path.clone()), group_id, path)?;
         let directory = path.parent().expect("absolute session path").to_owned();
-        create_private_directory(&directory)?;
+        crate::platform::create_private_directory(&directory)?;
         let owner = Self { path, directory };
         let context = Context {
             version: VERSION,
@@ -413,86 +413,6 @@ impl SessionOwner {
     pub(crate) fn remove(&self) -> crate::Result<()> {
         remove_session_directory(&self.directory)
     }
-}
-
-#[cfg(unix)]
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new().mode(0o700).create(path)
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    use std::mem::{size_of, zeroed};
-    use std::os::windows::ffi::OsStrExt;
-    use std::ptr::{addr_of_mut, null_mut};
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, GetLengthSid,
-        GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, SE_DACL_PROTECTED,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
-        SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ALL_ACCESS};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let result = (|| {
-        let mut size = 0;
-        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut size) };
-        // usize storage gives TOKEN_USER its required pointer alignment.
-        let mut user = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
-        if unsafe {
-            GetTokenInformation(token, TokenUser, user.as_mut_ptr().cast(), size, &mut size)
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let sid = unsafe { (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-        let sid_size = unsafe { GetLengthSid(sid) } as usize;
-        let acl_size =
-            size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_size;
-        let mut acl = vec![0u32; acl_size.div_ceil(size_of::<u32>())];
-        let acl = acl.as_mut_ptr().cast::<ACL>();
-        // OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE: context files inherit the
-        // single current-user grant rather than a permissive temp-folder ACL.
-        if unsafe { InitializeAcl(acl, acl_size as u32, ACL_REVISION) } == 0
-            || unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 3, FILE_ALL_ACCESS, sid) } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let mut descriptor: SECURITY_DESCRIPTOR = unsafe { zeroed() };
-        let descriptor_pointer = addr_of_mut!(descriptor).cast();
-        if unsafe { InitializeSecurityDescriptor(descriptor_pointer, 1) } == 0
-            || unsafe { SetSecurityDescriptorDacl(descriptor_pointer, 1, acl, 0) } == 0
-            || unsafe {
-                SetSecurityDescriptorControl(
-                    descriptor_pointer,
-                    SE_DACL_PROTECTED,
-                    SE_DACL_PROTECTED,
-                )
-            } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor_pointer,
-            bInheritHandle: 0,
-        };
-        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    })();
-    unsafe { CloseHandle(token) };
-    result
 }
 
 fn framework_choice(value: &str) -> crate::Result<FrameworkChoice> {
@@ -853,6 +773,7 @@ impl SessionMember {
         };
         Ok(ResolvedRunConfig {
             provenance: Default::default(),
+            tunnel: false,
             worktree: self.app.worktree.clone(),
             hostname: self.app.hostname.clone(),
             command: args.command.clone(),
@@ -1075,7 +996,7 @@ fn validate_arguments(app: &SessionApp, args: &RunArgs) -> crate::Result<()> {
             "member worktree overrides are incompatible with a workspace session; configure the root session",
         ));
     }
-    if args.tailscale || args.funnel || args.lan {
+    if args.tailscale || args.funnel || args.lan || args.tunnel.is_some() || args.no_tunnel {
         return Err(invalid(
             "member exposure overrides are incompatible with a workspace session",
         ));
@@ -1497,7 +1418,7 @@ while not os.path.exists('watcher.pid'):
         let store = Store::new(root.join("state.json"));
         let group_id = Uuid::new_v4();
         let directory = root.join(format!("nook-session-{group_id}"));
-        create_private_directory(&directory).unwrap();
+        crate::platform::create_private_directory(&directory).unwrap();
         // Force failure before even context.lock can be created. Ownership must
         // already be discoverable without an app lease or a readable context.
         assert!(

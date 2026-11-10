@@ -55,6 +55,10 @@ impl std::error::Error for Error {
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Registry {
+    #[serde(default)]
+    pub(crate) preparing: BTreeMap<Uuid, StartingRun>,
+    #[serde(default)]
+    pub(crate) tunnels: BTreeMap<Uuid, crate::cloudflare::Registration>,
     pub(crate) format_version: u32,
     #[serde(default)]
     pub(crate) aliases: BTreeMap<String, Alias>,
@@ -829,4 +833,13 @@ mod tests {
         fs::create_dir(&path).unwrap();
         path
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartingRun {
+    pub(crate) hostname: String,
+    pub(crate) tls: bool,
+    pub(crate) supervisor: WorkspaceSupervisor,
+    pub(crate) cancelled: bool,
 }

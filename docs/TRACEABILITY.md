@@ -93,3 +93,14 @@ Integration tests are isolated in temporary directories, use Caddy `2.11.x`, ins
   lifecycle preserving foreign routes and owner UUIDs.
 - Existing Caddy/reconciliation tests continue to cover ETag retries, owner markers,
   atomic registry writes and crash recovery.
+
+## Cloudflare Quick Tunnels
+
+- Configuration/preflight: `tests/cli_tunnel_config.rs`, `cloudflare::tests`.
+- Verified Caddy TLS, public Host forwarding, rollback, cancellation, supervisor
+  crash, forced transfer, workspace interpolation and runner ownership:
+  `tests/cloudflare_tunnel.rs` (isolated Linux namespaces, no public traffic).
+- Native connector spawn, paths containing spaces and Job cleanup:
+  `tests/windows_caddy_e2e.rs`, `tests/support/cloudflared_mock.rs`.
+- Opt-in Cloudflare HTTP and Vite WebSocket/HMR proof: `tests/cloudflare_live.py`.
+- User contract and exclusions: `docs/CLOUDFLARE.md`.

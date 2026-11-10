@@ -337,6 +337,14 @@ an application bind address reachable from the LAN.
 LAN access can be combined with Tailscale Serve (`--tailscale`) or Funnel (`--funnel`).
 `--no-tailscale` only disables Serve and Funnel.
 
+### Temporary Cloudflare URLs
+
+Install `cloudflared` explicitly, then use `nook run --tunnel cloudflare -- vite`.
+The public, ephemeral URL is available as `NOOK_TUNNEL_URL` before the app starts;
+`NOOK_URL` stays local. Quick Tunnels do not support SSE and are limited to 200
+in-flight requests. Workspaces, runners, worktrees and LAN can use this exposure.
+See [Cloudflare setup, lifecycle and limitations](docs/CLOUDFLARE.md).
+
 ### JavaScript package scripts
 
 JavaScript projects can use `@neotamia/nook-run` to provide a package-manager-independent `dev`

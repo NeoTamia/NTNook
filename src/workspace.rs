@@ -136,7 +136,14 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
         crate::workspace_session::PROCESS_VARIABLE.into(),
         member.process_marker(),
     ));
-    let (argv, launch_environment) = process::child_command(&config, port, &[]);
+    let exposed: Vec<_> = environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == crate::cloudflare::URL_VARIABLE)
+        .cloned()
+        .into_iter()
+        .collect();
+    let (argv, launch_environment) = process::child_command(&config, port, &exposed);
     environment.extend(launch_environment);
     let mut child = ChildTree::new(member.spawn_child(
         || {
@@ -250,6 +257,12 @@ pub(crate) fn prepare(
         .map_err(process::RunError::from)?;
         let port = reservation.port;
         let address = process::readiness_probe_address(app.config.bind_address);
+        if app.config.tunnel {
+            values.insert(
+                format!("{}.tunnel_url", app.id),
+                format!("${{{}.tunnel_url}}", app.id),
+            );
+        }
         values.insert(
             format!("{}.url", app.id),
             format!(
@@ -310,12 +323,12 @@ fn interpolate(value: &OsStr, values: &BTreeMap<String, String>) -> crate::Resul
     while let Some((_, after)) = rest.split_once("${") {
         let Some((reference, after)) = after.split_once('}') else {
             return Err(invalid(
-                "unterminated workspace interpolation; expected ${id.url}, ${id.lan_url}, ${id.upstream}, ${id.host}, or ${id.port}",
+                "unterminated workspace interpolation; expected ${id.url}, ${id.lan_url}, ${id.tunnel_url}, ${id.upstream}, ${id.host}, or ${id.port}",
             ));
         };
         if !values.contains_key(reference) {
             return Err(invalid(format!(
-                "unknown workspace reference `${{{reference}}}`; references must name a selected application and url, lan_url (with LAN enabled), upstream, host, or port"
+                "unknown workspace reference `${{{reference}}}`; references must name a selected application and url, lan_url (with LAN enabled), tunnel_url (with tunnel enabled), upstream, host, or port"
             )));
         }
         rest = after;
@@ -548,6 +561,43 @@ fn turbo_allows_session(value: &serde_json::Value) -> bool {
 }
 
 impl PreparedWorkspace {
+    fn start_tunnels(
+        &mut self,
+        runs: &mut [process::PreparedRun],
+        store: &Store,
+        routes: &mut impl RouteBackend,
+    ) -> crate::Result<()> {
+        let mut values = BTreeMap::new();
+        for (app, run) in self.apps.iter().zip(runs.iter_mut()) {
+            if app.app.config.tunnel {
+                let (tunnel, url) = crate::cloudflare::Tunnel::start(
+                    &app.app.config,
+                    run.owner_id,
+                    &run.target,
+                    store,
+                    routes,
+                )?;
+                run.tunnel = Some(tunnel);
+                run.exposed
+                    .push((crate::cloudflare::URL_VARIABLE.into(), url.clone().into()));
+                values.insert(format!("{}.tunnel_url", app.app.id), url);
+            }
+        }
+        for run in runs.iter_mut() {
+            if let Some(tunnel) = &mut run.tunnel {
+                tunnel.verify_ready()?;
+            }
+        }
+        for app in &mut self.apps {
+            for argument in &mut app.app.config.command {
+                *argument = process::substitute_values(argument, &values);
+            }
+            for (_, value) in &mut app.environment {
+                *value = process::substitute_values(value, &values);
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn run_runner(
         mut self,
         command: &[OsString],
@@ -567,7 +617,7 @@ impl PreparedWorkspace {
             pid: std::process::id(),
             process_start_time_ticks: identity.start_time_ticks,
         };
-        let operations = store.lock_operations()?;
+        let mut operations = Some(store.lock_operations()?);
         let mut prepared_runs = Vec::new();
         let mut advertisements = Vec::new();
         let mut runner = None;
@@ -580,10 +630,14 @@ impl PreparedWorkspace {
                     app.reservation.take().expect("reserved once"),
                     store,
                     routes,
-                    &operations,
+                    operations.as_ref().expect("locked"),
                     &mut process::LocalOnly,
                 )?);
             }
+            drop(operations.take());
+            self.start_tunnels(&mut prepared_runs, store, routes)?;
+            operations = Some(store.lock_operations()?);
+            validate_preparations(store, &prepared_runs)?;
             for (app, run) in self.apps.iter().zip(&prepared_runs) {
                 if app.app.config.lan {
                     match crate::lan::Advertisement::start(
@@ -715,6 +769,10 @@ impl PreparedWorkspace {
             Ok(warnings)
         })();
         if !committed {
+            drop(operations.take());
+            for run in &mut prepared_runs {
+                run.tunnel.take();
+            }
             // Even rollback must respect session -> operations -> store order.
             drop(operations);
             drop(runner);
@@ -755,6 +813,11 @@ impl PreparedWorkspace {
                 }
                 if let Some(code) = runner.child.0.try_wait().map_err(process::RunError::from)? {
                     return Ok(code);
+                }
+                for run in &mut prepared_runs {
+                    if let Some(tunnel) = &mut run.tunnel {
+                        tunnel.poll();
+                    }
                 }
                 advertisements.retain_mut(|advertisement| !advertisement.is_displaced(store));
                 for advertisement in &advertisements {
@@ -844,6 +907,9 @@ impl PreparedWorkspace {
                 thread::sleep(Duration::from_millis(20));
             }
         })();
+        for run in &mut prepared_runs {
+            run.tunnel.take();
+        }
         let mut warnings = runner.stop(result.is_ok().then_some(shutdown_signal));
         let mut cleanup_error = None;
         for (app, run) in self.apps.iter().zip(&prepared_runs) {
@@ -876,7 +942,7 @@ impl PreparedWorkspace {
         routes: &mut impl RouteBackend,
     ) -> crate::Result<RunningWorkspace> {
         let session_path = crate::workspace_session::journal_group(store, self.group_id)?;
-        let operations = store.lock_operations()?;
+        let mut operations = Some(store.lock_operations()?);
         let mut prepared_runs = Vec::new();
         let mut running = Vec::new();
         let result = (|| -> crate::Result<()> {
@@ -888,11 +954,15 @@ impl PreparedWorkspace {
                     reservation,
                     store,
                     routes,
-                    &operations,
+                    operations.as_ref().expect("locked"),
                     &mut process::LocalOnly,
                 )?;
                 prepared_runs.push(run);
             }
+            drop(operations.take());
+            self.start_tunnels(&mut prepared_runs, store, routes)?;
+            operations = Some(store.lock_operations()?);
+            validate_preparations(store, &prepared_runs)?;
             for (prepared, run) in self.apps.iter_mut().zip(&mut prepared_runs) {
                 if !self.signals.pending().is_empty() {
                     return Err(io::Error::new(
@@ -936,6 +1006,11 @@ impl PreparedWorkspace {
             Ok(())
         })();
         if let Err(error) = result {
+            drop(operations.take());
+            for run in &mut prepared_runs {
+                run.tunnel.take();
+            }
+            let _operations = store.lock_operations()?;
             for (_, running) in &mut running {
                 let _ = running.child.signal(ProcessSignal::Kill);
                 let _ = running.child.wait();
@@ -999,6 +1074,7 @@ impl RunningWorkspace {
                     });
                 }
                 for (index, (id, running)) in self.apps.iter_mut().enumerate() {
+                    running.poll_tunnel();
                     if let Some(code) = running.child.try_wait().map_err(process::RunError::from)? {
                         return Ok(code);
                     }
@@ -1048,6 +1124,9 @@ impl RunningWorkspace {
             return Vec::new();
         }
         self.terminated = true;
+        for (_, running) in &mut self.apps {
+            running.stop_tunnel();
+        }
         let mut warnings = Vec::new();
         if let Some(signal) = signal {
             #[cfg(target_os = "linux")]
@@ -1169,6 +1248,7 @@ mod tests {
                         environment: BTreeMap::new(),
                         config: ResolvedRunConfig {
                             provenance: Default::default(),
+                            tunnel: false,
                             worktree: None,
                             hostname: format!("{id}.demo.localhost"),
                             command: argv.iter().map(OsString::from).collect(),
@@ -1840,4 +1920,17 @@ mod tests {
             .unwrap();
         assert!(associate_member(&fixture.store, &app, &owner, &child_lease).is_err());
     }
+}
+
+fn validate_preparations(store: &Store, runs: &[process::PreparedRun]) -> crate::Result<()> {
+    let registry = store.load()?;
+    if runs.iter().any(|run| {
+        registry
+            .preparing
+            .get(&run.owner_id)
+            .is_none_or(|p| p.cancelled)
+    }) {
+        return Err(invalid("workspace startup cancelled"));
+    }
+    Ok(())
 }

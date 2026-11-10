@@ -14,6 +14,7 @@ use crate::state::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteSpec {
+    pub(crate) public_host: Option<String>,
     pub(crate) lan: bool,
     pub(crate) owner_id: Uuid,
     pub(crate) hostname: String,
@@ -36,6 +37,10 @@ impl fmt::Display for RouteError {
 impl std::error::Error for RouteError {}
 
 pub(crate) trait RouteBackend {
+    fn local_ca(&self) -> Result<String, RouteError> {
+        Err(RouteError("backend does not provide a local CA".into()))
+    }
+
     fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError>;
     fn remove_if_owned(
         &mut self,
@@ -68,6 +73,7 @@ pub(crate) enum AliasError {
     State(String),
     Route(RouteError),
     Conflict(String),
+    Preparing(String),
 }
 
 impl fmt::Display for AliasError {
@@ -78,6 +84,10 @@ impl fmt::Display for AliasError {
             Self::Conflict(hostname) => write!(
                 formatter,
                 "hostname `{hostname}` is already managed by Nook; use --force to replace it"
+            ),
+            Self::Preparing(hostname) => write!(
+                formatter,
+                "hostname `{hostname}` is reserved by a starting run; wait for startup or stop it first"
             ),
         }
     }
@@ -130,6 +140,15 @@ pub(crate) fn set_alias_with<T, E: From<AliasError>>(
             AliasError::State("hostname belongs to Compose; use nook compose".into()).into(),
         );
     }
+    if store
+        .load()
+        .map_err(|error| AliasError::State(error.to_string()))?
+        .preparing
+        .values()
+        .any(|entry| entry.hostname == request.hostname)
+    {
+        return Err(AliasError::Preparing(request.hostname).into());
+    }
     let replaced = store
         .mutate(|registry| {
             let aliases = registry
@@ -179,6 +198,7 @@ pub(crate) fn set_alias_with<T, E: From<AliasError>>(
         .map_err(|error| AliasError::State(error.to_string()))?;
     routes
         .ensure(&RouteSpec {
+            public_host: None,
             lan: false,
             owner_id: alias.id,
             hostname: alias.hostname.clone(),
@@ -197,6 +217,7 @@ pub(crate) fn set_alias_with<T, E: From<AliasError>>(
                 // A route that cannot be restored now is restored by the next
                 // reconciliation, because the registry still records its owner.
                 let _ = routes.ensure(&RouteSpec {
+                    public_host: None,
                     replace_existing: true,
                     ..route.clone()
                 });
@@ -483,6 +504,9 @@ fn reconcile_with_supervisors(
     for alias in aliases {
         restore(route_for_alias(&alias), registry, routes, &mut report);
     }
+    registry
+        .preparing
+        .retain(|_, entry| workspace_supervisor_liveness(&entry.supervisor) != Liveness::Dead);
     deduplicate_pending(registry);
     report
 }
@@ -503,6 +527,14 @@ fn retry_pending(
 ) {
     let pending = std::mem::take(&mut registry.pending_operations);
     for operation in pending {
+        if pending_owner(&operation.kind).is_some_and(|owner| {
+            registry.preparing.get(&owner).is_some_and(|entry| {
+                workspace_supervisor_liveness(&entry.supervisor) != Liveness::Dead
+            })
+        }) {
+            registry.pending_operations.push(operation);
+            continue;
+        }
         let result = match &operation.kind {
             PendingOperationKind::RestoreRoute {
                 hostname, owner_id, ..
@@ -598,6 +630,7 @@ fn current_route(registry: &Registry, hostname: &str, owner_id: Uuid) -> Option<
 
 pub(crate) fn route_for_lease(lease: &Lease) -> RouteSpec {
     RouteSpec {
+        public_host: None,
         lan: lease.lan,
         owner_id: lease.id,
         hostname: lease.hostname.clone(),
@@ -611,6 +644,7 @@ pub(crate) fn route_for_lease(lease: &Lease) -> RouteSpec {
 
 pub(crate) fn route_for_alias(alias: &Alias) -> RouteSpec {
     RouteSpec {
+        public_host: None,
         lan: false,
         owner_id: alias.id,
         hostname: alias.hostname.clone(),

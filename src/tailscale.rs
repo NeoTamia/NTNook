@@ -725,6 +725,15 @@ fn owner_state(
             },
         }
     });
+    let live = live.or_else(|| {
+        registry.preparing.get(&owner_id).map(|entry| {
+            if entry.cancelled {
+                Liveness::Dead
+            } else {
+                crate::process::workspace_supervisor_liveness(&entry.supervisor)
+            }
+        })
+    });
     match live {
         Some(Liveness::Alive) => Owner::Alive,
         Some(Liveness::Indeterminate) => Owner::Unknown,
@@ -1732,6 +1741,34 @@ mod tests {
             owner_state(&registry, lease.id, &mut unknown),
             Owner::Unknown
         );
+    }
+
+    #[test]
+    fn starting_run_owns_registration_until_cancelled_or_supervisor_disappears() {
+        let mut registry = Registry::empty();
+        let owner = Uuid::new_v4();
+        let pid = std::process::id();
+        let identity = crate::process::read_process_identity(pid).unwrap();
+        registry.preparing.insert(
+            owner,
+            crate::state::StartingRun {
+                hostname: "starting.localhost".into(),
+                tls: true,
+                cancelled: false,
+                supervisor: crate::state::WorkspaceSupervisor {
+                    pid,
+                    process_start_time_ticks: identity.start_time_ticks,
+                },
+            },
+        );
+        let mut no_app = |_: &Lease| panic!("application has not been spawned");
+        assert_eq!(owner_state(&registry, owner, &mut no_app), Owner::Alive);
+        registry.preparing.get_mut(&owner).unwrap().cancelled = true;
+        assert_eq!(owner_state(&registry, owner, &mut no_app), Owner::Gone);
+        let entry = registry.preparing.get_mut(&owner).unwrap();
+        entry.cancelled = false;
+        entry.supervisor.process_start_time_ticks += 1;
+        assert_eq!(owner_state(&registry, owner, &mut no_app), Owner::Gone);
     }
 
     #[test]
