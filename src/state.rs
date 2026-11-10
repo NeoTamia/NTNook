@@ -60,7 +60,7 @@ pub(crate) struct Registry {
     #[serde(default)]
     pub(crate) preparing: BTreeMap<Uuid, StartingRun>,
     #[serde(default)]
-    pub(crate) tunnels: BTreeMap<Uuid, crate::cloudflare::Registration>,
+    pub(crate) tunnels: BTreeMap<Uuid, crate::tunnel::Registration>,
     pub(crate) format_version: u32,
     #[serde(default)]
     pub(crate) aliases: BTreeMap<String, Alias>,
@@ -634,10 +634,28 @@ mod tests {
     }
 
     #[test]
+    fn v3_cloudflare_registration_keeps_its_owner_on_upgrade() {
+        let id = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let mut value = serde_json::to_value(Registry::empty()).unwrap();
+        value["format_version"] = serde_json::json!(3);
+        value["tunnels"] = serde_json::json!({id.to_string(): {
+            "id": id, "owner_id": owner, "hostname": "web.localhost", "target": "http://127.0.0.1:3000",
+            "supervisor": {"pid": 1, "process_start_time_ticks": 2}, "child": null,
+            "url": "https://fixture.trycloudflare.com", "metrics_port": 12345, "phase": "connected", "committed": true
+        }});
+        let registry = decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(registry.format_version, 4);
+        assert_eq!(registry.tunnels[&id].provider, "cloudflare");
+        assert_eq!(registry.tunnels[&id].owner_id, owner);
+        assert!(!registry.tunnels[&id].alias);
+    }
+
+    #[test]
     fn unknown_versions_corruption_and_unknown_fields_are_safe_errors() {
         assert!(matches!(
-            decode(br#"{"format_version":4}"#),
-            Err(Error::UnsupportedVersion(4))
+            decode(br#"{"format_version":5}"#),
+            Err(Error::UnsupportedVersion(5))
         ));
         assert!(matches!(decode(b"not json"), Err(Error::InvalidJson(_))));
         assert!(matches!(decode(br#"{"format_version":1,"aliases":{},"leases":{},"selected_servers":{},"last_synchronized_at_unix_ms":null,"pending_operations":[],"surprise":true}"#), Err(Error::InvalidJson(_))));

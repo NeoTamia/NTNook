@@ -369,7 +369,7 @@ pub(crate) struct RunningChild {
     readiness_warn_after: Duration,
     signals: ForwardedSignals,
     lan: Option<crate::lan::Advertisement>,
-    tunnel: Option<crate::cloudflare::Tunnel>,
+    tunnel: Option<crate::tunnel::Tunnel>,
 }
 
 /// Additional exposure of a run beyond its local Caddy route.
@@ -436,7 +436,7 @@ fn start_run_with_hook(
     let mut prepared = prepare_run(config, reservation, store, routes, &operations, exposure)?;
     drop(operations);
     if config.tunnel {
-        match crate::cloudflare::Tunnel::start(
+        match crate::tunnel::Tunnel::start(
             config,
             prepared.owner_id,
             &prepared.target,
@@ -447,7 +447,7 @@ fn start_run_with_hook(
                 prepared.tunnel = Some(tunnel);
                 prepared
                     .exposed
-                    .push((crate::cloudflare::URL_VARIABLE.into(), url.into()));
+                    .push((crate::tunnel::URL_VARIABLE.into(), url.into()));
             }
             Err(error) => {
                 let operations = store.lock_operations()?;
@@ -501,7 +501,7 @@ fn start_run_with_hook(
 
 /// A reserved port and journaled route, with no child launched yet.
 pub(crate) struct PreparedRun {
-    pub(crate) tunnel: Option<crate::cloudflare::Tunnel>,
+    pub(crate) tunnel: Option<crate::tunnel::Tunnel>,
     reservation: Option<PortReservation>,
     pub(crate) owner_id: Uuid,
     operation_id: Uuid,
@@ -711,7 +711,7 @@ pub(crate) fn spawn_prepared_run(
     after_release(port);
     let environment: Vec<_> = extra_environment
         .iter()
-        .filter(|(key, _)| key != crate::cloudflare::URL_VARIABLE)
+        .filter(|(key, _)| key != crate::tunnel::URL_VARIABLE)
         .cloned()
         .chain(environment)
         .collect();
@@ -752,7 +752,7 @@ pub(crate) fn child_command(
     let argv = substitute_port(&config.command, port);
     let argv = if let Some((_, url)) = exposed
         .iter()
-        .find(|(key, _)| key == crate::cloudflare::URL_VARIABLE)
+        .find(|(key, _)| key == crate::tunnel::URL_VARIABLE)
     {
         let values = std::collections::BTreeMap::from([(
             "tunnel_url".to_owned(),
@@ -775,7 +775,7 @@ pub(crate) fn child_command(
     let lan_hostname = config.lan.then(|| crate::lan::hostname(&config.hostname));
     let tunnel_hostname = exposed
         .iter()
-        .find(|(name, _)| name == crate::cloudflare::URL_VARIABLE)
+        .find(|(name, _)| name == crate::tunnel::URL_VARIABLE)
         .and_then(|(_, value)| value.to_str())
         .and_then(|value| url::Url::parse(value).ok())
         .and_then(|url| url.host_str().map(str::to_owned));
@@ -868,7 +868,7 @@ pub(crate) fn commit_prepared_runs(
                 .values_mut()
                 .filter(|t| displaced_ids.contains(&t.owner_id))
             {
-                entry.phase = crate::cloudflare::Phase::Stopping;
+                entry.phase = crate::tunnel::Phase::Stopping;
                 if let Some(child) = &entry.child {
                     let _ = kill_owned_lease(child);
                 }
@@ -992,7 +992,7 @@ fn abandon_route(
             .values_mut()
             .filter(|t| t.owner_id == owner_id)
         {
-            tunnel.phase = crate::cloudflare::Phase::Stopping;
+            tunnel.phase = crate::tunnel::Phase::Stopping;
         }
         registry
             .pending_operations
@@ -1153,7 +1153,7 @@ pub(crate) fn cleanup_run_route(
     let mut warnings = Vec::new();
     store.mutate(|registry| {
         registry.leases.remove(&owner_id);
-        warnings.extend(crate::cloudflare::reconcile(registry, store, routes));
+        warnings.extend(crate::tunnel::reconcile(registry, store, routes));
         if let Err(error) = &cleanup {
             registry.pending_operations.push(PendingOperation {
                 id: Uuid::new_v4(),
@@ -1351,6 +1351,14 @@ pub(crate) fn spawn_auxiliary(argv: &[OsString], lease_id: Uuid) -> Result<Manag
     spawn_child_options(argv, &[], lease_id, None, None, true)
 }
 
+pub(crate) fn spawn_ngrok(argv: &[OsString], lease_id: Uuid) -> Result<ManagedChild, Error> {
+    let credentials: Vec<_> = std::env::var_os("NGROK_AUTHTOKEN")
+        .map(|v| (OsString::from("NGROK_AUTHTOKEN"), v))
+        .into_iter()
+        .collect();
+    spawn_child_options(argv, &credentials, lease_id, None, None, true)
+}
+
 fn spawn_child_options(
     argv: &[OsString],
     environment: &[(OsString, OsString)],
@@ -1375,7 +1383,9 @@ fn spawn_child_options(
     // A run started from an exposed run must not inherit its tailnet URL;
     // an exposed child gets its own value back from `environment`.
     command
-        .env_remove(crate::cloudflare::URL_VARIABLE)
+        .env_remove("NGROK_AUTHTOKEN")
+        .env_remove("NGROK_API_KEY")
+        .env_remove(crate::tunnel::URL_VARIABLE)
         .env_remove(crate::tailscale::URL_VARIABLE)
         .env_remove("NOOK_WORKSPACE_SESSION")
         .env_remove(crate::workspace_session::PROCESS_VARIABLE)
@@ -1404,6 +1414,11 @@ fn spawn_child_options(
                 command.env_remove(key);
             }
         }
+    }
+    if !auxiliary {
+        command
+            .env_remove("NGROK_AUTHTOKEN")
+            .env_remove("NGROK_API_KEY");
     }
     if prefix.is_some() || auxiliary {
         command
@@ -5136,6 +5151,8 @@ sys.exit(3)
         ResolvedRunConfig {
             provenance: Default::default(),
             tunnel: false,
+            ngrok: false,
+            ngrok_url: None,
             worktree: None,
             hostname: "api.localhost".into(),
             command: command.into_iter().map(OsString::from).collect(),

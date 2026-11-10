@@ -139,7 +139,7 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
     let exposed: Vec<_> = environment
         .iter()
         .rev()
-        .find(|(key, _)| key == crate::cloudflare::URL_VARIABLE)
+        .find(|(key, _)| key == crate::tunnel::URL_VARIABLE)
         .cloned()
         .into_iter()
         .collect();
@@ -570,7 +570,7 @@ impl PreparedWorkspace {
         let mut values = BTreeMap::new();
         for (app, run) in self.apps.iter().zip(runs.iter_mut()) {
             if app.app.config.tunnel {
-                let (tunnel, url) = crate::cloudflare::Tunnel::start(
+                let (tunnel, url) = crate::tunnel::Tunnel::start(
                     &app.app.config,
                     run.owner_id,
                     &run.target,
@@ -579,7 +579,7 @@ impl PreparedWorkspace {
                 )?;
                 run.tunnel = Some(tunnel);
                 run.exposed
-                    .push((crate::cloudflare::URL_VARIABLE.into(), url.clone().into()));
+                    .push((crate::tunnel::URL_VARIABLE.into(), url.clone().into()));
                 values.insert(format!("{}.tunnel_url", app.app.id), url);
             }
         }
@@ -1249,6 +1249,8 @@ mod tests {
                         config: ResolvedRunConfig {
                             provenance: Default::default(),
                             tunnel: false,
+                            ngrok: false,
+                            ngrok_url: None,
                             worktree: None,
                             hostname: format!("{id}.demo.localhost"),
                             command: argv.iter().map(OsString::from).collect(),

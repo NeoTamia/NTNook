@@ -151,6 +151,7 @@ pub(crate) struct ProjectConfig {
     command: Option<Vec<String>>,
     tls: Option<bool>,
     tunnel: Option<TunnelChoice>,
+    ngrok_url: Option<String>,
     tailscale: Option<bool>,
     funnel: Option<bool>,
     lan: Option<bool>,
@@ -167,7 +168,9 @@ pub(crate) struct ProjectConfig {
 #[allow(dead_code)]
 pub(crate) struct GlobalConfig {
     #[serde(default)]
-    pub(crate) cloudflare: crate::cloudflare::Settings,
+    pub(crate) cloudflare: crate::tunnel::Settings,
+    #[serde(default)]
+    pub(crate) ngrok: crate::ngrok::Settings,
     format_version: u32,
     pub(crate) caddy_admin: String,
     pub(crate) https_server: Option<String>,
@@ -210,6 +213,7 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             cloudflare: Default::default(),
+            ngrok: Default::default(),
             format_version: FORMAT_VERSION,
             caddy_admin: DEFAULT_CADDY_ADMIN.to_owned(),
             https_server: None,
@@ -226,6 +230,8 @@ impl Default for GlobalConfig {
 pub(crate) struct ResolvedRunConfig {
     pub(crate) provenance: BTreeMap<String, String>,
     pub(crate) tunnel: bool,
+    pub(crate) ngrok: bool,
+    pub(crate) ngrok_url: Option<String>,
     pub(crate) worktree: Option<crate::worktree::Identity>,
     pub(crate) hostname: String,
     pub(crate) command: Vec<OsString>,
@@ -332,6 +338,13 @@ fn write_global_at(path: &Path, config: &GlobalConfig, force: bool) -> Result<()
 }
 
 fn validate_global(config: &GlobalConfig) -> Result<(), Error> {
+    config
+        .ngrok
+        .validate()
+        .map_err(|reason| Error::InvalidGlobal {
+            field: "ngrok",
+            reason,
+        })?;
     config
         .cloudflare
         .validate()
@@ -470,6 +483,7 @@ pub(crate) fn merge_project(
         worktree: local.worktree.or(base.worktree),
         command: local.command.or(base.command),
         tls: local.tls.or(base.tls),
+        ngrok_url: local.ngrok_url.or(base.ngrok_url),
         tunnel: local.tunnel.or(base.tunnel),
         tailscale: local.tailscale.or(base.tailscale),
         funnel: local.funnel.or(base.funnel),
@@ -506,6 +520,7 @@ pub(crate) fn merge_run(
         command: None,
         tls: None,
         tunnel: None,
+        ngrok_url: None,
         tailscale: None,
         funnel: None,
         lan: None,
@@ -592,8 +607,30 @@ pub(crate) fn merge_run(
     } else {
         arguments.command.clone()
     };
-    let tunnel = !arguments.no_tunnel
-        && (arguments.tunnel.is_some() || project.tunnel == Some(TunnelChoice::Cloudflare));
+    let choice = if arguments.no_tunnel {
+        TunnelChoice::None
+    } else {
+        match arguments.tunnel.as_deref() {
+            Some("ngrok") => TunnelChoice::Ngrok,
+            Some("cloudflare") => TunnelChoice::Cloudflare,
+            _ => project.tunnel.unwrap_or(TunnelChoice::None),
+        }
+    };
+    let tunnel = choice != TunnelChoice::None;
+    let ngrok = choice == TunnelChoice::Ngrok;
+    let ngrok_url = arguments.ngrok_url.clone().or(project.ngrok_url);
+    if arguments.ngrok_url.is_some() && !ngrok {
+        return Err(Error::InvalidGlobal {
+            field: "ngrok_url",
+            reason: "--ngrok-url requires --tunnel ngrok or tunnel='ngrok'".into(),
+        });
+    }
+    if ngrok && let Some(url) = &ngrok_url {
+        crate::ngrok::validate_url(url).map_err(|reason| Error::InvalidGlobal {
+            field: "ngrok_url",
+            reason,
+        })?;
+    }
     if !tunnel
         && command
             .iter()
@@ -601,7 +638,7 @@ pub(crate) fn merge_run(
     {
         return Err(Error::InvalidGlobal {
             field: "command",
-            reason: "{tunnel_url} requires --tunnel cloudflare".into(),
+            reason: "{tunnel_url} requires an enabled tunnel".into(),
         });
     }
     let funnel = !arguments.no_tailscale
@@ -626,6 +663,8 @@ pub(crate) fn merge_run(
     Ok(ResolvedRunConfig {
         provenance,
         tunnel,
+        ngrok,
+        ngrok_url,
         worktree,
         hostname,
         command,
@@ -1538,6 +1577,7 @@ mod tests {
         ProjectConfig {
             provenance: Default::default(),
             tunnel: None,
+            ngrok_url: None,
             worktree: None,
             format_version: 1,
             name: Some("project".into()),
@@ -1588,4 +1628,5 @@ mod tests {
 enum TunnelChoice {
     None,
     Cloudflare,
+    Ngrok,
 }
