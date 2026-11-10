@@ -1,0 +1,75 @@
+name: Agent skill CI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ci-agent-skills.yml'
+      - 'skills/nook/**'
+      - 'docs/AGENT_USAGE.md'
+      - 'tests/agent_skill_contract.mjs'
+      - 'tests/agent_skills/**'
+      - 'src/**'
+      - 'packages/nook-run/bin/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  pull_request:
+    paths:
+      - '.github/workflows/ci-agent-skills.yml'
+      - 'skills/nook/**'
+      - 'docs/AGENT_USAGE.md'
+      - 'tests/agent_skill_contract.mjs'
+      - 'tests/agent_skills/**'
+      - 'src/**'
+      - 'packages/nook-run/bin/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    strategy:
+      matrix:
+        os: [ubuntu-26.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Build Nook
+        run: cargo build --locked
+      - name: Validate portable skill and CLI contracts
+        run: node --test tests/agent_skill_contract.mjs
+      - name: Install Caddy on Linux
+        if: runner.os == 'Linux'
+        run: |
+          curl --fail --silent --show-error --location https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz --output /tmp/caddy.tar.gz
+          tar --extract --gzip --file /tmp/caddy.tar.gz --directory "$HOME/.cargo/bin" caddy
+      - name: Install Caddy on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'caddy.zip'
+          $directory = Join-Path $env:RUNNER_TEMP 'caddy'
+          Invoke-WebRequest -Uri https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_windows_amd64.zip -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $directory
+          $directory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Linux isolated lifecycle smoke
+        if: runner.os == 'Linux'
+        run: |
+          # This disposable runner has no shared Caddy; permit its loopback port 80.
+          sudo sysctl --write net.ipv4.ip_unprivileged_port_start=0
+          NOOK_AGENT_E2E=1 node --test tests/agent_skill_contract.mjs
+      - name: Windows native lifecycle smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:NOOK_AGENT_E2E = '1'
+          node --test tests/agent_skill_contract.mjs

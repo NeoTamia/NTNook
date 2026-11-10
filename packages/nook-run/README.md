@@ -56,3 +56,8 @@ separator that Bun removes from JavaScript arguments.
 When Nook is not installed, `nook-run` prints a warning and runs the command after `--` directly.
 This lets the project start on a new development machine without Nook's local domains or HTTPS
 features. Native Nook installations on Linux and Windows are discovered through `PATH`.
+
+Inside a workspace session, a missing Nook executable refuses direct fallback. An invalid
+or expired session also fails explicitly. An installed Nook returning an error never
+triggers fallback. See the [agent usage guide](https://github.com/NeoTamia/NTNook/blob/dev/docs/AGENT_USAGE.md)
+for the portable Nook skill, readiness checks, and owned cleanup.

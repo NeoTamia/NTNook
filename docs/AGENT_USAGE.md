@@ -1,0 +1,104 @@
+# Use Nook with coding agents
+
+Install the portable [Nook skill](../skills/nook/SKILL.md) in the **project that
+uses Nook**. It teaches application launch, URL discovery, testing, diagnosis
+and owned cleanup. It is not a contribution guide for the NTNook repository.
+Caddy and its CA remain a one-time machine setup; normal usage is `nook run`.
+
+## Install and discover
+
+Copy the whole `skills/nook` directory from a reviewed NTNook checkout or source
+archive containing this file. Pin that source to a commit or release; do not
+silently refresh from `dev`. No release tag is claimed to contain this new skill
+yet. Its runtime contract baseline is recorded in the skill metadata; installed
+Nook capabilities must still be checked with `--version` and `run --help`.
+
+| Harness | Project destination | Personal destination |
+| --- | --- | --- |
+| Codex | `.agents/skills/nook` | `~/.agents/skills/nook` |
+| Claude Code | `.claude/skills/nook` | `~/.claude/skills/nook` |
+| OpenCode | `.opencode/skills/nook` (also accepts `.agents/skills`) | `~/.config/opencode/skills/nook` |
+
+Example from the consuming project, with a local reviewed checkout at
+`../NTNook`. Choose one destination for each harness, avoiding duplicate copies
+of the same skill within its discovery paths.
+
+```sh
+destination=.agents/skills/nook
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+  echo "Skill already exists; review it before updating" >&2
+else
+  mkdir -p "$(dirname "$destination")"
+  cp -R ../NTNook/skills/nook "$destination"
+fi
+```
+
+```powershell
+$destination = '.agents/skills/nook'
+if (Test-Path -LiteralPath $destination) {
+    throw 'Skill already exists; review it before updating'
+}
+New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+Copy-Item -LiteralPath '../NTNook/skills/nook' -Destination $destination -Recurse
+```
+
+Copies work without symlink privileges on Windows. To update, compare the
+installed folder against the selected source and replace only that installation
+after reviewing local edits. To uninstall, remove only the skill you installed;
+no Nook state or application configuration needs removing.
+
+The optional external `skills` CLI can install from that local checkout:
+
+```sh
+npx skills add ../NTNook --list
+npx skills add ../NTNook --skill nook --agent codex claude-code opencode --copy
+```
+
+It is not a Nook command or required dependency. Once a containing revision is
+published, its documented `owner/repo@tag-or-sha` source syntax can pin a remote
+installation. Do not advertise a containing release or marketplace listing
+until verified. See the [installer's official reference](https://github.com/vercel-labs/skills/blob/main/docs/commands.md).
+
+Verify that the harness lists `nook`, invoke it once, and confirm it can open a
+bundled reference. Codex can use `$nook`; Claude Code can use `/nook`; other
+harnesses use their own skill selector or natural-language discovery. Local
+folders are not automatically available in cloud sessions. Check the official
+[Codex](https://learn.chatgpt.com/docs/build-skills),
+[Claude Code](https://code.claude.com/docs/en/skills), and
+[OpenCode](https://opencode.ai/docs/skills/) discovery rules (checked 2026-11-11).
+
+Without skill support, ask the agent to read `SKILL.md` explicitly. An optional
+pointer in the consuming project's existing instructions can say:
+
+> To launch, test, or diagnose this project's apps with Nook, read the installed
+> Nook SKILL.md and only the references relevant to the task.
+
+Supply the actual installed path; preserve the project's other instructions.
+Installing the skill does not authorize changing scripts, Caddy, CA trust or
+network exposure.
+
+## Start small
+
+Try: “Use Nook to start this app, verify its actual URL, run the existing E2E
+command, then stop only the session you created.” The entrypoint routes to
+configuration, workspaces/worktrees, verification or recovery on demand.
+
+See [workspace runner details](WORKSPACES.md), [Docker setup](DOCKER.md), and
+the [main setup guide](../README.md#prepare-caddy-for-nook) only when needed.
+The [evaluation scenarios](../tests/agent_skills/scenarios.md) distinguish tested
+behavior from future evaluation work. No provider-specific metadata, plugins,
+hooks or MCP server are required by this skill.
+
+## Capability boundary
+
+The current workflow uses existing CLI text output and lifecycle commands.
+Structured JSON/URL discovery, MCP, doctor, Compose orchestration and additional
+managed tunnels are separate future milestones, not available commands. JSON
+needs a versioned output/error contract first; MCP would need explicit operation
+permissions; doctor must separate diagnosis from repair. Compose and additional
+tunnels require separate ownership and exposure designs.
+
+Existing LAN, standalone Tailscale Serve and Funnel are already documented in
+Nook. They are not those future milestones. Serve is not supported for multi-app
+workspaces; Funnel is excluded from worktree mode. The skill preserves those
+limits and never turns Nook into a Caddy service manager.

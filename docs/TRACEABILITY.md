@@ -39,7 +39,7 @@ This matrix links product requirements to implementation tickets and checks trac
 | `nook update` replaces a GitHub binary after SHA-256 verification; a cached check warns when a newer version exists | post-MVP | `update::tests::*`, `cli_update` tests |
 | Package-manager-neutral JavaScript wrapper reports a missing Nook and preserves arguments, exit codes, and signals | post-MVP | `packages/nook-run/test`; Node 22/24 and npm/pnpm/Yarn/Bun CI jobs |
 | Conservative Vite/Nuxt/Astro CLI alignment (argv on the framework binary only; base env for Bun, Elysia, and undetected commands) | NOOK-62, NOOK-72, NOOK-71, NOOK-67, NOOK-69, NOOK-73, NOOK-68 | `framework::tests::*`; `process::tests::undetected_command_keeps_argv_and_base_environment`; `config::tests::framework_*`; `tests/cli_framework.rs`; `tests/framework_dev_server.rs` |
-| Opt-in private Tailscale Serve: prerequisites before spawn, 443-then-8443 concurrent-safe ports, `NOOK_TAILSCALE_URL`, run/alias lifecycle, crash and down/up recovery, no Funnel, reset, ACL change, or foreign-registration change | NOOK-6, NOOK-37, NOOK-39, NOOK-40, NOOK-42, NOOK-63 | `tailscale::tests::*`, `state::tests::v1_registry_*`, `process::tests::*exposure*`, `cli::tests::*tailscale*`; `tests/tailscale_serve.rs` (fake CLI, Linux and Windows) |
+| Opt-in private Tailscale Serve: prerequisites before spawn, 443-then-8443 concurrent-safe ports, `NOOK_TAILSCALE_URL`, run/alias lifecycle, crash and down/up recovery, no implicit Funnel, reset, ACL change, or foreign-registration change | NOOK-6, NOOK-37, NOOK-39, NOOK-40, NOOK-42, NOOK-63 | `tailscale::tests::*`, `state::tests::v1_registry_*`, `process::tests::*exposure*`, `cli::tests::*tailscale*`; `tests/tailscale_serve.rs` (fake CLI, Linux and Windows) |
 | Version 2 multi-app manifests, member overrides and pre-spawn URL interpolation | NOOK-61, NOOK-70, NOOK-65 | `workspace_config::tests`, `workspace::tests`, `tests/workspace.rs` |
 | Native workspace process groups, prefixed logs, individual leases and group cleanup | NOOK-61, NOOK-66, NOOK-64 | `tests/workspace.rs`; existing single-app process tests |
 | Existing package wrappers join an inherited workspace session without duplicate routes or app launches | NOOK-78 | Session tests and `tests/workspace_runners.mjs` |
@@ -76,3 +76,11 @@ Integration tests are isolated in temporary directories, use Caddy `2.11.x`, ins
   The shared config/identity tests run on Windows too; this process/network scenario
   is Unix-only. External tunnel provisioning is outside Nook; Funnel is excluded
   from worktree mode. See `docs/WORKSPACES.md` for the network contract.
+
+## Consumer agent skill
+
+- `skills/nook`: portable consumer workflows, distinct from contribution instructions.
+- `tests/agent_skill_contract.mjs`: copied reference integrity, real CLI/config contracts,
+  and opt-in Linux/Windows Caddy smoke for standalone, native and runner launches.
+- `tests/agent_skills/scenarios.md`: behavioral evaluation rubric; deterministic checks
+  do not imply that live harness evaluations have been performed.
