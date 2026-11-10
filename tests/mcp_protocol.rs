@@ -378,13 +378,32 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
                 .success()
         );
     }
+    if cfg!(windows) {
+        // Hosted Windows reserves port 80 (Winsock 10013). Use the same native
+        // HTTPS listener as the existing Windows Caddy integration tests.
+        caddy_alias_lifecycle(true);
+    } else {
+        caddy_alias_lifecycle(false);
+        caddy_alias_lifecycle(true);
+    }
+}
+
+fn caddy_alias_lifecycle(tls: bool) {
     let fixture = Fixture::new();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let admin = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
     fixture.global(&admin);
     let foreign = json!({"@id":"foreign-test","match":[{"host":["foreign.localhost"]}],"handle":[{"handler":"static_response","body":"foreign stays"}],"terminal":true});
-    let config = json!({"admin":{"listen":admin.trim_start_matches("http://")},"apps":{"http":{"servers":{"http":{"listen":["127.0.0.1:80"],"routes":[foreign.clone()]}}}}});
+    let frontend = if tls { "127.0.0.1:443" } else { "127.0.0.1:80" };
+    let mut config = json!({"admin":{"listen":admin.trim_start_matches("http://")},"apps":{"http":{"servers":{"http":{"listen":[frontend],"routes":[foreign.clone()]}}}}});
+    if tls {
+        config["apps"]["http"]["servers"]["http"]["automatic_https"] =
+            json!({"disable_redirects":true});
+        config["apps"]["pki"] =
+            json!({"certificate_authorities":{"local":{"install_trust":false}}});
+        config["apps"]["tls"] = json!({"automation":{"policies":[{"subjects":["db.localhost","foreign.localhost"],"issuers":[{"module":"internal"}]}]}});
+    }
     let path = fixture.root.join("caddy.json");
     fs::write(&path, config.to_string()).unwrap();
     struct Caddy(Child);
@@ -396,8 +415,8 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
     }
     let log_path = fixture.root.join("caddy-startup.log");
     let log = fs::File::create(&log_path).unwrap();
-    let http_guard = std::net::TcpListener::bind("127.0.0.1:80")
-        .expect("isolated Caddy test requires an available HTTP port 80");
+    let http_guard = std::net::TcpListener::bind(frontend)
+        .expect("isolated Caddy test requires an available frontend listener");
     drop(http_guard);
     let mut caddy = Caddy(
         Command::new(if cfg!(windows) { "caddy.exe" } else { "caddy" })
@@ -442,7 +461,7 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
     assert_eq!(
         client.call(
             "nook_alias_set",
-            json!({"hostname":"foreign.localhost","target":3000,"tls":false})
+            json!({"hostname":"foreign.localhost","target":3000,"tls":tls})
         )["error"]["code"],
         "FOREIGN_ROUTE"
     );
@@ -471,31 +490,68 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
             }
         }
     });
-    let args = json!({"hostname":"db.localhost","target":port,"tls":false,"preserve_host":true});
+    let args = json!({"hostname":"db.localhost","target":port,"tls":tls,"preserve_host":true});
     let created = client.call("nook_alias_set", args.clone());
     assert_eq!(created["ok"], true, "{created}");
     let owner = created["data"]["entry"]["resource_id"].clone();
     let same = client.call("nook_alias_set", args);
     assert_eq!(same["data"]["changed"], false, "{same}");
     assert_eq!(same["data"]["entry"]["resource_id"], owner);
-    let mut response = ureq::get("http://127.0.0.1/")
-        .header("Host", "db.localhost")
-        .call()
-        .unwrap();
-    assert_eq!(response.body_mut().read_to_string().unwrap(), "mcp-e2e");
+    if tls {
+        // Trust only this fixture CA for this curl request; never install it.
+        let ca: Value = ureq::get(format!("{admin}/pki/ca/local"))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+        let ca_path = fixture.root.join("root.pem");
+        fs::write(&ca_path, ca["root_certificate"].as_str().unwrap()).unwrap();
+        let output = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" })
+            .args([
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--noproxy",
+                "*",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "10",
+                "--resolve",
+                "db.localhost:443:127.0.0.1",
+                "--cacert",
+            ])
+            .arg(ca_path)
+            .arg("https://db.localhost/")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"mcp-e2e");
+    } else {
+        let mut response = ureq::get("http://127.0.0.1/")
+            .header("Host", "db.localhost")
+            .call()
+            .unwrap();
+        assert_eq!(response.body_mut().read_to_string().unwrap(), "mcp-e2e");
+    }
     worker.join().unwrap();
     // Simulate a crash after persisting alias intent, before applying the route.
     let mut interrupted: Value =
         serde_json::from_slice(&fs::read(fixture.registry()).unwrap()).unwrap();
     let operation = Uuid::new_v4().to_string();
-    interrupted["pending_operations"] = json!([{"id":operation,"kind":{"kind":"restore_route","hostname":"db.localhost","target":format!("http://127.0.0.1:{port}/"),"scheme":"http","owner_id":owner,"tls":false}}]);
+    interrupted["pending_operations"] = json!([{"id":operation,"kind":{"kind":"restore_route","hostname":"db.localhost","target":format!("http://127.0.0.1:{port}/"),"scheme":"http","owner_id":owner,"tls":tls}}]);
     fs::write(fixture.registry(), interrupted.to_string()).unwrap();
     ureq::patch(format!("{admin}/config/apps/http/servers/http/routes"))
         .send_json(json!([foreign.clone()]))
         .unwrap();
     let recovered = client.call(
         "nook_alias_set",
-        json!({"hostname":"db.localhost","target":port,"tls":false,"preserve_host":true}),
+        json!({"hostname":"db.localhost","target":port,"tls":tls,"preserve_host":true}),
     );
     assert_eq!(recovered["ok"], true, "{recovered}");
     assert_eq!(recovered["data"]["entry"]["resource_id"], owner);
@@ -511,7 +567,11 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
     assert_eq!(listed["data"]["entries"].as_array().unwrap().len(), 1);
     assert_eq!(
         client.call("nook_url", json!({"hostname":"db.localhost"}))["data"]["url"],
-        "http://db.localhost"
+        if tls {
+            "https://db.localhost"
+        } else {
+            "http://db.localhost"
+        }
     );
     client.call("nook_status", json!({"detail":"full"}));
     assert_eq!(fs::read(fixture.registry()).unwrap(), state_before);
@@ -530,7 +590,7 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
     assert_eq!(
         client.call(
             "nook_alias_set",
-            json!({"hostname":"db.localhost","target":9999,"tls":false})
+            json!({"hostname":"db.localhost","target":9999,"tls":tls})
         )["error"]["code"],
         "CONFLICT"
     );
@@ -545,7 +605,7 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
         .as_object_mut()
         .unwrap()
         .remove("db.localhost");
-    interrupted["pending_operations"] = json!([{"id":Uuid::new_v4().to_string(),"kind":{"kind":"remove_route","hostname":"db.localhost","owner_id":owner,"tls":false}}]);
+    interrupted["pending_operations"] = json!([{"id":Uuid::new_v4().to_string(),"kind":{"kind":"remove_route","hostname":"db.localhost","owner_id":owner,"tls":tls}}]);
     fs::write(fixture.registry(), interrupted.to_string()).unwrap();
     let removed = client.call(
         "nook_alias_remove",

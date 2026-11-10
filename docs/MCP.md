@@ -218,5 +218,7 @@ or MCP prune. There is no dependency on an unpublished doctor or skill implement
 wire calls, generated output schemas, three protocol versions, CLI JSON, commandless
 workspace URL lookup, worktree identity filtering, pagination, cancellation and a
 real Caddy alias lifecycle. Linux runs the real-Caddy case in an isolated network
-namespace unless `NOOK_E2E_DIRECT=1`; Windows uses native `caddy.exe`. Tests create
+namespace unless `NOOK_E2E_DIRECT=1` and covers HTTP and HTTPS. Windows uses native
+`caddy.exe` on HTTPS port 443 because hosted runners reserve HTTP port 80. HTTPS
+requests use the fixture CA via curl `--cacert`, without installing it. Tests create
 only temporary configuration/state and never install a CA.
