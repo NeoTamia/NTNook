@@ -398,9 +398,12 @@ pub(crate) fn execute(
     }
     inspect_ca(&mut report, args.ca_cert.as_deref());
     let tailscale_required = desired.iter().any(|c| c.tailscale)
-        || registry
-            .as_ref()
-            .is_some_and(|r| !r.tailscale.registrations.is_empty());
+        || registry.as_ref().is_some_and(|r| {
+            r.tailscale
+                .registrations
+                .values()
+                .any(|registration| args.owner.is_none_or(|id| id == registration.owner_id))
+        });
     if tailscale_required {
         let deadline = report.deadline;
         let complete = crate::tailscale::doctor(
@@ -408,6 +411,7 @@ pub(crate) fn execute(
                 report.add(id, Value::Null, status, reason, message, evidence)
             },
             registry.as_ref(),
+            args.owner,
             deadline,
         );
         report.complete &= complete;
@@ -1194,7 +1198,12 @@ fn deep_checks(
             && let Some(result) = report.probe(
                 "upstream.tcp",
                 doctor_io::Probe::Tcp(
-                    target.url.host_str().unwrap().into(),
+                    target
+                        .url
+                        .host_str()
+                        .unwrap()
+                        .trim_matches(['[', ']'])
+                        .into(),
                     target.url.port_or_known_default().unwrap(),
                 ),
                 2000,

@@ -45,6 +45,7 @@ const DOWNLOAD_URL: &str = "https://tailscale.com/download";
 pub(crate) fn doctor(
     emit: &mut impl FnMut(&str, crate::doctor::Status, &str, String, Value),
     registry: Option<&Registry>,
+    owner: Option<Uuid>,
     deadline: Instant,
 ) -> bool {
     use crate::doctor::Status;
@@ -141,7 +142,12 @@ pub(crate) fn doctor(
                 Value::Null,
             );
         }
-        for (port, registration) in &registry.tailscale.registrations {
+        for (port, registration) in registry
+            .tailscale
+            .registrations
+            .iter()
+            .filter(|(_, registration)| owner.is_none_or(|id| id == registration.owner_id))
+        {
             let observation = serve
                 .as_ref()
                 .zip(dns.as_deref())

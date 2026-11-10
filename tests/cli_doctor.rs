@@ -1,7 +1,7 @@
 //! Diagnostic safety is verified at the process boundary on Linux and Windows.
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -53,9 +53,7 @@ impl Fixture {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
-                let mut bytes = [0; 4096];
-                let size = stream.read(&mut bytes).unwrap_or(0);
-                let request = String::from_utf8_lossy(&bytes[..size])
+                let request = read_request_headers(&mut stream)
                     .lines()
                     .next()
                     .unwrap_or("")
@@ -66,11 +64,11 @@ impl Fixture {
                 } else {
                     "{}".into()
                 };
-                let _ = write!(
-                    stream,
+                let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: snapshot\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         Self {
@@ -130,6 +128,16 @@ impl Fixture {
                 .iter()
                 .all(|r| r.starts_with("GET /config/ "))
         );
+    }
+}
+fn read_request_headers(stream: &mut std::net::TcpStream) -> String {
+    let mut reader = BufReader::new(stream);
+    let mut headers = String::new();
+    loop {
+        let start = headers.len();
+        if reader.read_line(&mut headers).unwrap_or(0) == 0 || &headers[start..] == "\r\n" {
+            return headers;
+        }
     }
 }
 impl Drop for Fixture {
@@ -323,9 +331,7 @@ fn bounded_worker_does_not_follow_redirects_or_get_application_bodies() {
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = [0; 4096];
-        let n = stream.read(&mut buffer).unwrap();
-        assert!(String::from_utf8_lossy(&buffer[..n]).starts_with("HEAD / HTTP/1.1"));
+        assert!(read_request_headers(&mut stream).starts_with("HEAD / HTTP/1.1"));
         stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/side-effect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
     });
     let output = Command::new(env!("CARGO_BIN_EXE_nook"))
@@ -487,4 +493,132 @@ esac
     );
     assert_eq!(fs::read(fixture.state()).unwrap(), before);
     fixture.assert_read_only();
+}
+
+#[test]
+fn deep_inspection_connects_to_ipv6_upstream() {
+    let fixture = Fixture::new();
+    let owner = fixture.alias();
+    let listener = TcpListener::bind("[::1]:0").unwrap();
+    let mut registry: Value = serde_json::from_slice(&fs::read(fixture.state()).unwrap()).unwrap();
+    registry["aliases"]["api.localhost"]["target"] =
+        json!(format!("http://{}", listener.local_addr().unwrap()));
+    fixture.write_state(&registry);
+    let before = fs::read(fixture.state()).unwrap();
+    let (_, report) = fixture.doctor(&["--owner", &owner.to_string(), "--deep"]);
+    assert_eq!(check(&report, "upstream.tcp")["status"], "pass", "{report}");
+    assert_eq!(fs::read(fixture.state()).unwrap(), before);
+    fixture.assert_read_only();
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_selection_scopes_tailscale_requirements_and_registrations() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let owner = fixture.alias();
+    let other = uuid::Uuid::new_v4();
+    let mut registry: Value = serde_json::from_slice(&fs::read(fixture.state()).unwrap()).unwrap();
+    registry["tailscale"] = json!({"dns_name":"device.example.ts.net", "registrations":{"8444":{"owner_id":other,"hostname":"other.localhost","target":"http://127.0.0.1:4000","funnel":false}}});
+    fixture.write_state(&registry);
+    let script = fixture.root.join("tailscale");
+    let log = fixture.root.join("calls");
+    fs::write(&script, r#"#!/bin/sh
+echo "$*" >> "$DOCTOR_LOG"
+case "$*" in
+  version) echo '1.90.0' ;;
+  'status --json') echo '{"BackendState":"Running","Self":{"DNSName":"device.example.ts.net"},"CertDomains":["device.example.ts.net"]}' ;;
+  'serve status --json') echo '{"TCP":{"8443":{"HTTPS":true}},"Web":{"device.example.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}' ;;
+  *) exit 99 ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let inspect = |selected: bool| {
+        let mut command = fixture.command();
+        command
+            .env("NOOK_TAILSCALE", &script)
+            .env("DOCTOR_LOG", &log)
+            .args(["doctor", "--json"]);
+        if selected {
+            command.args(["--owner", &owner.to_string()]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.stderr.is_empty());
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let before = fs::read(fixture.state()).unwrap();
+    let report = inspect(true);
+    assert_eq!(
+        check(&report, "tailscale")["reason_code"],
+        "not_configured",
+        "{report}"
+    );
+    assert!(
+        !log.exists(),
+        "unselected registration must not invoke Tailscale"
+    );
+    assert_eq!(fs::read(fixture.state()).unwrap(), before);
+
+    registry["tailscale"]["registrations"]["8443"] = json!({"owner_id":owner,"hostname":"api.localhost","target":"http://127.0.0.1:3000","funnel":false});
+    fixture.write_state(&registry);
+    let before = fs::read(fixture.state()).unwrap();
+    let report = inspect(true);
+    let registrations: Vec<_> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["id"] == "tailscale.registration")
+        .collect();
+    assert_eq!(registrations.len(), 1, "{report}");
+    assert_eq!(registrations[0]["status"], "pass");
+    assert_eq!(registrations[0]["evidence"]["owner_id"], owner.to_string());
+    let all = inspect(false);
+    assert!(
+        all["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "tailscale.registration"
+                && c["evidence"]["owner_id"] == other.to_string()
+                && c["reason_code"] == "registration_missing")
+    );
+    assert_eq!(fs::read(fixture.state()).unwrap(), before);
+    fixture.assert_read_only();
+}
+
+#[test]
+fn fixture_waits_for_complete_request_headers() {
+    let fixture = Fixture::new();
+    let config = fs::read_to_string(fixture.root.join("config/nook/config.toml")).unwrap();
+    let address = config
+        .split("http://")
+        .nth(1)
+        .unwrap()
+        .split('\'')
+        .next()
+        .unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    stream.write_all(b"GET /config/ HTTP/1.1\r\n").unwrap();
+    let error = stream
+        .read(&mut [0; 1])
+        .expect_err("fixture replied before headers finished");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    stream.write_all(b"Host: localhost\r\n\r\n").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    let body = response.split_once("\r\n\r\n").unwrap().1;
+    assert_eq!(
+        serde_json::from_str::<Value>(body).unwrap(),
+        *fixture.config.lock().unwrap()
+    );
 }
