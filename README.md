@@ -3,6 +3,8 @@
 Nook is a Linux and Windows CLI that exposes local applications under stable `*.localhost`
 domains by configuring an existing Caddy instance.
 
+For coding agents using Nook in their projects, see the [portable skill and installation guide](docs/AGENT_USAGE.md).
+
 ## Requirements and installation
 
 - Linux x86-64 or Windows x86-64;
@@ -338,7 +340,7 @@ LAN access can be combined with Tailscale Serve (`--tailscale`) or Funnel (`--fu
 ### JavaScript package scripts
 
 JavaScript projects can use `@neotamia/nook-run` to provide a package-manager-independent `dev`
-script with an actionable error when the system `nook` executable is missing:
+script with a direct-command fallback when the system `nook` executable is missing:
 
 ```sh
 pnpm add --save-dev @neotamia/nook-run
@@ -359,6 +361,9 @@ The wrapper passes its arguments directly to `nook run`, inherits the terminal a
 forwards interruption signals, and preserves Nook's exit code. It has no dependencies or install
 hooks and never downloads Nook or Caddy. Nook must still be installed separately and available in
 `PATH`. The wrapper requires Node.js 22 or newer and invokes `nook` or `nook.exe` through `PATH`.
+If the executable is missing outside a workspace session, it warns and runs the command
+after `--` directly, without Nook domains or HTTPS. With a workspace session marker, it
+refuses unmanaged fallback. An error from an installed Nook never triggers fallback.
 
 ## Monorepo workspaces
 
