@@ -71,7 +71,7 @@ test('installed copy is self-contained and uses portable skill metadata', async 
 
 test('documented CLI forms parse and contradictory options fail', async (t) => {
   const { root, config, command } = await fixture(t);
-  assert.equal(command(['config', 'path']).stdout.trim(), config);
+  assert.equal(path.normalize(command(['config', 'path']).stdout.trim()), config);
   for (const args of [
     ['run', '--name', 'web'], ['run', '--config', 'configs/dev.toml', '--local'],
     ['run', '--runner'], ['run', '--only', 'api'], ['run', '--worktree=agent-a'],
