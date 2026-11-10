@@ -104,12 +104,13 @@ pub(crate) fn resolve(
 }
 
 fn git_path(directory: &Path, argument: &str) -> Result<PathBuf, Error> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(["rev-parse", argument])
-        .output()
-        .map_err(|error| Error::InvalidWorktree(format!("cannot run git: {error}")))?;
+    let output = crate::operation::git_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(["rev-parse", argument]),
+    )
+    .map_err(|error| Error::InvalidWorktree(format!("cannot run git: {error}")))?;
     if !output.status.success() {
         return Err(Error::InvalidWorktree(format!(
             "worktree mode requires a Git working tree: {}",

@@ -32,14 +32,18 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Create a project configuration in the current directory.
     Init(InitArgs),
+    /// Serve local MCP tools over stdio without implicit reconciliation.
+    Mcp(crate::api::McpArgs),
+    /// Look up a registered or configured local URL.
+    Url(UrlArgs),
     /// Run a command behind a temporary Nook route.
     Run(RunArgs),
     /// Manage persistent aliases.
     Alias(AliasArgs),
     /// List managed runs and aliases.
-    List,
+    List(ReadArgs),
     /// Diagnose Nook and Caddy state.
-    Status,
+    Status(ReadArgs),
     /// Stop a managed run.
     Stop(StopArgs),
     /// Diagnose Tailscale Serve and Funnel exposure.
@@ -54,6 +58,28 @@ pub(crate) enum Command {
     Completions(CompletionsArgs),
     /// Update the nook binary from GitHub Releases.
     Update(UpdateArgs),
+}
+
+#[derive(Debug, Args, Default)]
+pub(crate) struct ReadArgs {
+    #[arg(long)]
+    pub(crate) read_only: bool,
+    #[arg(long, requires = "read_only")]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UrlArgs {
+    #[command(flatten)]
+    pub(crate) context: crate::api::ContextArgs,
+    #[arg(long, conflicts_with = "app")]
+    pub(crate) hostname: Option<String>,
+    #[arg(long)]
+    pub(crate) app: Option<String>,
+    #[arg(long, value_enum, default_value = "registered")]
+    pub(crate) mode: crate::api::UrlMode,
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -206,6 +232,9 @@ pub(crate) struct CaExportArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RunArgs {
+    /// Resolve routing without requiring a child command (internal observation API).
+    #[arg(skip)]
+    pub(crate) observation: bool,
     /// Isolate this Git worktree; optionally choose its DNS label.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ID", conflicts_with = "no_worktree")]
     pub(crate) worktree: Option<String>,
@@ -285,7 +314,7 @@ pub(crate) enum AliasCommand {
     /// Remove a persistent alias.
     Remove(AliasRemoveArgs),
     /// List persistent aliases.
-    List,
+    List(ReadArgs),
 }
 
 #[derive(Debug, Args)]
@@ -368,6 +397,20 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         caddy_socket,
         command,
     } = cli;
+    let command = match command {
+        Command::Mcp(args) => return crate::mcp::run(args, caddy_socket),
+        Command::Url(args) => return observation_url(args, caddy_socket, output),
+        Command::List(args) if args.read_only => {
+            return observation_read("nook_list", args, caddy_socket, output);
+        }
+        Command::Status(args) if args.read_only => {
+            return observation_read("nook_status", args, caddy_socket, output);
+        }
+        Command::Alias(AliasArgs {
+            command: AliasCommand::List(args),
+        }) if args.read_only => return observation_read("aliases", args, caddy_socket, output),
+        command => command,
+    };
     // Turbo's strict environment may omit XDG configuration variables. Members
     // use the root's explicit store path and never contact Caddy themselves.
     let command = match command {
@@ -422,10 +465,10 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
             command: AliasCommand::Remove(arguments),
         }) => remove_alias_command(arguments, &global, output, errors).map(|()| 0),
         Command::Alias(AliasArgs {
-            command: AliasCommand::List,
+            command: AliasCommand::List(_),
         }) => list_alias_command(output).map(|()| 0),
-        Command::List => list_command(output).map(|()| 0),
-        Command::Status => status_command(&global, output, errors).map(|()| 0),
+        Command::List(_) => list_command(output).map(|()| 0),
+        Command::Status(_) => status_command(&global, output, errors).map(|()| 0),
         Command::Prune => prune_command(&global, output, errors).map(|()| 0),
         Command::Run(arguments) => run_command(arguments, &global, errors),
         Command::Stop(arguments) => stop_command(arguments, output).map(|()| 0),
@@ -435,6 +478,9 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Ca(CaArgs {
             command: CaCommand::Export(arguments),
         }) => ca_export_command(arguments, &global, output).map(|()| 0),
+        Command::Mcp(_) | Command::Url(_) => {
+            unreachable!("observations handled before reconciliation")
+        }
         Command::Config(_) => unreachable!("configuration commands return before loading Caddy"),
         Command::Init(_) | Command::Completions(_) | Command::Update(_) => {
             unreachable!("commands handled before global configuration return above")
@@ -2286,6 +2332,8 @@ fn normalize_shortcuts(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsS
 
 fn is_command(value: &OsStr) -> bool {
     [
+        "mcp",
+        "url",
         "init",
         "run",
         "alias",
@@ -2311,6 +2359,77 @@ fn is_alias_command(value: &OsStr) -> bool {
 
 fn looks_like_option(value: &OsStr) -> bool {
     value.as_encoded_bytes().starts_with(b"-")
+}
+
+fn observation_read(
+    name: &str,
+    args: ReadArgs,
+    socket: Option<String>,
+    output: &mut impl Write,
+) -> crate::Result<i32> {
+    let context = crate::api::Context::new(
+        Default::default(),
+        crate::api::Scope::User,
+        false,
+        Default::default(),
+        socket,
+    )?;
+    let request = if name == "nook_status" {
+        crate::mcp::Request::Status(crate::api::StatusInput {
+            detail: crate::api::Detail::Full,
+            timeout_ms: None,
+        })
+    } else {
+        crate::mcp::Request::List(crate::api::ListInput {
+            kind: if name == "aliases" {
+                crate::api::Kind::Alias
+            } else {
+                crate::api::Kind::All
+            },
+            ..Default::default()
+        })
+    };
+    let budget = crate::operation::Budget::new(15000, Default::default());
+    let value = request.execute(&context, &budget);
+    if args.json {
+        writeln!(output, "{}", value)?;
+    } else {
+        writeln!(output, "{}", serde_json::to_string_pretty(&value).unwrap())?;
+    }
+    Ok(i32::from(
+        value["ok"] != true || value["data"]["health"] == "error",
+    ))
+}
+fn observation_url(
+    args: UrlArgs,
+    socket: Option<String>,
+    output: &mut impl Write,
+) -> crate::Result<i32> {
+    let input = serde_json::json!({ "hostname": args.hostname, "app": args.app, "mode": if args.mode == crate::api::UrlMode::Configured { "configured" } else { "registered" } });
+    let request = crate::mcp::Request::parse("nook_url", input)
+        .map_err(|e| clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.message))?;
+    let context = crate::api::Context::new(
+        args.context,
+        crate::api::Scope::Context,
+        false,
+        Default::default(),
+        socket,
+    )?;
+    let budget = crate::operation::Budget::new(5000, Default::default());
+    let value = request.execute(&context, &budget);
+    if args.json {
+        writeln!(output, "{}", value)?;
+    } else if let Some(url) = value["data"]["url"].as_str() {
+        writeln!(output, "{url}")?;
+    } else {
+        return Err(io::Error::other(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or("URL lookup failed"),
+        )
+        .into());
+    }
+    Ok(i32::from(value["ok"] != true))
 }
 
 #[cfg(test)]
@@ -2691,7 +2810,7 @@ mod tests {
         ] {
             let cli = parse(arguments);
             assert_eq!(cli.caddy_socket.as_deref(), Some("/run/caddy/admin.socket"));
-            assert!(matches!(cli.command, Command::Status));
+            assert!(matches!(cli.command, Command::Status(_)));
         }
 
         assert!(try_parse(&["config", "show", "--caddy-socket", "/tmp/caddy.sock"]).is_err());

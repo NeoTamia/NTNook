@@ -1,10 +1,13 @@
 #![deny(unsafe_code)]
 
+mod api;
 mod caddy;
 mod cli;
 mod config;
 mod framework;
 mod lan;
+mod mcp;
+mod operation;
 mod platform;
 mod process;
 mod reconcile;

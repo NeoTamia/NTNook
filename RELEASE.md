@@ -49,6 +49,16 @@ provenance automatically. The automated job uses pnpm for installation, tests, a
 must invoke `npm publish`: npm Trusted Publishing currently exchanges OIDC credentials only for
 the npm CLI's `publish` and `stage publish` commands.
 
+## Next release: local MCP and read-only JSON
+
+- Add `nook mcp` over stdio with read-only route lookup and diagnostics by default.
+- Allow explicitly granted persistent alias hostnames without force or run ownership transfer.
+- Add `nook url` and `--read-only --json` observations; historical commands retain reconciliation.
+- Support MCP 2026-07-28, 2025-11-25 and 2025-06-18 on Linux and Windows.
+- Keep Caddy lifecycle, certificate installation and application launch outside MCP.
+
+See [the MCP guide](docs/MCP.md) for the v1 contract, client setup and recovery behavior.
+
 ## Delivered features
 
 - supervised launch of a local application under a `*.localhost` domain over HTTPS or HTTP;

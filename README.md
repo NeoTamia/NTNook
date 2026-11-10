@@ -401,6 +401,13 @@ A target can be an integer port or an absolute `http://`/`https://` URL. Credent
 
 By default, the upstream receives its own `Host`. `--preserve-host` retains the requested domain. `X-Forwarded-Host` always retains the `.localhost` hostname.
 
+## Local MCP clients
+
+Run `nook mcp --cwd /absolute/project/path` to expose read-only route lookup and
+diagnostics over stdio. Explicit alias grants can enable persistent alias changes;
+application launch remains `nook run` in your shell. See the [MCP guide](docs/MCP.md)
+for profiles, worktree scopes, client configuration and the versioned JSON contract.
+
 ## Operational commands
 
 ```sh
@@ -838,7 +845,7 @@ persistent aliases, supervised Linux or Windows process trees, and recovery on t
 platform. On Windows, native `caddy.exe` is the primary supported mode; Docker Desktop remains a
 secondary supported mode described in the [Docker guide](docs/DOCKER.md).
 
-Out of scope: a permanent daemon, IPC or a local socket, an implicit shell, modifying the hosts
+Out of scope: a permanent daemon, a network MCP endpoint or local control socket, an implicit shell, modifying the hosts
 file, installing or starting Caddy, automatic CA installation, Docker lifecycle orchestration,
 native macOS support, rewriting framework config files,
 Angular-specific origin allow-lists, and public exposure outside Tailscale Funnel.

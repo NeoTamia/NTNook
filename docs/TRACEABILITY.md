@@ -84,3 +84,12 @@ Integration tests are isolated in temporary directories, use Caddy `2.11.x`, ins
   and opt-in Linux/Windows Caddy smoke for standalone, native and runner launches.
 - `tests/agent_skills/scenarios.md`: behavioral evaluation rubric; deterministic checks
   do not imply that live harness evaluations have been performed.
+
+## MCP observation and scoped alias API
+
+- `tests/mcp_protocol.rs`: independent stdio client, protocol versions, closed inputs,
+  output schema validation, read-only registry behavior, worktree identity scopes,
+  stale cursors, bounded lock/cancellation behavior, CLI JSON and real Caddy alias
+  lifecycle preserving foreign routes and owner UUIDs.
+- Existing Caddy/reconciliation tests continue to cover ETag retries, owner markers,
+  atomic registry writes and crash recovery.
