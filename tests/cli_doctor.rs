@@ -50,6 +50,8 @@ impl Fixture {
                         continue;
                     }
                 };
+                // Winsock inherits the listener's nonblocking mode; reads below wait for headers.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
