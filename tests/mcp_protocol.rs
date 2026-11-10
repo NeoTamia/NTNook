@@ -394,6 +394,11 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
             let _ = self.0.wait();
         }
     }
+    let log_path = fixture.root.join("caddy-startup.log");
+    let log = fs::File::create(&log_path).unwrap();
+    let http_guard = std::net::TcpListener::bind("127.0.0.1:80")
+        .expect("isolated Caddy test requires an available HTTP port 80");
+    drop(http_guard);
     let mut caddy = Caddy(
         Command::new(if cfg!(windows) { "caddy.exe" } else { "caddy" })
             .args(["run", "--config"])
@@ -402,7 +407,7 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
             .env("XDG_DATA_HOME", fixture.root.join("caddy-data"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(log))
             .spawn()
             .unwrap(),
     );
@@ -412,8 +417,17 @@ fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
         if ureq::get(&endpoint).call().is_ok() {
             break;
         }
-        assert!(caddy.0.try_wait().unwrap().is_none(), "Caddy exited");
-        assert!(Instant::now() < deadline);
+        let status = caddy.0.try_wait().unwrap();
+        assert!(
+            status.is_none(),
+            "Caddy exited ({status:?}): {}",
+            fs::read_to_string(&log_path).unwrap_or_default()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "Caddy startup timed out: {}",
+            fs::read_to_string(&log_path).unwrap_or_default()
+        );
         thread::sleep(Duration::from_millis(30));
     }
     let mut client = fixture.spawn(&[
