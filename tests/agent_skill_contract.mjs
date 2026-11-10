@@ -1,13 +1,14 @@
 // cargo build --locked && node --test tests/agent_skill_contract.mjs
 // Real Caddy: NOOK_AGENT_E2E=1 node --test tests/agent_skill_contract.mjs
 // Use an isolated Linux network namespace, or a disposable Windows CI host
-// with loopback port 80 free. Never point this test at a personal Caddy.
+// with loopback port 443 free. Never point this test at a personal Caddy.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { cp, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { get } from 'node:http';
+import { get as getHttps } from 'node:https';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -136,9 +137,10 @@ async function until(check, description) {
   assert.fail(`timed out: ${description}`);
 }
 
-async function http(port, hostname, pathname = '/') {
+async function http(port, hostname, pathname = '/', ca) {
   return new Promise(resolve => {
-    const request = get({ host: '127.0.0.1', port, path: pathname, headers: { Host: hostname }, timeout: 1000 }, response => {
+    const request = (ca ? getHttps : get)({ host: '127.0.0.1', port, path: pathname,
+      headers: { Host: hostname }, servername: hostname, ca, timeout: 1000 }, response => {
       let body = '';
       response.on('data', chunk => { body += chunk; });
       response.on('end', () => resolve({ status: response.statusCode, body }));
@@ -156,12 +158,18 @@ test('real Caddy preserves foreign routes across documented app and workspace la
     await once(server, 'listening');
     const adminPort = server.address().port;
     await new Promise(resolve => server.close(resolve));
-    const caddyConfig = path.join(root, 'caddy.json');
-    await writeFile(caddyConfig, JSON.stringify({ admin: { listen: `127.0.0.1:${adminPort}` }, apps: { http: {
-      servers: { local: { listen: ['127.0.0.1:80'], routes: [
-        { match: [{ host: ['foreign.localhost'] }], handle: [{ handler: 'static_response', body: 'foreign-sentinel' }] },
-      ] } },
-    } } }));
+    const caddyConfig = path.join(root, 'Caddyfile');
+    await writeFile(caddyConfig, `{
+  admin 127.0.0.1:${adminPort}
+  auto_https disable_redirects
+  skip_install_trust
+}
+https://foreign.localhost {
+  bind 127.0.0.1
+  tls internal
+  respond "foreign-sentinel"
+}
+`);
     await writeFile(config, `format_version = 1\ncaddy_admin = "http://127.0.0.1:${adminPort}"\n`);
     const children = [];
     function start(executable, args, cwd = root) {
@@ -191,18 +199,23 @@ test('real Caddy preserves foreign routes across documented app and workspace la
       assert.equal(caddy.exitCode, null, caddy.log);
       return (await http(adminPort, `127.0.0.1:${adminPort}`, '/config/'))?.status === 200;
     }, 'isolated Caddy Admin API');
+    const caFile = path.join(root, 'test-ca.pem');
+    const exported = command(['ca', 'export', caFile]);
+    assert.equal(exported.status, 0, exported.stderr);
+    // Trust only this temporary Caddy CA for these requests, never the host store.
+    const ca = await readFile(caFile);
     const app = `require('node:http').createServer((req,res)=>res.end(JSON.stringify({url:process.env.NOOK_URL,port:process.env.PORT,api:process.env.API_URL}))).listen(Number(process.env.PORT),process.env.HOST);`;
     await writeFile(path.join(root, 'server.js'), app);
     await writeFile(path.join(root, 'nook.toml'), await tomlExample('configuration.md'));
-    const neighbor = start(binary, ['run', '--no-tls', '--name', 'neighbor']);
+    const neighbor = start(binary, ['run', '--name', 'neighbor']);
     const responds = async (hostname) => {
-      const response = await http(80, hostname);
-      return response?.status === 200 && response.body.includes(`http://${hostname}`);
+      const response = await http(443, hostname, '/', ca);
+      return response?.status === 200 && response.body.includes(`https://${hostname}`);
     };
     await until(() => responds('neighbor.localhost'), 'neighbor ready');
-    const standalone = start(binary, ['run', '--no-tls']);
+    const standalone = start(binary, ['run']);
     await until(() => responds('web.localhost'), 'documented standalone ready');
-    assert.match(standalone.log, /domain=web\.localhost url=http:\/\/web\.localhost port=\d+/);
+    assert.match(standalone.log, /domain=web\.localhost url=https:\/\/web\.localhost port=\d+/);
     assert.equal(command(['stop', 'web.localhost']).status, 0);
     await until(() => standalone.exitCode !== null || standalone.signalCode !== null, 'standalone stopped');
 
@@ -222,12 +235,12 @@ for(const child of children)child.on('exit',code=>process.exit(code??1));`);
     delete env[pathKey];
     env.PATH = `${path.dirname(binary)}${path.delimiter}${inheritedPath}`;
     await writeFile(path.join(root, 'nook.toml'), await tomlExample('workspaces.md'));
-    const missingApp = command(['run', '--no-tls', '--worktree=agent-a', '--only', 'web']);
+    const missingApp = command(['run', '--worktree=agent-a', '--only', 'web']);
     assert.notEqual(missingApp.status, 0);
     assert.match(missingApp.stderr, /api/);
     assert.doesNotMatch(command(['list']).stdout, /agent-a\.shop\.localhost/);
     for (const runner of [false, true]) {
-      const args = ['run', '--no-tls', '--worktree=agent-a'];
+      const args = ['run', '--worktree=agent-a'];
       if (runner) args.push('--runner', '--', 'node', 'runner.mjs');
       const child = start(binary, args);
       const api = 'api.agent-a.shop.localhost';
@@ -236,11 +249,11 @@ for(const child of children)child.on('exit',code=>process.exit(code??1));`);
         assert.equal(child.exitCode, null, child.log);
         return await responds(api) && await responds(web);
       }, `workspace ready (runner=${runner})`);
-      const apiBody = JSON.parse((await http(80, api)).body);
-      const webBody = JSON.parse((await http(80, web)).body);
+      const apiBody = JSON.parse((await http(443, api, '/', ca)).body);
+      const webBody = JSON.parse((await http(443, web, '/', ca)).body);
       assert.notEqual(apiBody.port, webBody.port);
       assert.equal(webBody.api, `http://127.0.0.1:${apiBody.port}`);
-      assert.ok(child.log.includes(`url=http://${web}`), child.log);
+      assert.ok(child.log.includes(`url=https://${web}`), child.log);
       const stopped = command(['stop', api]);
       assert.equal(stopped.status, 0, stopped.stderr);
       await until(() => child.exitCode !== null || child.signalCode !== null, 'workspace exited');
@@ -250,7 +263,7 @@ for(const child of children)child.on('exit',code=>process.exit(code??1));`);
       assert.equal(listed.status, 0, listed.stderr);
       assert.doesNotMatch(listed.stdout, /agent-a\.shop\.localhost/);
       assert.ok(await responds('neighbor.localhost'));
-      assert.equal((await http(80, 'foreign.localhost'))?.body, 'foreign-sentinel');
+      assert.equal((await http(443, 'foreign.localhost', '/', ca))?.body, 'foreign-sentinel');
     }
     assert.equal(command(['stop', 'neighbor.localhost']).status, 0);
     await until(() => neighbor.exitCode !== null || neighbor.signalCode !== null, 'neighbor stopped');
