@@ -422,7 +422,8 @@ nook update --force
 ```
 
 - `list` distinguishes `starting`/`ready` runs from persistent aliases;
-- `status` checks the Admin API, servers, Nook containers, drift, and local CA trust;
+- `status` reconciles managed resources first, then checks the Admin API, servers, Nook containers, remaining drift, and local CA trust;
+- `doctor` inspects without reconciliation, state/cache creation or CA provisioning; use `--json` for agents and `--deep` to explicitly send network probes. See [diagnostics](docs/DIAGNOSTICS.md) for guarantees, checks and exit codes;
 - `stop` gracefully signals the currently managed run's process group (SIGTERM on Unix,
   CTRL_BREAK on Windows);
 - `stop --force` waits up to two seconds, then forcibly terminates the same process tree if it

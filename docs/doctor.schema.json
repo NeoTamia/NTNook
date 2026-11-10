@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Nook doctor report v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "nook_version",
+    "mode",
+    "result",
+    "complete",
+    "exit_code",
+    "context",
+    "duration_ms",
+    "counts",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "nook_version": {
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "quick",
+        "deep_active"
+      ]
+    },
+    "result": {
+      "enum": [
+        "passed",
+        "warning",
+        "failed",
+        "incomplete"
+      ]
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "exit_code": {
+      "enum": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    "context": {
+      "type": "object"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "resource",
+          "status",
+          "reason_code",
+          "message",
+          "evidence",
+          "remediations"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "resource": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "pass",
+              "fail",
+              "warning",
+              "skipped"
+            ]
+          },
+          "reason_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "evidence": {},
+          "remediations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "argv",
+                "mutating",
+                "requires_privilege",
+                "precondition"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "argv": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "mutating": {
+                  "type": "boolean"
+                },
+                "requires_privilege": {
+                  "type": "boolean"
+                },
+                "precondition": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

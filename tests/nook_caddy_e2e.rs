@@ -185,6 +185,23 @@ https://localhost:443 {{
     );
     assert_eq!(https_body(&alias_host), "alias-via-nook");
     harness.reload();
+    let before_doctor = fetch_config(&harness);
+    let before_state = fs::read(state_home.join("nook/state.json")).unwrap();
+    let diagnosis = nook(&config_home, &state_home, &["doctor", "--json"]);
+    assert_eq!(diagnosis.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&diagnosis.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["reason_code"] == "expected_route_absent")
+    );
+    assert_eq!(fetch_config(&harness), before_doctor);
+    assert_eq!(
+        fs::read(state_home.join("nook/state.json")).unwrap(),
+        before_state
+    );
     let list = nook(&config_home, &state_home, &["list"]);
     assert_success(&list);
     assert!(
@@ -194,6 +211,7 @@ https://localhost:443 {{
     );
     assert_eq!(https_body(&alias_host), "alias-via-nook");
     upstream_server.join().unwrap();
+    assert_success(&nook(&config_home, &state_home, &["doctor", "--json"]));
     assert_success(&nook(
         &config_home,
         &state_home,

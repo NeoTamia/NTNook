@@ -49,6 +49,8 @@ export NOOK_DISABLE_UPDATE_CHECK=1
 target/debug/nook status >"$test_root/status.txt" 2>"$test_root/status.err"
 grep -q $'caddy\tok' "$test_root/status.txt"
 grep -q $'caddy_loopback_host\thost.docker.internal' "$test_root/status.txt"
+target/debug/nook doctor --json >"$test_root/doctor.json"
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["schema_version"] == 1 and r["exit_code"] == 0' "$test_root/doctor.json"
 
 target/debug/nook ca export "$test_root/caddy-local-ca.pem" >"$test_root/ca.txt"
 grep -Eq '^sha256=[0-9a-f]{64}$' "$test_root/ca.txt"

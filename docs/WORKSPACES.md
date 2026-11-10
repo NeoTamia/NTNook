@@ -424,3 +424,10 @@ and application files. The worktree integration test starts two real linked
 worktrees concurrently through Caddy in native and runner modes, checks local/LAN
 routing and sibling URLs, rejects collisions, and verifies SIGKILL + prune leaves
 the other worktree serving.
+
+## Read-only diagnostics
+
+Use `nook doctor --json` to inspect configuration and ownership without reconciling
+resources. `--deep` explicitly enables active network probes; local reachability
+does not prove container, LAN or external tunnel reachability. See the
+[diagnostic guide](DIAGNOSTICS.md). `status` still reconciles before reporting.

@@ -164,6 +164,10 @@ struct LockedContext {
 }
 
 fn open_private_file(path: &Path, create_new: bool) -> crate::Result<File> {
+    open_private_file_mode(path, create_new, false)
+}
+
+fn open_private_file_mode(path: &Path, create_new: bool, read_only: bool) -> crate::Result<File> {
     if !create_new {
         let metadata = fs::symlink_metadata(path)
             .map_err(|error| invalid(format!("cannot open supplied context: {error}")))?;
@@ -172,7 +176,7 @@ fn open_private_file(path: &Path, create_new: bool) -> crate::Result<File> {
         }
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(create_new);
+    options.read(true).write(!read_only).create_new(create_new);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -197,6 +201,30 @@ fn open_private_file(path: &Path, create_new: bool) -> crate::Result<File> {
         }
     }
     Ok(file)
+}
+
+/// Read only the original recorded session; never claim, repair or clean it.
+pub(crate) fn inspect(group_id: Uuid, group: &WorkspaceGroup) -> crate::Result<serde_json::Value> {
+    let path = recovery_path(group_id, group)?;
+    let lock = open_private_file_mode(&path.with_file_name("context.lock"), false, true)?;
+    lock.try_lock_shared()
+        .map_err(|_| invalid("session lock unavailable"))?;
+    let file = open_private_file_mode(path, false, true)?;
+    if file.metadata()?.len() > MAX_CONTEXT_BYTES {
+        return Err(invalid("session exceeds size limit"));
+    }
+    let context: Context = serde_json::from_reader(file.take(MAX_CONTEXT_BYTES))
+        .map_err(|_| invalid("invalid session JSON"))?;
+    if context.version != VERSION
+        || context.group_id != group_id
+        || context.supervisor.pid != group.supervisor.pid
+        || context.supervisor.process_start_time_ticks != group.supervisor.process_start_time_ticks
+    {
+        return Err(invalid("session identity/version differs from registry"));
+    }
+    Ok(
+        serde_json::json!({"closing": context.closing, "apps": context.apps.iter().map(|a| &a.id).collect::<Vec<_>>(), "members": context.members.iter().map(|m| serde_json::json!({"app_id": m.app_id, "released": m.released, "has_child": m.child.is_some()})).collect::<Vec<_>>()}),
+    )
 }
 
 impl LockedContext {
@@ -824,6 +852,7 @@ impl SessionMember {
             framework_choice(&self.app.framework)?
         };
         Ok(ResolvedRunConfig {
+            provenance: Default::default(),
             worktree: self.app.worktree.clone(),
             hostname: self.app.hostname.clone(),
             command: args.command.clone(),

@@ -4,6 +4,8 @@ mod api;
 mod caddy;
 mod cli;
 mod config;
+mod doctor;
+mod doctor_io;
 mod framework;
 mod lan;
 mod mcp;
