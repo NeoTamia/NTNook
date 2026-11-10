@@ -507,7 +507,13 @@ fn caddy_alias_lifecycle(tls: bool) {
             .unwrap();
         let ca_path = fixture.root.join("root.pem");
         fs::write(&ca_path, ca["root_certificate"].as_str().unwrap()).unwrap();
-        let output = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" })
+        let mut curl = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" });
+        if cfg!(windows) {
+            // The ephemeral Caddy CA has no CRL distribution point. Schannel
+            // must still verify the chain and hostname against root.pem.
+            curl.arg("--ssl-revoke-best-effort");
+        }
+        let output = curl
             .args([
                 "--silent",
                 "--show-error",

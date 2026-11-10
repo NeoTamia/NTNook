@@ -220,5 +220,7 @@ workspace URL lookup, worktree identity filtering, pagination, cancellation and 
 real Caddy alias lifecycle. Linux runs the real-Caddy case in an isolated network
 namespace unless `NOOK_E2E_DIRECT=1` and covers HTTP and HTTPS. Windows uses native
 `caddy.exe` on HTTPS port 443 because hosted runners reserve HTTP port 80. HTTPS
-requests use the fixture CA via curl `--cacert`, without installing it. Tests create
-only temporary configuration/state and never install a CA.
+requests use the fixture CA via curl `--cacert`, without installing it. Windows
+also uses `--ssl-revoke-best-effort` because the ephemeral CA has no CRL
+distribution point; certificate chain and hostname verification remain enabled.
+Tests create only temporary configuration/state and never install a CA.
