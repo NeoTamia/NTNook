@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_REPO: &str = "NeoTamia/NTNook";
-const DEFAULT_RELEASES_URL: &str = "https://api.github.com/repos/NeoTamia/NTNook/releases/latest";
+const DEFAULT_RELEASES_URL: &str = "https://api.github.com/repos/NeoTamia/NTNook/releases";
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const ARCHIVE_NAME: &str = "nook-x86_64-pc-windows-msvc.zip";
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -96,6 +96,10 @@ enum InstallKind {
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     #[serde(default)]
     assets: Vec<GithubAsset>,
 }
@@ -283,27 +287,47 @@ fn cached_latest(latest: String) -> Option<String> {
 }
 
 fn fetch_latest(timeout: Duration) -> Result<Release, Error> {
-    let agent = http_agent(timeout);
-    let url = releases_url();
-    let mut response = agent
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|error| Error::Network(error.to_string()))?;
-    let payload: GithubRelease = response
-        .body_mut()
-        .read_json()
-        .map_err(|error| Error::Network(error.to_string()))?;
-    let version = parse_tag(&payload.tag_name).ok_or_else(|| {
-        Error::Network(format!("unrecognized release tag `{}`", payload.tag_name))
-    })?;
-    Ok(Release {
-        archive_url: asset_url(&payload, ARCHIVE_NAME)
-            .unwrap_or_else(|| github_download_url(&version, ARCHIVE_NAME)),
-        checksum_url: asset_url(&payload, CHECKSUM_NAME)
-            .unwrap_or_else(|| github_download_url(&version, CHECKSUM_NAME)),
-        version,
-    })
+    let started = Instant::now();
+    let mut url =
+        url::Url::parse(&releases_url()).map_err(|error| Error::Network(error.to_string()))?;
+    for page in 1.. {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| Error::Network("release lookup timed out".into()))?;
+        url.set_query(None);
+        url.query_pairs_mut()
+            .append_pair("per_page", "100")
+            .append_pair("page", &page.to_string());
+        let mut response = http_agent(remaining)
+            .get(url.as_str())
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|error| Error::Network(error.to_string()))?;
+        let releases: Vec<GithubRelease> = response
+            .body_mut()
+            .read_json()
+            .map_err(|error| Error::Network(error.to_string()))?;
+        let last_page = releases.len() < 100;
+        for payload in releases {
+            if payload.draft || payload.prerelease {
+                continue;
+            }
+            let Some(version) = parse_tag(&payload.tag_name) else {
+                continue;
+            };
+            return Ok(Release {
+                archive_url: asset_url(&payload, ARCHIVE_NAME)
+                    .unwrap_or_else(|| github_download_url(&version, ARCHIVE_NAME)),
+                checksum_url: asset_url(&payload, CHECKSUM_NAME)
+                    .unwrap_or_else(|| github_download_url(&version, CHECKSUM_NAME)),
+                version,
+            });
+        }
+        if last_page {
+            break;
+        }
+    }
+    Err(Error::Network("no stable Nook release found".into()))
 }
 
 fn download_bytes(url: &str, timeout: Duration) -> Result<Vec<u8>, Error> {

@@ -26,6 +26,7 @@ pub(crate) struct WorkspaceApp {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    worktree: Option<crate::worktree::Setting>,
     format_version: u32,
     name: Option<String>,
     command: Option<Vec<String>>,
@@ -116,6 +117,7 @@ fn load_inner(
                 ));
             }
             manifest.name = local.name.or(manifest.name);
+            manifest.worktree = local.worktree.or(manifest.worktree);
             let mut overridden = BTreeSet::new();
             for member in local.apps {
                 if !overridden.insert(member.id.clone()) {
@@ -150,6 +152,18 @@ fn load_inner(
             .or_else(|| root.file_name().and_then(|name| name.to_str()))
             .ok_or(config::Error::MissingName)?,
     )?;
+    let worktree = crate::worktree::resolve(
+        crate::worktree::setting(
+            &arguments.worktree,
+            arguments.no_worktree,
+            manifest.worktree,
+        )
+        .as_ref(),
+        &root,
+    )?;
+    let mut member_arguments = arguments.clone();
+    member_arguments.worktree = None;
+    member_arguments.no_worktree = true;
     let mut ids = BTreeSet::new();
     let mut apps: Vec<WorkspaceApp> = Vec::new();
     for member in manifest.apps {
@@ -205,6 +219,12 @@ fn load_inner(
             ));
         }
         let mut settings = member.settings;
+        if settings.contains_key("worktree") {
+            return Err(invalid(
+                &path,
+                "worktree is a root workspace option; remove it from [[apps]]",
+            ));
+        }
         if settings.contains_key("format_version") {
             return Err(invalid(
                 &path,
@@ -249,14 +269,25 @@ fn load_inner(
         let hostname = config::normalize_hostname(project.name.as_deref().unwrap())?;
         let environment = project.env.take().unwrap_or_default();
         let mut resolved = config::merge_run(
-            arguments,
+            &member_arguments,
             Some(project),
             None,
             &directory,
             default_bind_address,
         )?;
         // --name names the workspace; explicit member names remain authoritative.
-        resolved.hostname = hostname;
+        resolved.hostname = match &worktree {
+            Some(identity) => {
+                crate::worktree::hostname(&hostname, identity, Some(&workspace_name))?
+            }
+            None => hostname,
+        };
+        resolved.worktree = worktree.clone();
+        if worktree.is_some() && resolved.funnel {
+            return Err(config::Error::InvalidWorktree(
+                "Funnel is not supported in worktree mode".into(),
+            ));
+        }
         resolved.ignored_local_config = ignored_root_local.clone().or_else(|| {
             (!use_local && member_local.exists() && member_local != path).then_some(member_local)
         });
@@ -266,11 +297,11 @@ fn load_inner(
                 format!("app `{}` requires a nonempty command argv", member.id),
             ));
         }
-        if resolved.tailscale || resolved.funnel || resolved.lan {
+        if resolved.tailscale || resolved.funnel {
             return Err(invalid(
                 &path,
                 format!(
-                    "app `{}`: Tailscale, Funnel, and LAN exposure are not supported by native workspaces yet; disable them with --no-tailscale and --no-lan",
+                    "app `{}`: managed Tailscale Serve and Funnel are not supported by workspaces; use --lan with an externally configured tunnel to Caddy, or disable with --no-tailscale",
                     member.id
                 ),
             ));
@@ -383,7 +414,7 @@ fn validate_environment(path: &Path, apps: &[WorkspaceApp]) -> Result<(), config
                     )
                 })?;
                 let (id, field) = token.rsplit_once('.').ok_or_else(|| invalid(path, format!("invalid environment token `${{{token}}}`; expected ${{id.url}}, ${{id.upstream}}, ${{id.host}}, or ${{id.port}}")))?;
-                if !matches!(field, "url" | "upstream" | "host" | "port") {
+                if !matches!(field, "url" | "lan_url" | "upstream" | "host" | "port") {
                     return Err(invalid(
                         path,
                         format!("unsupported environment token `${{{token}}}`"),
@@ -398,6 +429,12 @@ fn validate_environment(path: &Path, apps: &[WorkspaceApp]) -> Result<(), config
                         ),
                     )
                 })?;
+                if field == "lan_url" && !target.config.lan {
+                    return Err(invalid(
+                        path,
+                        format!("`${{{token}}}` requires LAN mode on app `{id}`"),
+                    ));
+                }
                 references.insert(&target.id);
                 remaining = rest;
             }
@@ -719,21 +756,21 @@ mod tests {
     }
 
     #[test]
-    fn exposure_options_fail_before_a_workspace_is_returned() {
+    fn managed_tailscale_options_fail_before_a_workspace_is_returned() {
         let directory = Directory::new();
         directory.workspace(API);
-        for flag in ["--tailscale", "--funnel", "--lan"] {
+        for flag in ["--tailscale", "--funnel"] {
             assert!(
                 directory
                     .load(&[flag])
                     .unwrap_err()
                     .to_string()
-                    .contains("not supported by native workspaces")
+                    .contains("not supported by workspaces")
             );
         }
-        for field in ["tailscale", "funnel", "lan"] {
+        for field in ["tailscale", "funnel"] {
             directory.workspace(&format!("{API}{field} = true\n"));
-            directory.error("not supported by native workspaces");
+            directory.error("not supported by workspaces");
             assert!(directory.load(&["--no-tailscale", "--no-lan"]).is_ok());
         }
     }

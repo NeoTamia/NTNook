@@ -97,6 +97,8 @@ pub(crate) struct Alias {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Lease {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worktree: Option<crate::worktree::Identity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) group_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) workspace_supervisor: Option<WorkspaceSupervisor>,

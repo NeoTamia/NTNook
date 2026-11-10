@@ -128,18 +128,6 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
     let mut signals = ForwardedSignals::new()?;
     member.wait_for_release()?;
     let port = member.app().port;
-    let argv = process::substitute_port(&config.command, port);
-    let framework = config.framework.resolve(&argv);
-    let argv = match framework {
-        Some(framework) => framework.inject_argv(
-            argv,
-            port,
-            config.bind_address,
-            &config.hostname,
-            config.strict_port,
-        ),
-        None => argv,
-    };
     let mut environment = member.app().environment.clone();
     environment.retain(|(key, _)| {
         key != SESSION_VARIABLE && key != crate::workspace_session::PROCESS_VARIABLE
@@ -148,15 +136,8 @@ pub(crate) fn run_member(arguments: crate::cli::RunArgs) -> crate::Result<i32> {
         crate::workspace_session::PROCESS_VARIABLE.into(),
         member.process_marker(),
     ));
-    environment.extend(process::child_environment(
-        port,
-        config.bind_address,
-        &config.hostname,
-        config.tls,
-    ));
-    if let Some(framework) = framework {
-        environment.extend(framework.environment(port, config.bind_address, &config.hostname));
-    }
+    let (argv, launch_environment) = process::child_command(&config, port, &[]);
+    environment.extend(launch_environment);
     let mut child = ChildTree::new(member.spawn_child(
         || {
             Ok(process::spawn_managed_child_in(
@@ -245,6 +226,18 @@ pub(crate) fn prepare(
         }
         workspace.apps.retain(|app| app.id == id);
     }
+    // All routes are prepared before leases are committed. Check the whole
+    // selection here: the registry cannot detect collisions within this batch.
+    let mut lan_names = BTreeMap::new();
+    for app in workspace.apps.iter().filter(|app| app.config.lan) {
+        let hostname = crate::lan::hostname(&app.config.hostname);
+        if let Some(other) = lan_names.insert(hostname.clone(), &app.id) {
+            return Err(invalid(format!(
+                "apps `{other}` and `{}` resolve to the same LAN hostname `{hostname}`; choose distinct app names (--force cannot replace a sibling)",
+                app.id
+            )));
+        }
+    }
     let signals = ForwardedSignals::new()?;
     let mut apps = Vec::new();
     let mut values = BTreeMap::new();
@@ -265,6 +258,12 @@ pub(crate) fn prepare(
                 app.config.hostname
             ),
         );
+        if app.config.lan {
+            values.insert(
+                format!("{}.lan_url", app.id),
+                format!("http://{}", crate::lan::hostname(&app.config.hostname)),
+            );
+        }
         values.insert(
             format!("{}.upstream", app.id),
             format!("http://{}", SocketAddr::new(address, port)),
@@ -311,12 +310,12 @@ fn interpolate(value: &OsStr, values: &BTreeMap<String, String>) -> crate::Resul
     while let Some((_, after)) = rest.split_once("${") {
         let Some((reference, after)) = after.split_once('}') else {
             return Err(invalid(
-                "unterminated workspace interpolation; expected ${id.url}, ${id.upstream}, ${id.host}, or ${id.port}",
+                "unterminated workspace interpolation; expected ${id.url}, ${id.lan_url}, ${id.upstream}, ${id.host}, or ${id.port}",
             ));
         };
         if !values.contains_key(reference) {
             return Err(invalid(format!(
-                "unknown workspace reference `${{{reference}}}`; references must name a selected application and url, upstream, host, or port"
+                "unknown workspace reference `${{{reference}}}`; references must name a selected application and url, lan_url (with LAN enabled), upstream, host, or port"
             )));
         }
         rest = after;
@@ -483,6 +482,71 @@ impl Drop for RunnerTree {
     }
 }
 
+// This is a root-config advisory: the runner owns CLI overrides, package
+// configurations and task selection, which may be hidden behind npm scripts.
+fn turbo_environment_warning(root: &std::path::Path) -> Option<String> {
+    let path = root.join("turbo.json");
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(format!("cannot check {}: {error}", path.display())),
+    };
+    let config: serde_json::Value = match serde_json::from_str(&source) {
+        Ok(config) => config,
+        Err(error) => {
+            return Some(format!(
+                "cannot check {} for Turbo strict environment filtering: {error}",
+                path.display()
+            ));
+        }
+    };
+    if config["envMode"] == "loose"
+        || turbo_allows_session(&config["globalPassThroughEnv"])
+        || turbo_allows_session(&config["globalEnv"])
+    {
+        return None;
+    }
+    let tasks = config["tasks"].as_object()?;
+    let missing: Vec<_> = tasks
+        .iter()
+        .filter(|(_, task)| {
+            !turbo_allows_session(&task["passThroughEnv"]) && !turbo_allows_session(&task["env"])
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}: tasks [{}] do not allow {SESSION_VARIABLE} in the root config. If run with Turbo strict mode (the default), wrappers may lose the Nook workspace session. Add \"globalPassThroughEnv\": [\"{SESSION_VARIABLE}\"] to turbo.json, or passThroughEnv on each participating task. Check package configs and runner overrides if already configured elsewhere.",
+        path.display(),
+        missing.join(", ")
+    ))
+}
+
+fn turbo_allows_session(value: &serde_json::Value) -> bool {
+    fn matches(pattern: &str, name: &str) -> bool {
+        match pattern.split_once('*') {
+            Some((prefix, rest)) => name.strip_prefix(prefix).is_some_and(|suffix| {
+                (0..=suffix.len()).any(|offset| matches(rest, &suffix[offset..]))
+            }),
+            None => pattern == name,
+        }
+    }
+    let Some(patterns) = value.as_array() else {
+        return false;
+    };
+    let patterns: Vec<_> = patterns.iter().filter_map(|value| value.as_str()).collect();
+    patterns
+        .iter()
+        .any(|pattern| !pattern.starts_with('!') && matches(pattern, SESSION_VARIABLE))
+        && !patterns.iter().any(|pattern| {
+            pattern
+                .strip_prefix('!')
+                .is_some_and(|pattern| matches(pattern, SESSION_VARIABLE))
+        })
+}
+
 impl PreparedWorkspace {
     pub(crate) fn run_runner(
         mut self,
@@ -494,6 +558,9 @@ impl PreparedWorkspace {
         if command.is_empty() {
             return Err(invalid("--runner requires a root dev command after --"));
         }
+        if let Some(warning) = turbo_environment_warning(&self.root) {
+            warn(&warning);
+        }
         let identity = process::read_process_identity(std::process::id())
             .ok_or_else(|| invalid("cannot identify workspace supervisor"))?;
         let root_supervisor = WorkspaceSupervisor {
@@ -502,6 +569,7 @@ impl PreparedWorkspace {
         };
         let operations = store.lock_operations()?;
         let mut prepared_runs = Vec::new();
+        let mut advertisements = Vec::new();
         let mut runner = None;
         let mut unstarted_owner = None;
         let mut committed = false;
@@ -516,6 +584,18 @@ impl PreparedWorkspace {
                     &mut process::LocalOnly,
                 )?);
             }
+            for (app, run) in self.apps.iter().zip(&prepared_runs) {
+                if app.app.config.lan {
+                    match crate::lan::Advertisement::start(
+                        &app.app.config.hostname,
+                        80,
+                        run.owner_id,
+                    ) {
+                        Ok(advertisement) => advertisements.push(advertisement),
+                        Err(error) => warn(&format!("cannot announce the LAN hostname: {error}")),
+                    }
+                }
+            }
             let apps = self
                 .apps
                 .iter()
@@ -523,6 +603,8 @@ impl PreparedWorkspace {
                 .map(|(app, run)| {
                     let config = &app.app.config;
                     SessionApp {
+                        worktree: config.worktree.clone(),
+                        lan: config.lan,
                         id: app.app.id.clone(),
                         directory: app.app.directory.clone(),
                         lease_id: run.owner_id,
@@ -576,6 +658,7 @@ impl PreparedWorkspace {
                 .map_err(process::RunError::from)?,
             );
             let lease = Lease {
+                worktree: None,
                 id: self.group_id,
                 group_id: Some(self.group_id),
                 workspace_supervisor: Some(root_supervisor.clone()),
@@ -672,6 +755,12 @@ impl PreparedWorkspace {
                 }
                 if let Some(code) = runner.child.0.try_wait().map_err(process::RunError::from)? {
                     return Ok(code);
+                }
+                advertisements.retain_mut(|advertisement| !advertisement.is_displaced(store));
+                for advertisement in &advertisements {
+                    for warning in advertisement.warnings() {
+                        warn(&warning);
+                    }
                 }
                 runner.owner.poll_joins(|app, _wrapper| {
                     let registry = store.load()?;
@@ -1079,6 +1168,7 @@ mod tests {
                         directory: self.root.join(id),
                         environment: BTreeMap::new(),
                         config: ResolvedRunConfig {
+                            worktree: None,
                             hostname: format!("{id}.demo.localhost"),
                             command: argv.iter().map(OsString::from).collect(),
                             tls: true,
@@ -1235,6 +1325,43 @@ mod tests {
     }
 
     #[test]
+    fn selected_apps_cannot_share_a_normalized_lan_hostname_even_with_force() {
+        let fixture = Fixture::new();
+        let config = |force: bool| {
+            let mut config = fixture.workspace([&["server"], &["server"]]);
+            for (app, hostname) in config
+                .apps
+                .iter_mut()
+                .zip(["api.localhost", "api.local.localhost"])
+            {
+                app.config.hostname = hostname.into();
+                app.config.lan = true;
+                app.config.force = force;
+            }
+            config
+        };
+        for force in [false, true] {
+            let error = prepare(config(force), None)
+                .err()
+                .expect("duplicate LAN names must fail before route installation");
+            let message = error.to_string();
+            assert!(
+                message.contains("same LAN hostname `api.local`"),
+                "{message}"
+            );
+            assert!(
+                message.contains("web") && message.contains("api"),
+                "{message}"
+            );
+            assert!(fixture.store.load().unwrap().leases.is_empty());
+        }
+        assert!(prepare(config(true), Some("web")).is_ok());
+        let mut local_only = config(true);
+        local_only.apps[1].config.lan = false;
+        assert!(prepare(local_only, None).is_ok());
+    }
+
+    #[test]
     fn strict_port_conflict_prevents_any_startup() {
         let fixture = Fixture::new();
         let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1293,6 +1420,79 @@ mod tests {
                 .values()
                 .all(|lease| process::lease_liveness(lease) == process::Liveness::Dead)
         );
+    }
+
+    #[test]
+    fn two_worktrees_keep_their_urls_ports_leases_and_cleanup_independent() {
+        let fixture = Fixture::new();
+        let config = |label: &str| {
+            let mut config = fixture.workspace([&["/bin/sleep", "30"], &["/bin/sleep", "30"]]);
+            for app in &mut config.apps {
+                let identity = crate::worktree::Identity {
+                    key: label.into(),
+                    label: label.into(),
+                };
+                app.config.hostname =
+                    crate::worktree::hostname(&app.config.hostname, &identity, Some("demo"))
+                        .unwrap();
+                app.config.worktree = Some(identity);
+            }
+            config.apps[0]
+                .environment
+                .insert("API".into(), "${api.url} ${api.upstream}".into());
+            config
+        };
+        let first = prepare(config("agent-a"), None).unwrap();
+        let second = prepare(config("agent-b"), None).unwrap();
+        let ports: std::collections::BTreeSet<_> = first
+            .apps
+            .iter()
+            .chain(&second.apps)
+            .map(|app| app.port)
+            .collect();
+        assert_eq!(ports.len(), 4);
+        assert_eq!(
+            first.apps[0].environment[0].1.to_string_lossy(),
+            format!(
+                "https://api.agent-a.demo.localhost http://127.0.0.1:{}",
+                first.apps[1].port
+            )
+        );
+        assert_eq!(
+            second.apps[0].environment[0].1.to_string_lossy(),
+            format!(
+                "https://api.agent-b.demo.localhost http://127.0.0.1:{}",
+                second.apps[1].port
+            )
+        );
+        let mut routes = Routes::default();
+        let mut first = first.start(&fixture.store, &mut routes).unwrap();
+        let mut second = second.start(&fixture.store, &mut routes).unwrap();
+        assert_eq!(fixture.store.load().unwrap().leases.len(), 4);
+        first.apps[0].1.child.signal(ProcessSignal::Kill).unwrap();
+        first.finish(&fixture.store, &mut routes, |_| {}).unwrap();
+        let remaining = fixture.store.load().unwrap();
+        assert_eq!(remaining.leases.len(), 2);
+        assert_eq!(routes.owners.len(), 2);
+        for (_, app) in &mut second.apps {
+            assert!(app.child.try_wait().unwrap().is_none());
+            assert_eq!(
+                remaining.leases[&app.lease_id]
+                    .worktree
+                    .as_ref()
+                    .unwrap()
+                    .key,
+                "agent-b"
+            );
+        }
+        second.apps[0]
+            .1
+            .child
+            .signal(ProcessSignal::Terminate)
+            .unwrap();
+        second.finish(&fixture.store, &mut routes, |_| {}).unwrap();
+        assert!(fixture.store.load().unwrap().leases.is_empty());
+        assert!(routes.owners.is_empty());
     }
 
     #[test]
@@ -1427,6 +1627,64 @@ mod tests {
     }
 
     #[test]
+    fn turbo_environment_advisory_respects_allowlists_and_loose_mode() {
+        let fixture = Fixture::new();
+        assert!(turbo_environment_warning(&fixture.root).is_none());
+        for config in [
+            r#"{"tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["OTHER"],"tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["NOOK_*","!NOOK_WORKSPACE_SESSION"],"tasks":{"dev":{}}}"#,
+            r#"{"tasks":{"dev":{"passThroughEnv":["NOOK_WORKSPACE_SESSION"]},"other":{}}}"#,
+        ] {
+            fs::write(fixture.root.join("turbo.json"), config).unwrap();
+            assert!(
+                turbo_environment_warning(&fixture.root).is_some(),
+                "{config}"
+            );
+        }
+        for config in [
+            r#"{"envMode":"loose","tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["NOOK_WORKSPACE_SESSION"],"tasks":{"dev":{}}}"#,
+            r#"{"globalPassThroughEnv":["NOOK_*"],"tasks":{"dev":{}}}"#,
+            r#"{"globalEnv":["NOOK_WORKSPACE_SESSION"],"tasks":{"dev":{}}}"#,
+            r#"{"tasks":{"dev":{"passThroughEnv":["NOOK_WORKSPACE_SESSION"]}}}"#,
+            r#"{"tasks":{"dev":{"env":["NOOK_WORKSPACE_SESSION"]}}}"#,
+        ] {
+            fs::write(fixture.root.join("turbo.json"), config).unwrap();
+            assert!(
+                turbo_environment_warning(&fixture.root).is_none(),
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_runner_warns_about_incomplete_turbo_strict_environment() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.root.join("turbo.json"),
+            r#"{"envMode":"strict","tasks":{"dev":{"cache":false,"persistent":true}}}"#,
+        )
+        .unwrap();
+        let plan = prepare(fixture.workspace([&["unused"], &["unused"]]), None).unwrap();
+        let mut warnings = Vec::new();
+        plan.run_runner(
+            &["/usr/bin/true".into()],
+            &fixture.store,
+            &mut Routes::default(),
+            |warning| warnings.push(warning.to_owned()),
+        )
+        .unwrap();
+        assert!(
+            warnings.iter().any(|warning| warning.contains("turbo.json")
+                && warning.contains("strict")
+                && warning.contains("NOOK_WORKSPACE_SESSION")
+                && warning.contains("globalPassThroughEnv")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
     fn external_runner_rolls_back_forced_owner_only_before_commit() {
         for spawn_succeeds in [false, true] {
             let fixture = Fixture::new();
@@ -1489,6 +1747,7 @@ mod tests {
         let lease_id = Uuid::new_v4();
         let identity = process::read_process_identity(std::process::id()).unwrap();
         let owner = Lease {
+            worktree: None,
             group_id: Some(group_id),
             workspace_supervisor: None,
             lan: false,
@@ -1503,6 +1762,8 @@ mod tests {
             state: LeaseState::Starting,
         };
         let app = SessionApp {
+            worktree: None,
+            lan: false,
             id: "web".into(),
             directory: fixture.root.join("web"),
             lease_id,

@@ -14,6 +14,7 @@ mod update;
 mod workspace;
 mod workspace_config;
 mod workspace_session;
+mod worktree;
 
 use std::fmt;
 use std::io;
