@@ -14,6 +14,19 @@ environment. `nook list` helps correlate domains and workspace `group=<UUID>`;
 its text columns vary with exposure and grouping and are not a JSON API.
 `list` and `status` may reconcile state and require Caddy.
 
+When the installed `--help` exposes the structured interface, prefer
+`nook list --read-only --json` and `nook status --read-only --json` for observation.
+Use `nook url --json` with the launch's config, local override and worktree options
+to resolve a registered URL; select `--app <id>` for a workspace member. Check
+`schema_version` and `ok` before consuming `data`. A `--mode configured` URL is a
+prediction, not evidence of a registered route or application readiness. CLI list
+returns at most 100 entries; MCP supports pagination for larger registries.
+
+If an MCP connection is already configured, use its advertised read tools and
+fixed project/worktree context for discovery. Alias mutation requires explicit
+hostname grants. Start and stop application sessions through the shell workflow;
+MCP does not launch processes or manage the Caddy service.
+
 Do not discover URLs by reading the private state registry, guessing a worktree
 hash, assuming the requested port was free, or adding a port to a Caddy URL.
 

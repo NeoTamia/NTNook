@@ -61,6 +61,8 @@ Report pending cleanup explicitly; do not claim success from an exit code alone.
 ## Available interface
 
 Use `run`, `init`, `list`, `status`, `stop`, `prune`, `alias`, `config`, and
-`ca export` as documented by their installed `--help`. There is no `nook logs`,
-`nook doctor`, `nook url`, `nook list --json`, MCP server, or Compose orchestration
-in this contract. Do not substitute hypothetical commands for these workflows.
+`ca export` as documented by their installed `--help`. When the installed binary
+also exposes `url`, `mcp`, or `list/status --read-only --json`, follow the optional
+structured-discovery guidance in [verification](references/verification.md).
+The CLI launch workflow remains usable without these capabilities. There is no
+`nook logs`, `nook doctor`, or Compose orchestration command in this contract.

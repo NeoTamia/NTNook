@@ -191,7 +191,7 @@ MCP messages are limited to 1 MiB input and 4 MiB output. The official SDK disca
 unparsable/oversized lines and keeps the connection usable; valid JSON with an invalid
 JSON-RPC shape receives a protocol error. It does not echo malformed input.
 
-## Shell and future skills
+## Shell and agent skills
 
 ```sh
 nook list --read-only --json
@@ -207,10 +207,11 @@ paginated like MCP (first 100 entries); use MCP's cursor for additional pages.
 JSON exit codes are 0 for success, 1 for a domain failure or status health `error`,
 and 2 for invalid CLI arguments. Status's read-only CLI uses full diagnostics.
 
-A future doctor or skill can reuse the typed observation API. An agent should inspect
-status, resolve the URL, launch `nook run` in its shell if needed, then observe the
-registered resource. V1 deliberately has no `nook_doctor`, process launch/stop tool,
-or MCP prune. There is no dependency on an unpublished doctor or skill implementation.
+The [portable agent skill](AGENT_USAGE.md) can use these optional interfaces after
+checking installed capabilities. An agent should inspect status, resolve the URL,
+launch `nook run` in its shell if needed, then observe the registered resource.
+A future doctor can reuse the typed observation API. V1 deliberately has no
+`nook_doctor`, process launch/stop tool, or MCP prune.
 
 ## Validation
 
