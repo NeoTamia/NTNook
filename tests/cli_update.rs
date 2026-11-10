@@ -63,6 +63,46 @@ fn update_check_reports_current_and_outdated_versions() {
 }
 
 #[test]
+fn update_check_searches_later_pages_and_reports_missing_nook_releases() {
+    for (last_page, expected_code, expected_message) in [
+        (r#"[{"tag_name":"v99.0.0"}]"#, 1, "nook 99.0.0 is available"),
+        ("[]", 2, "no stable Nook release found"),
+    ] {
+        let home = test_home("release-pages");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let unrelated = vec![r#"{"tag_name":"nook-run-v1.1.0"}"#; 100].join(",");
+            for (index, body) in [format!("[{unrelated}]"), last_page.to_owned()]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                assert!(
+                    request.starts_with(&format!("GET /releases?per_page=100&page={} ", index + 1))
+                );
+                write_response(&mut stream, 200, "application/json", body.as_bytes());
+            }
+        });
+        let output = nook(
+            &home,
+            &["update", "--check"],
+            &[("NOOK_UPDATE_RELEASES_URL", &url)],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "{}",
+            stderr(&output)
+        );
+        assert!(format!("{}{}", stdout(&output), stderr(&output)).contains(expected_message));
+        server.join().unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+}
+
+#[test]
 fn update_check_network_failure_uses_exit_code_two() {
     let home = test_home("check-fail");
     let state = Arc::new(Mutex::new(ReleaseServer {
@@ -406,7 +446,7 @@ fn spawn_server(state: Arc<Mutex<ReleaseServer>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let base = format!("http://{address}");
-    let releases = format!("{base}/releases/latest");
+    let releases = format!("{base}/releases");
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
@@ -433,6 +473,15 @@ fn serve_request(stream: &mut TcpStream, base: &str, state: &ReleaseServer) {
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
     if path.ends_with("/releases/latest") {
+        write_response(
+            stream,
+            200,
+            "application/json",
+            br#"{"tag_name":"nook-run-v1.1.0"}"#,
+        );
+        return;
+    }
+    if path.starts_with("/releases?") {
         if state.latest_status != 200 {
             write_response(stream, state.latest_status, "text/plain", b"");
             return;
@@ -440,6 +489,9 @@ fn serve_request(stream: &mut TcpStream, base: &str, state: &ReleaseServer) {
         let body = format!(
             r#"{{"tag_name":"{}","assets":[{{"name":"{ARCHIVE_NAME}","browser_download_url":"{base}/{ARCHIVE_NAME}"}},{{"name":"{CHECKSUM_NAME}","browser_download_url":"{base}/{CHECKSUM_NAME}"}}]}}"#,
             state.tag
+        );
+        let body = format!(
+            r#"[{{"tag_name":"nook-run-v1.1.0"}},{{"tag_name":"v100.0.0","draft":true}},{{"tag_name":"v100.0.0","prerelease":true}},{body}]"#
         );
         write_response(stream, 200, "application/json", body.as_bytes());
         return;
