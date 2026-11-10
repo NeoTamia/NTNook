@@ -791,6 +791,10 @@ os.execv(sys.argv[1],sys.argv[1:])",
         let context = fs::read_to_string(fixture.path("context")).unwrap();
         let lock = File::open(Path::new(&context).with_file_name("context.lock")).unwrap();
         lock.lock().unwrap();
+        // The supervisor also reads the registry outside the session lock.
+        // Do not freeze it holding that lock while a member waits in Store::load.
+        let state_lock = File::open(fixture.path("state/nook/state.lock")).unwrap();
+        state_lock.lock().unwrap();
         // Keep root recovery from masking a wrapper's missing-context cleanup.
         // Holding its session lock first also keeps the paused root out of it.
         signal(root, libc::SIGSTOP);
@@ -803,6 +807,7 @@ os.execv(sys.argv[1],sys.argv[1:])",
         let bytes = fs::read(&context).unwrap();
         let permissions = fs::metadata(&context).unwrap().permissions();
         fs::remove_file(&context).unwrap();
+        drop(state_lock);
         drop(lock);
         fixture.until(|fixture| {
             fixture.path("api-exit").exists() && fixture.path("web-exit").exists()

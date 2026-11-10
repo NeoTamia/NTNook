@@ -311,7 +311,8 @@ Each fixture has two HTTP apps using the repository's JavaScript wrapper and one
 non-HTTP watcher. The Bun runtime and real Vite server variants share the same
 contract assertions.
 
-The gate verifies routes and leases before the single root command starts,
+The gate verifies routes before the single root command starts and leases before
+member applications start (the runner PID is recorded after spawning it),
 distinct app environments/cwds/domains/ports, session forwarding to wrappers and
 removal from servers, native filtering, normal shutdown, standalone wrapper use,
 native member-error

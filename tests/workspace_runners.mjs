@@ -135,6 +135,7 @@ function adminConfig(url, host) {
 }
 
 const serverInfoSource = `
+import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 const id = path.basename(process.cwd());
@@ -142,6 +143,11 @@ const info = {id, pid:process.pid, cwd:process.cwd(), port:process.env.PORT,
   host:process.env.HOST, url:process.env.NOOK_URL, api:process.env.API_UPSTREAM,
   label:process.env.APP_LABEL, dotenv:process.env.NOOK_TEST_DOTENV ?? null, bun:process.versions.bun ?? null,
   session:process.env.NOOK_WORKSPACE_SESSION ?? null, recovery:process.env.NOOK_WORKSPACE_PROCESS ?? null};
+// Members are released only after all placeholder leases have been committed.
+if (info.recovery) {
+  const registry = JSON.parse(fs.readFileSync(path.resolve('../../state/nook/state.json')));
+  assert.equal(Object.keys(registry.leases).length, 2, 'both leases must precede member startup');
+}
 `;
 const serverSource = `
 import http from 'node:http';
@@ -217,7 +223,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 assert.ok(process.env.NOOK_WORKSPACE_SESSION);
-assert.equal(Object.keys(JSON.parse(fs.readFileSync(${JSON.stringify(path.join(root, "state/nook/state.json"))})).leases).length, 2);
+// The runner PID must exist before its placeholder leases can be persisted.
+// Routes precede root execution; leases precede member application execution.
 const config = await new Promise((resolve, reject) => http.get(${JSON.stringify(`${admin}/config/`)}, res => {
   let body=''; res.on('data',chunk=>body+=chunk); res.on('end',()=>resolve(body));
 }).on('error',reject));
