@@ -1,8 +1,8 @@
 # Caddy in Docker
 
 Nook can remain installed on the Linux or Windows host while Caddy 2.11 runs in a container. The
-official image is the supported path. Nook does not control Docker and neither starts nor stops
-Caddy. On Windows, native `caddy.exe` is the primary supported mode; Docker Desktop is a secondary
+official image is the supported path. Nook neither starts nor stops Caddy. Application stacks
+can separately use [`nook compose`](COMPOSE.md). On Windows, native `caddy.exe` is the primary supported mode; Docker Desktop is a secondary
 supported alternative.
 
 ## Recommended setup

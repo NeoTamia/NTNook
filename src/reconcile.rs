@@ -122,6 +122,14 @@ pub(crate) fn set_alias_with<T, E: From<AliasError>>(
     let operations = store
         .lock_operations()
         .map_err(|error| AliasError::State(error.to_string()))?;
+    if crate::compose::claims(
+        &store.load().map_err(|e| AliasError::State(e.to_string()))?,
+        &request.hostname,
+    ) {
+        return Err(
+            AliasError::State("hostname belongs to Compose; use nook compose".into()).into(),
+        );
+    }
     let replaced = store
         .mutate(|registry| {
             let aliases = registry
@@ -266,6 +274,14 @@ pub(crate) fn remove_alias(
     let _operations = store
         .lock_operations()
         .map_err(|error| AliasError::State(error.to_string()))?;
+    if crate::compose::claims(
+        &store.load().map_err(|e| AliasError::State(e.to_string()))?,
+        hostname,
+    ) {
+        return Err(AliasError::State(
+            "hostname belongs to Compose; use nook compose".into(),
+        ));
+    }
     let removal = store
         .mutate(|registry| {
             let Some(alias) = registry.aliases.remove(hostname) else {
@@ -336,6 +352,9 @@ fn reconcile_with_supervisors(
     mut supervisor_liveness: impl FnMut(&crate::state::WorkspaceSupervisor) -> Liveness,
 ) -> Report {
     let mut report = Report::default();
+    report
+        .warnings
+        .extend(crate::compose::reconcile(registry, routes));
     // Resolve workspace ownership before replaying any route restorations.
     let mut live: BTreeMap<_, _> = registry
         .leases

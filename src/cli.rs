@@ -38,6 +38,8 @@ pub(crate) enum Command {
     Url(UrlArgs),
     /// Run a command behind a temporary Nook route.
     Run(RunArgs),
+    /// Run explicitly selected HTTP endpoints from a Docker Compose application.
+    Compose(crate::compose::Args),
     /// Manage persistent aliases.
     Alias(AliasArgs),
     /// List managed runs and aliases.
@@ -480,6 +482,9 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
     if let Some(socket) = caddy_socket {
         global.caddy_admin = format!("unix/{socket}");
     }
+    if let Command::Compose(arguments) = command {
+        return crate::compose::execute(arguments, &global, output, errors);
+    }
     if !matches!(
         &command,
         Command::Prune | Command::Ca(_) | Command::Tailscale(_) | Command::Run(_)
@@ -510,6 +515,7 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Mcp(_) | Command::Url(_) | Command::Doctor(_) => {
             unreachable!("observations handled before reconciliation")
         }
+        Command::Compose(_) => unreachable!("compose handled above"),
         Command::Config(_) => unreachable!("configuration commands return before loading Caddy"),
         Command::Init(_) | Command::Completions(_) | Command::Update(_) => {
             unreachable!("commands handled before global configuration return above")
@@ -1064,7 +1070,7 @@ _nook_dynamic() {
     fi
 
     case "$subcommand" in
-        init|run|alias|list|status|stop|prune|tailscale|ca|config|completions|update|help|-*) ;;
+        init|run|compose|alias|list|status|stop|prune|tailscale|ca|config|completions|update|help|-*) ;;
         *)
             if (( COMP_CWORD == command_index + 1 )); then
                 _nook_dynamic_word run "$current"
@@ -1226,7 +1232,7 @@ _nook_dynamic() {
     fi
 
     case "$subcommand" in
-        init|run|alias|list|status|stop|prune|tailscale|ca|config|completions|update|help|-*) ;;
+        init|run|compose|alias|list|status|stop|prune|tailscale|ca|config|completions|update|help|-*) ;;
         *)
             (( CURRENT == command_index + 1 )) && _nook_dynamic_word run "$current"
             ;;
@@ -1315,7 +1321,7 @@ const POWERSHELL_DYNAMIC_COMPLETION: &str = r#"
                 $dynamicKind = 'aliases'
             }
         } elseif ($subcommand -notin @(
-            'init', 'run', 'list', 'status', 'prune', 'tailscale', 'ca', 'config',
+            'init', 'run', 'compose', 'list', 'status', 'prune', 'tailscale', 'ca', 'config',
             'completions', 'update', 'help'
         ) -and $currentIndex -eq $commandIndex + 1 -and
             'run'.StartsWith($wordToComplete)) {
@@ -1808,6 +1814,9 @@ fn remove_alias_command(
 ) -> crate::Result<()> {
     let hostname = crate::config::normalize_hostname(&arguments.name)?;
     let store = crate::state::Store::new(crate::state::state_path()?);
+    if crate::compose::claims(&store.load()?, &hostname) {
+        return Err(io::Error::other("hostname belongs to Compose; use nook compose down").into());
+    }
     let aliases = crate::reconcile::list_aliases(&store)?;
     let Some(alias) = aliases.iter().find(|alias| alias.hostname == hostname) else {
         writeln!(output, "alias {hostname} is not configured")?;
@@ -1855,6 +1864,7 @@ fn write_registry_list(
         }
         write_tailscale_columns(registry, lease.id, &lease.hostname, lease.tls, output)?;
     }
+    crate::compose::write_status(registry, output)?;
     for alias in registry.aliases.values() {
         write!(
             output,
@@ -1977,6 +1987,7 @@ fn status_command(
     let config = client.fetch_config()?;
     let selection = available_servers(global, &config)?;
     let inspection = crate::caddy::inspect_managed(&config, &selection)?;
+    crate::compose::write_status(&registry, output)?;
     writeln!(output, "caddy\tok")?;
     writeln!(output, "run_bind_address\t{}", global.run_bind_address)?;
     writeln!(
@@ -2266,6 +2277,15 @@ fn expected_routes(
                 .map(|lease| (lease.id, lease.hostname.clone(), lease.tls)),
         )
         .collect();
+    for project in registry.compose_projects.values() {
+        for endpoint in project.routes.values() {
+            routes.insert((
+                endpoint.alias.id,
+                endpoint.alias.hostname.clone(),
+                endpoint.alias.tls,
+            ));
+        }
+    }
     for lease in registry.leases.values().filter(|lease| lease.lan) {
         routes.insert((lease.id, crate::lan::hostname(&lease.hostname), false));
     }
@@ -2276,7 +2296,16 @@ fn drift_messages(
     registry: &crate::state::Registry,
     inspection: &crate::caddy::ManagedInspection,
 ) -> Vec<String> {
-    let expected = expected_routes(registry);
+    let mut expected = expected_routes(registry);
+    for project in registry.compose_projects.values() {
+        for endpoint in project.routes.values().filter(|e| !e.active) {
+            expected.remove(&(
+                endpoint.alias.id,
+                endpoint.alias.hostname.clone(),
+                endpoint.alias.tls,
+            ));
+        }
+    }
     let observed: std::collections::BTreeSet<_> = inspection
         .routes
         .iter()
@@ -2296,7 +2325,7 @@ fn drift_messages(
     messages
 }
 
-fn with_caddy_routes<T>(
+pub(crate) fn with_caddy_routes<T>(
     global: &crate::config::GlobalConfig,
     need_https: bool,
     need_http: bool,
@@ -2365,6 +2394,7 @@ fn is_command(value: &OsStr) -> bool {
         "url",
         "init",
         "run",
+        "compose",
         "alias",
         "list",
         "status",

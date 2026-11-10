@@ -3,6 +3,8 @@
 mod api;
 mod caddy;
 mod cli;
+mod compose;
+mod compose_config;
 mod config;
 mod doctor;
 mod doctor_io;

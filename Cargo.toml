@@ -20,6 +20,10 @@ path = "src/main.rs"
 name = "tailscale_serve"
 harness = false
 
+[[test]]
+name = "compose_cli"
+harness = false
+
 [dependencies]
 rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "signal"] }
