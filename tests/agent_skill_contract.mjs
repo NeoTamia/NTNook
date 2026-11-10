@@ -128,13 +128,13 @@ test('published TOML examples resolve before dependency access', async (t) => {
   resolved(['run', '--no-worktree', '--runner', '--', 'node', 'runner.mjs']);
 });
 
-async function until(check, description) {
+async function until(check, description, diagnostics = () => '') {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     if (await check()) return;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  assert.fail(`timed out: ${description}`);
+  assert.fail(`timed out: ${description}\n${diagnostics()}`);
 }
 
 async function http(port, hostname, pathname = '/', ca) {
@@ -146,7 +146,7 @@ async function http(port, hostname, pathname = '/', ca) {
       response.on('end', () => resolve({ status: response.statusCode, body }));
     });
     request.on('timeout', () => request.destroy());
-    request.on('error', () => resolve(null));
+    request.on('error', error => resolve({ error: `${error.code}: ${error.message}` }));
   });
 }
 
@@ -172,6 +172,11 @@ https://foreign.localhost {
 `);
     await writeFile(config, `format_version = 1\ncaddy_admin = "http://127.0.0.1:${adminPort}"\n`);
     const children = [];
+    const responses = new Map();
+    const diagnostics = () => [
+      `Last HTTPS responses: ${JSON.stringify(Object.fromEntries(responses))}`,
+      ...children.map(child => `Process ${child.pid} (exit=${child.exitCode}, signal=${child.signalCode}):\n${child.log}`),
+    ].join('\n');
     function start(executable, args, cwd = root) {
       const child = spawn(executable, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
       child.log = '';
@@ -210,11 +215,12 @@ https://foreign.localhost {
     const neighbor = start(binary, ['run', '--name', 'neighbor']);
     const responds = async (hostname) => {
       const response = await http(443, hostname, '/', ca);
+      responses.set(hostname, response);
       return response?.status === 200 && response.body.includes(`https://${hostname}`);
     };
-    await until(() => responds('neighbor.localhost'), 'neighbor ready');
+    await until(() => responds('neighbor.localhost'), 'neighbor ready', diagnostics);
     const standalone = start(binary, ['run']);
-    await until(() => responds('web.localhost'), 'documented standalone ready');
+    await until(() => responds('web.localhost'), 'documented standalone ready', diagnostics);
     assert.match(standalone.log, /domain=web\.localhost url=https:\/\/web\.localhost port=\d+/);
     assert.equal(command(['stop', 'web.localhost']).status, 0);
     await until(() => standalone.exitCode !== null || standalone.signalCode !== null, 'standalone stopped');
@@ -248,7 +254,7 @@ for(const child of children)child.on('exit',code=>process.exit(code??1));`);
       await until(async () => {
         assert.equal(child.exitCode, null, child.log);
         return await responds(api) && await responds(web);
-      }, `workspace ready (runner=${runner})`);
+      }, `workspace ready (runner=${runner})`, diagnostics);
       const apiBody = JSON.parse((await http(443, api, '/', ca)).body);
       const webBody = JSON.parse((await http(443, web, '/', ca)).body);
       assert.notEqual(apiBody.port, webBody.port);
