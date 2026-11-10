@@ -101,7 +101,9 @@ future milestones. Doctor must separate diagnosis from repair; Compose and
 additional tunnels require separate ownership and exposure designs.
 
 Existing LAN, standalone Tailscale Serve/Funnel and
-[Cloudflare Quick Tunnels](CLOUDFLARE.md) are available. Quick Tunnel URLs are
+[Cloudflare Quick Tunnels](CLOUDFLARE.md) and [ngrok](NGROK.md) are available.
+ngrok uses an existing account and can select an already available domain; it
+connects directly to the loopback app, bypassing Caddy middleware. Quick Tunnel URLs are
 public and ephemeral; cloudflared installation is explicit. Serve is not supported for multi-app
 workspaces; Funnel is excluded from worktree mode. The skill preserves those
 limits and never turns Nook into a Caddy service manager.

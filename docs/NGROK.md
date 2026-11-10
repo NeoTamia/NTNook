@@ -56,9 +56,12 @@ public hostname, never a provider-wide wildcard. There is no new framework
 integration. Explicit HMR configuration may still be necessary for apps that
 hardcode a hostname: use `wss` and external port 443, without breaking local use.
 
-ngrok assigns the account's stable development domain when no URL is supplied.
-It does **not** assign a different free domain for every run or worktree. Nook
-supports ngrok domains only; personal domains, provisioning and DNS management
+Without an explicit URL, ngrok chooses the endpoint according to the account's
+configuration and plan. Nook discovers the actual URL from the agent API and
+does not promise that it stays unchanged across launches. For a stable URL, use
+`--ngrok-url` with a domain already available to your account. Separate worktrees
+do not receive additional free domains. Nook supports ngrok domains only;
+personal domains, provisioning and DNS management
 are outside this version. URLs cannot contain credentials, paths, queries,
 fragments, wildcards or nonstandard ports.
 
