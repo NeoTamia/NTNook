@@ -441,6 +441,35 @@ fn alias_profile_requires_explicit_grants() {
 }
 
 #[test]
+fn alias_creation_preserves_a_starting_runs_reservation() {
+    let fixture = Fixture::new();
+    fixture.global("http://127.0.0.1:0");
+    let owner = Uuid::new_v4().to_string();
+    let registry = json!({
+        "format_version":3,
+        "last_synchronized_at_unix_ms":null,
+        "preparing": {owner: {
+            "hostname":"web.localhost", "lan":false, "tls":true, "cancelled":false,
+            "supervisor":{"pid":std::process::id(),"process_start_time_ticks":1}
+        }}
+    });
+    fs::create_dir_all(fixture.registry().parent().unwrap()).unwrap();
+    let before = serde_json::to_vec(&registry).unwrap();
+    fs::write(fixture.registry(), &before).unwrap();
+    let mut client = fixture.spawn(&["--tools", "read,aliases", "--allow-alias", "web.localhost"]);
+    client.initialize("2025-11-25");
+    assert_eq!(
+        client.call(
+            "nook_alias_set",
+            json!({"hostname":"web.localhost","target":3000})
+        )["error"]["code"],
+        "CONFLICT"
+    );
+    assert_eq!(fs::read(fixture.registry()).unwrap(), before);
+    client.close();
+}
+
+#[test]
 fn real_caddy_aliases_preserve_foreign_routes_and_ownership() {
     #[cfg(target_os = "linux")]
     if std::env::var_os("NOOK_E2E_DIRECT").is_none() && std::env::var_os("NOOK_MCP_NETNS").is_none()

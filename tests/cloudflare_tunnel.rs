@@ -65,6 +65,21 @@ fn state(root: &Path) -> Value {
         .and_then(|s| serde_json::from_slice(&s).ok())
         .unwrap_or(Value::Null)
 }
+fn assert_no_orphan_route_diagnostic(root: &Path) {
+    let output = nook(root)
+        .args(["status", "--read-only", "--json"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = response["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "managed_routes")
+        .unwrap();
+    assert_eq!(check["status"], "ok", "{response}");
+}
 fn nook(root: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nook"));
     c.current_dir(root)
@@ -335,6 +350,7 @@ fn aliases_and_lan_runs_cannot_replace_routes_reserved_by_starting_runs() {
                 .is_some_and(|t| t.values().any(|e| !e["child"].is_null()))
         });
         let before = c.config_json();
+        assert_no_orphan_route_diagnostic(root);
         for force in [true, false] {
             let mut alias = nook(root);
             alias.args(["alias", "set", name, "9000"]);
@@ -394,6 +410,7 @@ fn aliases_and_lan_runs_cannot_replace_routes_reserved_by_starting_runs() {
         until(|| root.join("app-env.json").exists());
         until(|| state(root)["preparing"].as_object().unwrap().is_empty());
         assert_eq!(state(root)["leases"].as_object().unwrap().len(), 1);
+        assert_no_orphan_route_diagnostic(root);
         assert!(nook(root).args(["stop", name]).status().unwrap().success());
         until(|| child.0.try_wait().unwrap().is_some());
         assert!(nook(root).arg("prune").status().unwrap().success());
