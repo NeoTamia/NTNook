@@ -1,4 +1,4 @@
-//! Owned, foreground Quick Tunnels. No account provisioning or service management.
+//! Shared ownership and supervision for foreground tunnels. No account provisioning or service management.
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -108,6 +108,10 @@ pub(crate) enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Registration {
+    #[serde(default = "cloudflare_provider")]
+    pub(crate) provider: String,
+    #[serde(default)]
+    pub(crate) alias: bool,
     pub(crate) id: Uuid,
     pub(crate) owner_id: Uuid,
     pub(crate) hostname: String,
@@ -118,6 +122,9 @@ pub(crate) struct Registration {
     pub(crate) metrics_port: u16,
     pub(crate) phase: Phase,
     pub(crate) committed: bool,
+}
+fn cloudflare_provider() -> String {
+    "cloudflare".into()
 }
 impl Registration {
     pub(crate) fn route(&self) -> RouteSpec {
@@ -139,25 +146,25 @@ impl Registration {
             ),
         }
     }
-    fn directory(&self, store: &Store) -> PathBuf {
+    pub(crate) fn directory(&self, store: &Store) -> PathBuf {
         store.path().with_file_name(format!("tunnel-{}", self.id))
     }
 }
 
-fn failure(message: impl Into<String>) -> RunError {
+pub(crate) fn failure(message: impl Into<String>) -> RunError {
     RunError::Exposure(Box::new(io::Error::other(message.into())))
 }
-fn wrapped(error: impl std::fmt::Display) -> RunError {
+pub(crate) fn wrapped(error: impl std::fmt::Display) -> RunError {
     failure(error.to_string())
 }
 
 pub(crate) struct Tunnel {
-    id: Uuid,
-    store: Store,
-    child: Option<ManagedChild>,
-    agent: ureq::Agent,
-    last_poll: Instant,
-    failures: u8,
+    pub(crate) id: Uuid,
+    pub(crate) store: Store,
+    pub(crate) child: Option<ManagedChild>,
+    pub(crate) agent: ureq::Agent,
+    pub(crate) last_poll: Instant,
+    pub(crate) failures: u8,
 }
 
 impl Tunnel {
@@ -169,6 +176,9 @@ impl Tunnel {
         store: &Store,
         routes: &mut impl RouteBackend,
     ) -> Result<(Self, String), RunError> {
+        if config.ngrok {
+            return crate::ngrok::start(config, owner_id, target, store, routes, None);
+        }
         let global = crate::config::load_global().map_err(wrapped)?;
         let settings = &global.cloudflare;
         settings.validate().map_err(failure)?;
@@ -176,6 +186,8 @@ impl Tunnel {
             .ok_or_else(|| failure("cannot identify tunnel supervisor"))?;
         let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(wrapped)?;
         let registration = Registration {
+            provider: "cloudflare".into(),
+            alias: false,
             id: Uuid::new_v4(),
             owner_id,
             hostname: config.hostname.clone(),
@@ -326,17 +338,24 @@ impl Tunnel {
         }
     }
 
-    fn require_starting(&self, signals: &mut ForwardedSignals) -> Result<(), RunError> {
+    pub(crate) fn require_starting(&self, signals: &mut ForwardedSignals) -> Result<(), RunError> {
         if !signals.pending().is_empty() {
             return Err(failure("tunnel startup interrupted"));
         }
         let registry = self.store.load()?;
         if registry.tunnels.get(&self.id).is_none_or(|r| {
             r.phase == Phase::Stopping
-                || registry
-                    .preparing
-                    .get(&r.owner_id)
-                    .is_none_or(|p| p.cancelled)
+                || if r.alias {
+                    !registry
+                        .aliases
+                        .values()
+                        .any(|a| a.id == r.owner_id && a.target == r.target)
+                } else {
+                    registry
+                        .preparing
+                        .get(&r.owner_id)
+                        .is_none_or(|p| p.cancelled)
+                }
         }) {
             return Err(failure("tunnel startup cancelled"));
         }
@@ -354,7 +373,7 @@ impl Tunnel {
                 .child
                 .as_mut()
                 .is_none_or(|child| !matches!(child.try_wait(), Ok(None)))
-            || !ready(&self.agent, entry.metrics_port)
+            || !endpoint_ready(&self.agent, entry)
         {
             return Err(failure(
                 "a prepared tunnel failed before applications could start",
@@ -376,7 +395,7 @@ impl Tunnel {
             return;
         };
         if entry.phase == Phase::Stopping
-            || (entry.committed && !registry.leases.contains_key(&entry.owner_id))
+            || (entry.committed && !owner_exists(&registry.leases, &registry.aliases, entry))
         {
             self.stop();
             return;
@@ -386,7 +405,7 @@ impl Tunnel {
         };
         let phase = match child.try_wait() {
             Ok(Some(_)) => Phase::Failed,
-            Ok(None) if ready(&self.agent, entry.metrics_port) => {
+            Ok(None) if endpoint_ready(&self.agent, entry) => {
                 self.failures = 0;
                 Phase::Connected
             }
@@ -468,7 +487,7 @@ fn command(
         directory.join("caddy-root.pem").into_os_string(),
     ]
 }
-fn local_agent() -> ureq::Agent {
+pub(crate) fn local_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .proxy(None)
         .max_redirects(0)
@@ -567,7 +586,7 @@ pub(crate) fn revoke_orphans(store: &Store) -> Result<Vec<String>, crate::state:
         for entry in registry.tunnels.values_mut() {
             if entry.phase == Phase::Stopping
                 || process::workspace_supervisor_liveness(&entry.supervisor) == Liveness::Dead
-                || (entry.committed && !registry.leases.contains_key(&entry.owner_id))
+                || (entry.committed && !owner_exists(&registry.leases, &registry.aliases, entry))
             {
                 entry.phase = Phase::Stopping;
                 if let Some(child) = &entry.child
@@ -592,7 +611,7 @@ pub(crate) fn reconcile(
     let mut removed = Vec::new();
     for entry in registry.tunnels.values_mut() {
         let supervisor = process::workspace_supervisor_liveness(&entry.supervisor);
-        let owned = !entry.committed || registry.leases.contains_key(&entry.owner_id);
+        let owned = !entry.committed || owner_exists(&registry.leases, &registry.aliases, entry);
         if entry.phase == Phase::Stopping || supervisor == Liveness::Dead || !owned {
             entry.phase = Phase::Stopping;
             if let Some(child) = &entry.child {
@@ -604,7 +623,11 @@ pub(crate) fn reconcile(
                     continue;
                 }
             }
-            match routes.remove_if_owned(&entry.route().hostname, entry.id, true) {
+            match if entry.provider == "ngrok" {
+                Ok(())
+            } else {
+                routes.remove_if_owned(&entry.route().hostname, entry.id, true)
+            } {
                 Ok(()) => {
                     let directory = entry.directory(store);
                     match fs::remove_dir_all(directory) {
@@ -615,11 +638,11 @@ pub(crate) fn reconcile(
                 }
                 Err(error) => warnings.push(error.to_string()),
             }
-        } else if supervisor == Liveness::Alive {
+        } else if supervisor == Liveness::Alive && entry.provider == "cloudflare" {
             if let Err(error) = routes.ensure(&entry.route()) {
                 warnings.push(error.to_string());
             }
-        } else {
+        } else if supervisor != Liveness::Alive {
             warnings.push(format!(
                 "tunnel {} supervisor identity is indeterminate",
                 entry.id
@@ -630,6 +653,31 @@ pub(crate) fn reconcile(
         registry.tunnels.remove(&id);
     }
     warnings
+}
+
+fn owner_exists(
+    leases: &std::collections::BTreeMap<Uuid, Lease>,
+    aliases: &std::collections::BTreeMap<String, crate::state::Alias>,
+    entry: &Registration,
+) -> bool {
+    if entry.alias {
+        aliases
+            .values()
+            .any(|a| a.id == entry.owner_id && a.target == entry.target)
+    } else {
+        leases.contains_key(&entry.owner_id)
+    }
+}
+fn endpoint_ready(agent: &ureq::Agent, entry: &Registration) -> bool {
+    if entry.provider == "ngrok" {
+        crate::ngrok::discover(agent, entry)
+            .ok()
+            .flatten()
+            .as_ref()
+            .is_some_and(|url| Some(url) == entry.url.as_ref())
+    } else {
+        ready(agent, entry.metrics_port)
+    }
 }
 
 #[cfg(test)]

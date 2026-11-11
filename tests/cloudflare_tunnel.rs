@@ -146,6 +146,7 @@ fn assert_doctor_routes_read_only(c: &CaddyHarness) {
     let root = c.root();
     let path = root.join("state/nook/state.json");
     let before = fs::read(&path).unwrap();
+    let docker_before = fs::read(root.join("docker-observations")).ok();
     let config = c.config_json();
     let output = nook(root)
         .args(["doctor", "--json"])
@@ -162,6 +163,11 @@ fn assert_doctor_routes_read_only(c: &CaddyHarness) {
     for route in routes {
         assert_eq!(route["reason_code"], "matches", "{report}");
     }
+    assert_no_orphan_route_diagnostic(root);
+    assert_eq!(
+        fs::read(root.join("docker-observations")).ok(),
+        docker_before
+    );
     assert_eq!(fs::read(path).unwrap(), before);
     assert_eq!(c.config_json(), config);
 }
@@ -209,6 +215,7 @@ fn compose_and_tunnel_migration_observation_reconcile_and_cleanup_preserve_each_
 import json,pathlib,sys
 root=pathlib.Path(__file__).resolve().parent.parent
 a=sys.argv[1:]
+with (root/'docker-observations').open('a') as log: log.write(repr(a)+'\n')
 if a[0]=='info': print(json.dumps({'ID':'engine','OSType':'linux'}))
 elif a[0]=='ps': print('owned' if not (root/'compose-stopped').exists() else '')
 elif a[0]=='inspect': print((root/'containers.json').read_text())
@@ -225,7 +232,7 @@ else: raise SystemExit('unexpected Docker mutation: '+repr(a))
     assert_doctor_routes_read_only(&c);
     assert_no_orphan_route_diagnostic(root);
     assert_eq!(fs::read(&path).unwrap(), original);
-    assert!(!path.with_extension("pre-v5.json").exists());
+    assert!(!path.with_extension("pre-v6.json").exists());
     let mut child = Running(
         nook(root)
             .args([
@@ -257,9 +264,44 @@ else: raise SystemExit('unexpected Docker mutation: '+repr(a))
             })
         })
     });
-    assert_eq!(state(root)["format_version"], 5);
+    let ngrok_binary = root.join("ngrok");
+    fs::write(&ngrok_binary, include_str!("support/ngrok_api_mock.py")).unwrap();
+    fs::set_permissions(&ngrok_binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let global = root.join("config/nook/config.toml");
+    let mut config = fs::read_to_string(&global).unwrap();
+    config.push_str(&format!(
+        "\n[ngrok]\nbinary = {:?}\nstartup_timeout_seconds = 3\n",
+        ngrok_binary.to_str().unwrap()
+    ));
+    fs::write(global, config).unwrap();
+    let mut ngrok = Running(
+        nook(root)
+            .args([
+                "run",
+                "--name",
+                "ngrok-app",
+                "--tunnel",
+                "ngrok",
+                "--",
+                "python3",
+                "app.py",
+            ])
+            .env("NGROK_AUTHTOKEN", "fixture-token")
+            .stderr(fs::File::create(root.join("ngrok.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    until(|| {
+        state(root)["leases"].as_object().is_some_and(|leases| {
+            leases
+                .values()
+                .any(|l| l["hostname"] == "ngrok-app.localhost" && l["state"] == "ready")
+        })
+    });
+    assert_eq!(state(root)["tunnels"].as_object().unwrap().len(), 2);
+    assert_eq!(state(root)["format_version"], 6);
     assert_eq!(
-        fs::read(path.with_extension("pre-v5.json")).unwrap(),
+        fs::read(path.with_extension("pre-v6.json")).unwrap(),
         original
     );
     assert_eq!(state(root)["compose_projects"]["identity"], project);
@@ -267,7 +309,7 @@ else: raise SystemExit('unexpected Docker mutation: '+repr(a))
     assert_no_orphan_route_diagnostic(root);
     assert!(nook(root).arg("prune").status().unwrap().success());
     assert_eq!(state(root)["compose_projects"]["identity"], project);
-    assert_eq!(state(root)["tunnels"].as_object().unwrap().len(), 1);
+    assert_eq!(state(root)["tunnels"].as_object().unwrap().len(), 2);
     // Removing a stopped Compose endpoint must leave both tunnel routes intact.
     fs::write(root.join("compose-stopped"), "").unwrap();
     assert!(nook(root).arg("prune").status().unwrap().success());
@@ -277,13 +319,29 @@ else: raise SystemExit('unexpected Docker mutation: '+repr(a))
             .unwrap()
     );
     assert_doctor_routes_read_only(&c);
-    assert_eq!(state(root)["tunnels"].as_object().unwrap().len(), 1);
+    assert_eq!(state(root)["tunnels"].as_object().unwrap().len(), 2);
     fs::remove_file(root.join("compose-stopped")).unwrap();
     assert!(nook(root).arg("prune").status().unwrap().success());
     assert_eq!(state(root)["compose_projects"]["identity"], project);
     // Supervisor crash and prune revoke the connector, never Compose or foreign routes.
     child.0.kill().unwrap();
     child.0.wait().unwrap();
+    assert!(nook(root).arg("prune").status().unwrap().success());
+    let remaining = state(root);
+    assert_eq!(remaining["tunnels"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        remaining["tunnels"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["provider"],
+        "ngrok"
+    );
+    assert!(ngrok.0.try_wait().unwrap().is_none());
+    assert_doctor_routes_read_only(&c);
+    ngrok.0.kill().unwrap();
+    ngrok.0.wait().unwrap();
     assert!(nook(root).arg("prune").status().unwrap().success());
     assert!(state(root)["tunnels"].as_object().unwrap().is_empty());
     assert_eq!(state(root)["compose_projects"]["identity"], project);

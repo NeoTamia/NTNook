@@ -32,7 +32,7 @@ fn tunnel_options_templates_and_preflight_are_explicit() {
         assert_eq!(entry["tunnel"].as_str(), Some("cloudflare"));
     }
     for flags in [
-        vec!["run", "--tunnel", "ngrok"],
+        vec!["run", "--tunnel", "unsupported"],
         vec!["run", "--tunnel", "cloudflare", "--no-tunnel"],
         vec!["alias", "set", "web", "3000", "--tunnel", "cloudflare"],
     ] {
@@ -76,5 +76,60 @@ fn tunnel_options_templates_and_preflight_are_explicit() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&output.stderr).contains("install it explicitly"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ngrok_templates_and_validation_do_not_need_authentication() {
+    let root = std::env::temp_dir().join(format!("nook-ngrok-config-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    for workspace in [false, true] {
+        let mut cmd = command(&root);
+        cmd.args([
+            "init",
+            "--print",
+            "--name",
+            "web",
+            "--tunnel",
+            "ngrok",
+            "--ngrok-url",
+            "https://web.ngrok.app",
+        ]);
+        if workspace {
+            cmd.arg("--workspace");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: toml::Value =
+            toml::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        let entry = if workspace { &value["apps"][0] } else { &value };
+        assert_eq!(entry["tunnel"].as_str(), Some("ngrok"));
+        assert_eq!(entry["ngrok_url"].as_str(), Some("https://web.ngrok.app"));
+    }
+    for args in [
+        vec!["init", "--print", "--ngrok-url", "https://web.ngrok.app"],
+        vec![
+            "run",
+            "--no-tunnel",
+            "--ngrok-url",
+            "https://web.ngrok.app",
+            "--",
+            "unused",
+        ],
+        vec![
+            "init",
+            "--print",
+            "--tunnel",
+            "ngrok",
+            "--ngrok-url",
+            "https://evil.example",
+        ],
+    ] {
+        assert!(!command(&root).args(args).output().unwrap().status.success());
+    }
     fs::remove_dir_all(root).unwrap();
 }

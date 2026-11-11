@@ -885,3 +885,9 @@ and `nook compose down` for ownership-checked teardown that preserves volumes.
 See [the application Compose guide](docs/COMPOSE.md) for labels, dynamic ports,
 worktree isolation, network setup and recovery. This is separate from running
 Caddy itself in Docker.
+
+## ngrok
+
+`nook run --tunnel ngrok -- vite` adds a public URL using an already authenticated
+ngrok CLI. Local Caddy routes remain unchanged. See [ngrok tunnels](docs/NGROK.md)
+for stable domains, workspaces, foreground aliases, security and recovery.

@@ -356,7 +356,8 @@ pub(crate) fn execute(
                 .chain(
                     r.tunnels
                         .values()
-                        .map(crate::cloudflare::Registration::route),
+                        .filter(|entry| entry.provider == "cloudflare")
+                        .map(crate::tunnel::Registration::route),
                 )
                 .chain(
                     crate::compose::observations(r)
@@ -547,6 +548,7 @@ fn inspect_project(
         return Vec::new();
     }
     let run = crate::cli::RunArgs {
+        ngrok_url: None,
         tunnel: None,
         no_tunnel: false,
         observation: false,

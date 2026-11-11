@@ -13,6 +13,8 @@ on:
       - "packages/nook-run/README.md"
       - "docs/WORKSPACES.md"
       - "docs/COMPOSE.md"
+
+      - "docs/NGROK.md"
       - "tests/**"
       - "docker/**"
       - "README.md"
@@ -32,6 +34,8 @@ on:
       - "packages/nook-run/README.md"
       - "docs/WORKSPACES.md"
       - "docs/COMPOSE.md"
+
+      - "docs/NGROK.md"
       - "tests/**"
       - "docker/**"
       - "README.md"

@@ -774,6 +774,8 @@ impl SessionMember {
         Ok(ResolvedRunConfig {
             provenance: Default::default(),
             tunnel: false,
+            ngrok: false,
+            ngrok_url: None,
             worktree: self.app.worktree.clone(),
             hostname: self.app.hostname.clone(),
             command: args.command.clone(),
@@ -996,7 +998,12 @@ fn validate_arguments(app: &SessionApp, args: &RunArgs) -> crate::Result<()> {
             "member worktree overrides are incompatible with a workspace session; configure the root session",
         ));
     }
-    if args.tailscale || args.funnel || args.lan || args.tunnel.is_some() || args.no_tunnel {
+    if args.tailscale
+        || args.funnel
+        || args.lan
+        || (args.tunnel.is_some() || args.ngrok_url.is_some())
+        || args.no_tunnel
+    {
         return Err(invalid(
             "member exposure overrides are incompatible with a workspace session",
         ));

@@ -52,6 +52,8 @@ pub(crate) enum Command {
     Stop(StopArgs),
     /// Diagnose Tailscale Serve and Funnel exposure.
     Tailscale(TailscaleArgs),
+    /// Manage foreground public tunnel sessions.
+    Tunnel(TunnelArgs),
     /// Remove stale leases and reconcile routes.
     Prune,
     /// Manage Caddy's local certificate authority.
@@ -94,9 +96,12 @@ pub(crate) enum CompletionKind {
 
 #[derive(Debug, Args)]
 pub(crate) struct InitArgs {
-    /// Publish a temporary public URL through Cloudflare (no SSE support).
-    #[arg(long, value_parser = ["cloudflare"], conflicts_with = "no_tunnel")]
+    /// Publish a public URL through Cloudflare or ngrok (provider limits apply).
+    #[arg(long, value_parser = ["cloudflare", "ngrok"], conflicts_with = "no_tunnel")]
     pub(crate) tunnel: Option<String>,
+    /// Reserved ngrok HTTPS URL; omitted uses the account dev domain.
+    #[arg(long)]
+    pub(crate) ngrok_url: Option<String>,
     /// Disable the tunnel configured by the project.
     #[arg(long)]
     pub(crate) no_tunnel: bool,
@@ -246,9 +251,12 @@ pub(crate) struct RunArgs {
     #[arg(skip)]
     pub(crate) observation: bool,
 
-    /// Publish a temporary public URL through Cloudflare (no SSE support).
-    #[arg(long, value_parser = ["cloudflare"], conflicts_with = "no_tunnel")]
+    /// Publish a public URL through Cloudflare or ngrok (provider limits apply).
+    #[arg(long, value_parser = ["cloudflare", "ngrok"], conflicts_with = "no_tunnel")]
     pub(crate) tunnel: Option<String>,
+    /// Reserved ngrok HTTPS URL; omitted uses the account dev domain.
+    #[arg(long)]
+    pub(crate) ngrok_url: Option<String>,
     /// Disable the tunnel configured by the project.
     #[arg(long)]
     pub(crate) no_tunnel: bool,
@@ -373,6 +381,30 @@ pub(crate) struct TailscaleArgs {
 pub(crate) enum TailscaleCommand {
     /// Check client, tailscaled, login, HTTPS, and Nook Serve registrations.
     Status,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TunnelArgs {
+    #[command(subcommand)]
+    command: TunnelCommand,
+}
+#[derive(Debug, Subcommand)]
+enum TunnelCommand {
+    /// Temporarily publish an existing alias; keep this command running.
+    Alias {
+        name: String,
+        #[arg(long, value_parser = ["ngrok"], default_value = "ngrok")]
+        provider: String,
+        #[arg(long)]
+        ngrok_url: Option<String>,
+        #[arg(long)]
+        upstream_ca: Option<PathBuf>,
+    },
+    List,
+    /// Stop an alias tunnel by its UUID (runs use nook stop).
+    Stop {
+        id: uuid::Uuid,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -519,6 +551,7 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Prune => prune_command(&global, output, errors).map(|()| 0),
         Command::Run(arguments) => run_command(arguments, &global, errors),
         Command::Stop(arguments) => stop_command(arguments, output).map(|()| 0),
+        Command::Tunnel(arguments) => tunnel_command(arguments, &global, output),
         Command::Tailscale(TailscaleArgs {
             command: TailscaleCommand::Status,
         }) => tailscale_status_command(output, errors).map(|()| 0),
@@ -676,13 +709,20 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
     contents.push_str(
         "\n# Align Vite/Nuxt/Astro when the command is that CLI. Use \"none\" to disable.\n",
     );
+    if let Some(url) = &arguments.ngrok_url {
+        crate::ngrok::validate_url(url).map_err(io::Error::other)?;
+        if arguments.tunnel.as_deref() != Some("ngrok") {
+            return Err(io::Error::other("--ngrok-url requires --tunnel ngrok").into());
+        }
+        contents.push_str(&format!("ngrok_url = {}\n", toml_string(url)));
+    }
     if arguments.tunnel.is_some() || arguments.no_tunnel {
         contents.push_str(&format!(
             "tunnel = {}\n",
             toml_string(if arguments.no_tunnel {
                 "none"
             } else {
-                "cloudflare"
+                arguments.tunnel.as_deref().unwrap_or("none")
             })
         ));
     }
@@ -753,13 +793,20 @@ fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::R
         worktree_config_template(arguments)?,
         toml::Value::Array(command)
     );
+    if let Some(url) = &arguments.ngrok_url {
+        crate::ngrok::validate_url(url).map_err(io::Error::other)?;
+        if arguments.tunnel.as_deref() != Some("ngrok") {
+            return Err(io::Error::other("--ngrok-url requires --tunnel ngrok").into());
+        }
+        contents.push_str(&format!("ngrok_url = {}\n", toml_string(url)));
+    }
     if arguments.tunnel.is_some() || arguments.no_tunnel {
         contents.push_str(&format!(
             "tunnel = {}\n",
             toml_string(if arguments.no_tunnel {
                 "none"
             } else {
-                "cloudflare"
+                arguments.tunnel.as_deref().unwrap_or("none")
             })
         ));
     }
@@ -1577,7 +1624,11 @@ fn run_command(
     let config =
         crate::config::resolve_run(&arguments, &current_directory, global.run_bind_address)?;
     if config.tunnel {
-        crate::cloudflare::preflight()?;
+        if config.ngrok {
+            crate::ngrok::preflight()?;
+        } else {
+            crate::tunnel::preflight()?;
+        }
     }
     reconcile_before_command(global, errors)?;
     if let Some(path) = &config.ignored_local_config {
@@ -1598,7 +1649,7 @@ fn run_command(
     }
     with_caddy_routes(
         global,
-        config.tls || config.tunnel,
+        config.tls || (config.tunnel && !config.ngrok),
         !config.tls || config.lan,
         |routes| {
             if config.lan {
@@ -1695,18 +1746,43 @@ fn run_workspace_command(
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
-    if workspace
+    let selected: Vec<_> = workspace
         .apps
         .iter()
-        .any(|app| app.config.tunnel && only.is_none_or(|id| id == app.id))
+        .filter(|app| only.is_none_or(|id| id == app.id))
+        .collect();
+    let ngrok: Vec<_> = selected.iter().filter(|app| app.config.ngrok).collect();
+    if ngrok.len() > 1 && ngrok.iter().any(|app| app.config.ngrok_url.is_none()) {
+        return Err(io::Error::other("multiple ngrok apps require distinct explicit ngrok_url values; use --only for the account dev domain").into());
+    }
+    let urls: BTreeSet<_> = ngrok
+        .iter()
+        .filter_map(|app| app.config.ngrok_url.as_ref())
+        .collect();
+    if urls.len()
+        != ngrok
+            .iter()
+            .filter(|app| app.config.ngrok_url.is_some())
+            .count()
     {
-        crate::cloudflare::preflight()?;
+        return Err(
+            io::Error::other("ngrok apps must have distinct URLs (pooling is disabled)").into(),
+        );
+    }
+    if !ngrok.is_empty() {
+        crate::ngrok::preflight()?;
+    }
+    if selected
+        .iter()
+        .any(|app| app.config.tunnel && !app.config.ngrok)
+    {
+        crate::tunnel::preflight()?;
     }
     let prepared = crate::workspace::prepare(workspace, only)?;
     let https = prepared
         .apps
         .iter()
-        .any(|app| app.app.config.tls || app.app.config.tunnel);
+        .any(|app| app.app.config.tls || (app.app.config.tunnel && !app.app.config.ngrok));
     let http = prepared
         .apps
         .iter()
@@ -1793,7 +1869,7 @@ fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<(
             .values_mut()
             .filter(|entry| entry.hostname == hostname)
         {
-            entry.phase = crate::cloudflare::Phase::Stopping;
+            entry.phase = crate::tunnel::Phase::Stopping;
         }
         Ok(cancelled)
     })?;
@@ -2156,7 +2232,7 @@ fn prune_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
-    for warning in crate::cloudflare::revoke_orphans(&store)? {
+    for warning in crate::tunnel::revoke_orphans(&store)? {
         writeln!(errors, "warning: {warning}")?;
     }
     let operations = store.lock_operations()?;
@@ -2212,7 +2288,7 @@ fn reconcile_before_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
-    for warning in crate::cloudflare::revoke_orphans(&store)? {
+    for warning in crate::tunnel::revoke_orphans(&store)? {
         writeln!(errors, "warning: {warning}")?;
     }
     let operations = store.lock_operations()?;
@@ -2309,7 +2385,7 @@ fn reconcile_and_record(
             crate::reconcile::reconcile(registry, routes, crate::process::lease_liveness);
         report
             .warnings
-            .extend(crate::cloudflare::reconcile(registry, store, routes));
+            .extend(crate::tunnel::reconcile(registry, store, routes));
         registry.selected_servers.https = selection.https.clone();
         registry.selected_servers.http = selection.http.clone();
         registry.last_synchronized_at_unix_ms = Some(synchronized_at);
@@ -2386,7 +2462,11 @@ fn expected_routes(
             ));
         }
     }
-    for entry in registry.tunnels.values() {
+    for entry in registry
+        .tunnels
+        .values()
+        .filter(|e| e.provider == "cloudflare")
+    {
         routes.insert((entry.id, entry.route().hostname, true));
     }
     for (id, entry) in &registry.preparing {
@@ -2597,14 +2677,135 @@ fn observation_url(
     Ok(i32::from(value["ok"] != true))
 }
 
+fn tunnel_command(
+    arguments: TunnelArgs,
+    global: &crate::config::GlobalConfig,
+    output: &mut impl Write,
+) -> crate::Result<i32> {
+    let store = state_store()?;
+    match arguments.command {
+        TunnelCommand::List => {
+            write_tunnels(&store.load()?, output)?;
+            Ok(0)
+        }
+        TunnelCommand::Stop { id } => {
+            let _guard = store.lock_operations()?;
+            let child = store.mutate(|registry| {
+                let entry =
+                    registry
+                        .tunnels
+                        .get_mut(&id)
+                        .ok_or_else(|| crate::state::Error::Io {
+                            path: store.path().to_owned(),
+                            source: io::Error::other("unknown tunnel ID"),
+                        })?;
+                if !entry.alias {
+                    return Err(crate::state::Error::Io {
+                        path: store.path().to_owned(),
+                        source: io::Error::other(
+                            "run tunnels stop with their application; use nook stop",
+                        ),
+                    });
+                }
+                entry.phase = crate::tunnel::Phase::Stopping;
+                Ok(entry.child.clone())
+            })?;
+            if let Some(child) = child {
+                crate::process::kill_owned_lease(&child).map_err(io::Error::other)?;
+            }
+            Ok(0)
+        }
+        TunnelCommand::Alias {
+            name,
+            ngrok_url,
+            upstream_ca,
+            ..
+        } => {
+            crate::ngrok::preflight()?;
+            let hostname = crate::config::normalize_hostname(&name)?;
+            let alias = store
+                .load()?
+                .aliases
+                .get(&hostname)
+                .cloned()
+                .ok_or_else(|| io::Error::other("unknown alias"))?;
+            let config = crate::config::ResolvedRunConfig {
+                provenance: Default::default(),
+                tunnel: true,
+                ngrok: true,
+                ngrok_url,
+                worktree: None,
+                hostname,
+                command: Vec::new(),
+                tls: alias.tls,
+                tailscale: false,
+                funnel: false,
+                lan: false,
+                app_port: None,
+                strict_port: false,
+                force: false,
+                readiness_warn_after_seconds: 30,
+                bind_address: "127.0.0.1".parse().expect("loopback"),
+                ignored_local_config: None,
+                framework: crate::framework::FrameworkChoice::Disabled,
+            };
+            with_caddy_routes(global, alias.tls, !alias.tls, |routes| {
+                let (mut tunnel, _) = crate::ngrok::start(
+                    &config,
+                    alias.id,
+                    &alias.target,
+                    &store,
+                    routes,
+                    Some(crate::ngrok::AliasOptions {
+                        preserve_host: alias.preserve_host,
+                        ca: upstream_ca.as_deref(),
+                    }),
+                )?;
+                let mut signals =
+                    crate::process::ForwardedSignals::new().map_err(io::Error::other)?;
+                let mut code = 0;
+                loop {
+                    if !signals.pending().is_empty() {
+                        break;
+                    }
+                    tunnel.poll();
+                    let registry = store.load()?;
+                    let Some(entry) = registry.tunnels.get(&tunnel.id) else {
+                        break;
+                    };
+                    if entry.phase == crate::tunnel::Phase::Stopping {
+                        break;
+                    }
+                    if entry.phase == crate::tunnel::Phase::Failed {
+                        code = 1;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                tunnel.stop();
+                let _guard = store.lock_operations()?;
+                store.mutate(|registry| {
+                    for warning in crate::tunnel::reconcile(registry, &store, routes) {
+                        eprintln!("warning: {warning}");
+                    }
+                    Ok(())
+                })?;
+                Ok(code)
+            })
+        }
+    }
+}
+
 fn write_tunnels(registry: &crate::state::Registry, output: &mut impl Write) -> crate::Result<()> {
     for entry in registry.tunnels.values() {
         writeln!(
             output,
-            "tunnel\tcloudflare\t{:?}\t{}\t{}",
+            "tunnel\t{}\t{:?}\t{}\t{}\t{}",
+            entry.provider,
             entry.phase,
             entry.hostname,
-            entry.url.as_deref().unwrap_or("pending")
+            entry.url.as_deref().unwrap_or("pending"),
+            entry.id
         )?;
     }
     Ok(())

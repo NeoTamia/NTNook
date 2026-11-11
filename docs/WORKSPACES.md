@@ -442,3 +442,10 @@ be used in another app's environment. Each child also receives its own
 `NOOK_TUNNEL_URL`; joining wrappers must not override exposure options.
 Worktrees remain isolated. These are public, ephemeral URLs, without SSE support.
 See [the Cloudflare guide](CLOUDFLARE.md) for prerequisites and recovery.
+
+### ngrok
+
+Use `tunnel = "ngrok"` per app and `${api.tunnel_url}` for public references.
+Multiple selected ngrok apps require distinct explicit `ngrok_url` values.
+The root owns the agents in native and runner mode; members inherit URLs.
+See [ngrok tunnels](NGROK.md).
