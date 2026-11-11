@@ -148,7 +148,7 @@ pub(crate) struct ProjectConfig {
     pub(crate) worktree: Option<crate::worktree::Setting>,
     format_version: u32,
     pub(crate) name: Option<String>,
-    command: Option<Vec<String>>,
+    pub(crate) command: Option<Vec<String>>,
     tls: Option<bool>,
     tunnel: Option<TunnelChoice>,
     ngrok_url: Option<String>,

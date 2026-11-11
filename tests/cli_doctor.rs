@@ -203,7 +203,33 @@ fn commandless_project_is_valid_for_doctor_but_not_for_run() {
 
     let run = fixture.command().args(["run"]).output().unwrap();
     assert!(!run.status.success());
-    assert!(String::from_utf8_lossy(&run.stderr).contains("a child command is required"));
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("a child command is required"),
+        "{run:?}"
+    );
+}
+
+#[test]
+fn workspace_inspection_allows_omitted_but_rejects_explicitly_empty_commands() {
+    for (command, expected) in [("", "pass"), ("command = []\n", "fail")] {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.root.join("project/api")).unwrap();
+        fs::write(
+            fixture.root.join("project/nook.toml"),
+            format!(
+                "format_version = 2\nname = 'preview'\n[[apps]]\nid = 'api'\ndir = 'api'\n{command}"
+            ),
+        )
+        .unwrap();
+        let (_, report) = fixture.doctor(&[]);
+        assert_eq!(
+            check(&report, "config.project")["status"],
+            expected,
+            "{report}"
+        );
+        assert!(!fixture.root.join("state").exists());
+        fixture.assert_read_only();
+    }
 }
 
 #[test]
