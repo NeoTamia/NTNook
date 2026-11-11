@@ -302,6 +302,48 @@ fn cli_json_and_commandless_workspace_urls_share_the_api() {
 }
 
 #[test]
+fn alias_tools_cannot_take_an_inactive_compose_reservation() {
+    let fixture = Fixture::new();
+    fixture.global("http://127.0.0.1:1");
+    let owner = Uuid::new_v4().to_string();
+    let registry = json!({
+        "format_version":3,"last_synchronized_at_unix_ms":null,
+        "compose_projects":{"identity":{
+            "id":Uuid::new_v4(),"identity":"identity","root":fixture.root,
+            "name":"app","namespace":"app","host":"unix:///unused.sock","engine":"engine",
+            "services":["web"],"routes":{"web/http":{
+                "service":"web","port":8080,"active":false,"desired":true,"status":"stopped",
+                "alias":{"id":owner,"hostname":"web.localhost","target":"http://127.0.0.1:8080/",
+                    "scheme":"http","tls":false,"preserve_host":true}
+            }}
+        }}
+    });
+    let path = fixture.registry();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, registry.to_string()).unwrap();
+    let original = fs::read(&path).unwrap();
+    let mut client = fixture.spawn(&["--tools", "read,aliases", "--allow-alias", "web.localhost"]);
+    client.initialize("2025-11-25");
+    for (tool, input, code) in [
+        (
+            "nook_alias_set",
+            json!({"hostname":"web.localhost","target":3000}),
+            "CONFLICT",
+        ),
+        (
+            "nook_alias_remove",
+            json!({"hostname":"web.localhost","expected_owner_id":owner}),
+            "OWNERSHIP_CHANGED",
+        ),
+    ] {
+        let result = client.call(tool, input);
+        assert_eq!(result["error"]["code"], code, "{result}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    client.close();
+}
+
+#[test]
 fn alias_profile_requires_explicit_grants() {
     let fixture = Fixture::new();
     for args in [

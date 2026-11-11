@@ -1177,6 +1177,12 @@ impl Context {
         let store = self.store(budget)?;
         let _guard = store.lock_operations()?;
         let registry = store.snapshot()?;
+        if crate::compose::claims(&registry, &hostname) {
+            return Err(Failure::new(
+                Code::Conflict,
+                "Compose owns this hostname; use nook compose",
+            ));
+        }
         if registry
             .leases
             .values()
@@ -1308,6 +1314,7 @@ impl Context {
         let alias = registry.aliases.get(&hostname);
         if alias.is_some_and(|a| a.id != owner)
             || registry.leases.values().any(|l| l.hostname == hostname)
+            || crate::compose::claims(&registry, &hostname)
         {
             return Err(Failure::new(
                 Code::OwnershipChanged,
