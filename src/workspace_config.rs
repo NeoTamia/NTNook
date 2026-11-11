@@ -292,6 +292,7 @@ fn load_inner(
         }
         let hostname = config::normalize_hostname(project.name.as_deref().unwrap())?;
         let name_source = project.provenance.get("name").cloned();
+        let has_command = project.command.is_some();
         let environment = project.env.take().unwrap_or_default();
         let mut resolved = config::merge_run(
             &member_arguments,
@@ -322,7 +323,9 @@ fn load_inner(
         resolved.ignored_local_config = ignored_root_local.clone().or_else(|| {
             (!use_local && member_local.exists() && member_local != path).then_some(member_local)
         });
-        if resolved.command.is_empty() && !arguments.runner && !arguments.observation {
+        if resolved.command.is_empty()
+            && (has_command || (!arguments.runner && !arguments.observation))
+        {
             return Err(invalid(
                 &path,
                 format!("app `{}` requires a nonempty command argv", member.id),

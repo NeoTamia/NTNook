@@ -551,7 +551,7 @@ fn inspect_project(
         ngrok_url: None,
         tunnel: None,
         no_tunnel: false,
-        observation: false,
+        observation: true,
         config: args.config.clone(),
         local: args.local,
         name: args.name.clone(),
