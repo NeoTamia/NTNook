@@ -11,6 +11,9 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "support/compose_registry.rs"]
+mod compose_registry;
+
 struct Fixture {
     root: PathBuf,
 }
@@ -302,6 +305,99 @@ fn cli_json_and_commandless_workspace_urls_share_the_api() {
 }
 
 #[test]
+fn alias_tools_cannot_take_an_inactive_compose_reservation() {
+    let fixture = Fixture::new();
+    fixture.global("http://127.0.0.1:1");
+    let owner = Uuid::new_v4().to_string();
+    let registry =
+        compose_registry::registry(&fixture.root, Uuid::parse_str(&owner).unwrap(), false);
+    let path = fixture.registry();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, registry.to_string()).unwrap();
+    let original = fs::read(&path).unwrap();
+    let mut client = fixture.spawn(&["--tools", "read,aliases", "--allow-alias", "web.localhost"]);
+    client.initialize("2025-11-25");
+    for (tool, input, code) in [
+        (
+            "nook_alias_set",
+            json!({"hostname":"web.localhost","target":3000}),
+            "CONFLICT",
+        ),
+        (
+            "nook_alias_remove",
+            json!({"hostname":"web.localhost","expected_owner_id":owner}),
+            "OWNERSHIP_CHANGED",
+        ),
+    ] {
+        let result = client.call(tool, input);
+        assert_eq!(result["error"]["code"], code, "{result}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+    client.close();
+}
+
+#[test]
+fn compose_observations_are_read_only_and_scoped_to_the_recorded_root() {
+    let fixture = Fixture::new();
+    fixture.global("http://127.0.0.1:1");
+    let owner = Uuid::new_v4();
+    let mut registry = compose_registry::registry(&fixture.root, owner, false);
+    let path = fixture.registry();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, registry.to_string()).unwrap();
+    let original = fs::read(&path).unwrap();
+    let mut client = fixture.spawn(&[]);
+    client.initialize("2025-11-25");
+    let list = client.call("nook_list", json!({"kind":"compose"}));
+    let entries = list["data"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{list}");
+    let entry = &entries[0];
+    assert_eq!(entry["resource_id"], owner.to_string());
+    assert_eq!(entry["kind"], "compose");
+    assert_eq!(entry["liveness"], "unknown");
+    assert_eq!(entry["compose"]["active"], false);
+    assert_eq!(entry["compose"]["service"], "web");
+    assert_eq!(entry["compose"]["port"], 8080);
+    assert_eq!(
+        client.call("nook_list", json!({"kind":"alias"}))["data"]["entries"],
+        json!([])
+    );
+    assert_eq!(
+        client.call("nook_url", json!({"hostname":"web.localhost"}))["data"]["url"],
+        "http://web.localhost"
+    );
+    let status = client.call("nook_status", json!({}));
+    let live = status["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "process_liveness")
+        .unwrap();
+    assert_eq!(live["status"], "unknown");
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!path.with_extension("pre-compose.json").exists());
+    client.close();
+
+    // A matching hostname is not sufficient to expose another worktree's project.
+    registry["compose_projects"]["identity"]["root"] = json!(fixture.root.join("other"));
+    fs::write(&path, registry.to_string()).unwrap();
+    let mut scoped = fixture.spawn(&[]);
+    scoped.initialize("2025-11-25");
+    assert_eq!(
+        scoped.call("nook_list", json!({"kind":"compose"}))["data"]["entries"],
+        json!([])
+    );
+    scoped.close();
+    let mut all = fixture.spawn(&["--scope", "user"]);
+    all.initialize("2025-11-25");
+    assert_eq!(
+        all.call("nook_list", json!({"kind":"compose"}))["data"]["entries"][0]["resource_id"],
+        owner.to_string()
+    );
+    all.close();
+}
+
+#[test]
 fn alias_profile_requires_explicit_grants() {
     let fixture = Fixture::new();
     for args in [
@@ -588,6 +684,69 @@ fn caddy_alias_lifecycle(tls: bool) {
         .read_json()
         .unwrap();
     assert_eq!(observed, caddy_before);
+    // The same installed route can belong to Compose rather than a manual alias.
+    // Observation must recognize that owner without calling Docker or reconciling.
+    let mut compose_state = compose_registry::registry(
+        &fixture.root,
+        Uuid::parse_str(owner.as_str().unwrap()).unwrap(),
+        true,
+    );
+    let saved_state: Value = serde_json::from_slice(&state_before).unwrap();
+    compose_state["compose_projects"]["identity"]["routes"]["web/http"]["alias"] =
+        saved_state["aliases"]["db.localhost"].clone();
+    for (active, changed_host, changed_tls, expected) in [
+        (true, false, false, "ok"),
+        (false, false, false, "warning"),
+        (false, true, false, "warning"),
+        (false, false, true, "warning"),
+    ] {
+        compose_state["compose_projects"]["identity"]["routes"]["web/http"]["active"] =
+            json!(active);
+        let alias =
+            &mut compose_state["compose_projects"]["identity"]["routes"]["web/http"]["alias"];
+        alias["hostname"] = json!(if changed_host {
+            "changed.localhost"
+        } else {
+            "db.localhost"
+        });
+        alias["tls"] = json!(if changed_tls { !tls } else { tls });
+        fs::write(fixture.registry(), compose_state.to_string()).unwrap();
+        let before = fs::read(fixture.registry()).unwrap();
+        let status = client.call("nook_status", json!({}));
+        let routes = status["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "managed_routes")
+            .unwrap();
+        assert_eq!(routes["status"], expected, "{status}");
+        if !active {
+            assert_eq!(routes["affected_resource_ids"], json!([owner]));
+        }
+        assert_eq!(fs::read(fixture.registry()).unwrap(), before);
+        let observed: Value = ureq::get(&endpoint)
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+        assert_eq!(observed, caddy_before);
+    }
+    ureq::patch(format!("{admin}/config/apps/http/servers/http/routes"))
+        .send_json(json!([foreign.clone()]))
+        .unwrap();
+    let status = client.call("nook_status", json!({}));
+    let routes = status["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "managed_routes")
+        .unwrap();
+    assert_eq!(routes["status"], "ok", "{status}");
+    ureq::post(format!("{admin}/load"))
+        .send_json(&caddy_before)
+        .unwrap();
+    fs::write(fixture.registry(), &state_before).unwrap();
     let wrong = client.call(
         "nook_alias_remove",
         json!({"hostname":"db.localhost","expected_owner_id":Uuid::new_v4().to_string()}),

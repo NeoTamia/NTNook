@@ -489,6 +489,9 @@ pub(crate) fn prepare_run(
     exposure: &mut impl RunExposure,
 ) -> Result<PreparedRun, RunError> {
     let registry = store.load()?;
+    if crate::compose::claims(&registry, &config.hostname) {
+        return Err(RunError::WorktreeConflict(config.hostname.clone()));
+    }
     if config.lan {
         let hostname = crate::lan::hostname(&config.hostname);
         if let Some(lease) = registry.leases.values().find(|lease| {

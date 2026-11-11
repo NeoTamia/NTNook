@@ -869,3 +869,11 @@ Linux and Windows CI enforce this gate with the toolchain pinned in `rust-toolch
 `v*` tag produces Linux and Windows x86-64 archives, SHA-256 checksums, installers, and GitHub
 attestations before publishing the `ntnook` source package on crates.io. See the
 [traceability matrix](docs/TRACEABILITY.md) and [release notes](RELEASE.md).
+
+## Docker Compose applications
+
+Use `nook compose up` / `nook compose up -d` for explicitly labelled HTTP services,
+and `nook compose down` for ownership-checked teardown that preserves volumes.
+See [the application Compose guide](docs/COMPOSE.md) for labels, dynamic ports,
+worktree isolation, network setup and recovery. This is separate from running
+Caddy itself in Docker.

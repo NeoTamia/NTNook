@@ -190,12 +190,14 @@ pub(crate) enum Kind {
     All,
     Run,
     Alias,
+    Compose,
 }
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResourceKind {
     Run,
     Alias,
+    Compose,
 }
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -240,6 +242,17 @@ pub(crate) struct Entry {
     group_id: Option<String>,
     worktree: Option<Worktree>,
     urls: Vec<EntryUrl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compose: Option<ComposeObservation>,
+}
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ComposeObservation {
+    project: String,
+    service: String,
+    port: u16,
+    active: bool,
+    desired: bool,
+    last_status: String,
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct ListData {
@@ -390,6 +403,7 @@ pub(crate) struct App {
     tls: bool,
 }
 pub(crate) struct Context {
+    cwd: PathBuf,
     pub(crate) global: std::result::Result<config::GlobalConfig, Failure>,
     pub(crate) apps: std::result::Result<Vec<App>, Failure>,
     worktree: Option<crate::worktree::Identity>,
@@ -460,6 +474,7 @@ impl Context {
             }
         })();
         Ok(Self {
+            cwd,
             global,
             apps,
             worktree,
@@ -599,6 +614,28 @@ impl Context {
             .chain(registry.aliases.values().map(alias_entry))
             .filter(|entry| self.visible(entry))
             .collect();
+        entries.extend(
+            crate::compose::observations(registry)
+                .filter(|(project, endpoint)| {
+                    self.scope == Scope::User
+                        || self.allowed.contains(&endpoint.alias.hostname)
+                        || project.root == self.cwd
+                })
+                .map(|(project, endpoint)| {
+                    let mut entry = alias_entry(&endpoint.alias);
+                    entry.kind = ResourceKind::Compose;
+                    entry.liveness = Liveness::Unknown;
+                    entry.compose = Some(ComposeObservation {
+                        project: project.name.clone(),
+                        service: endpoint.service.clone(),
+                        port: endpoint.port,
+                        active: endpoint.active,
+                        desired: endpoint.desired,
+                        last_status: endpoint.status.clone(),
+                    });
+                    entry
+                }),
+        );
         for entry in &mut entries {
             if let Some(dns) = &registry.tailscale.dns_name {
                 for (port, registration) in &registry.tailscale.registrations {
@@ -646,7 +683,9 @@ impl Context {
                 (input.kind == Kind::All
                     || matches!(
                         (&input.kind, &e.kind),
-                        (Kind::Run, ResourceKind::Run) | (Kind::Alias, ResourceKind::Alias)
+                        (Kind::Run, ResourceKind::Run)
+                            | (Kind::Alias, ResourceKind::Alias)
+                            | (Kind::Compose, ResourceKind::Compose)
                     ))
                     && hostname.as_ref().is_none_or(|h| h == &e.hostname)
             })
@@ -772,6 +811,7 @@ fn base_entry(id: Uuid, hostname: &str, target: &str, tls: bool) -> Entry {
             kind: UrlKind::Local,
             url,
         }],
+        compose: None,
     }
 }
 fn alias_entry(alias: &state::Alias) -> Entry {
@@ -894,7 +934,7 @@ impl Context {
                 CheckState::Ok
             };
             live.message =
-                "Process identity observed; recorded readiness is not a health probe".into();
+                "Native process identity observed; Compose liveness is unknown (Docker not inspected). Recorded readiness is not a health probe".into();
             live.affected_resource_ids = entries
                 .iter()
                 .filter(|e| matches!(e.liveness, Liveness::Dead | Liveness::Unknown))
@@ -1009,11 +1049,17 @@ impl Context {
                                 drift.affected_resource_ids = entries
                                     .iter()
                                     .filter(|entry| {
-                                        !inspection.routes.iter().any(|route| {
+                                        if entry.compose.as_ref().is_some_and(|c| !c.active) {
+                                            return inspection.routes.iter().any(|route| {
+                                                route.owner_id.to_string() == entry.resource_id
+                                            });
+                                        }
+                                        let present = inspection.routes.iter().any(|route| {
                                             route.owner_id.to_string() == entry.resource_id
                                                 && route.hostname == entry.hostname
                                                 && route.tls == entry.tls
-                                        })
+                                        });
+                                        !present
                                     })
                                     .map(|e| e.resource_id.clone())
                                     .collect();
@@ -1024,6 +1070,8 @@ impl Context {
                                                 .aliases
                                                 .values()
                                                 .any(|alias| alias.id == route.owner_id)
+                                            && !crate::compose::observations(registry)
+                                                .any(|(_, e)| e.alias.id == route.owner_id)
                                     }) && (self.scope == Scope::User
                                         || self.allowed.contains(&route.hostname)
                                         || self.apps.as_ref().is_ok_and(|apps| {
@@ -1177,6 +1225,12 @@ impl Context {
         let store = self.store(budget)?;
         let _guard = store.lock_operations()?;
         let registry = store.snapshot()?;
+        if crate::compose::claims(&registry, &hostname) {
+            return Err(Failure::new(
+                Code::Conflict,
+                "Compose owns this hostname; use nook compose",
+            ));
+        }
         if registry
             .leases
             .values()
@@ -1308,6 +1362,7 @@ impl Context {
         let alias = registry.aliases.get(&hostname);
         if alias.is_some_and(|a| a.id != owner)
             || registry.leases.values().any(|l| l.hostname == hostname)
+            || crate::compose::claims(&registry, &hostname)
         {
             return Err(Failure::new(
                 Code::OwnershipChanged,

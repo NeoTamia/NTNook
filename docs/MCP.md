@@ -86,7 +86,7 @@ commands, a new cwd, or a different Caddy endpoint.
 | Tool | Inputs beyond optional `timeout_ms` | Behavior |
 | --- | --- | --- |
 | `nook_tools_profiles` | none; no timeout argument | Reports active/available profiles, scope, grants and tool names |
-| `nook_list` | `kind`: `all`/`run`/`alias` (default `all`); optional `hostname`, `limit` (1–200, default 100), `cursor` | Reads registered resources, including stale leases |
+| `nook_list` | `kind`: `all`/`run`/`alias`/`compose` (default `all`); optional `hostname`, `limit` (1–200, default 100), `cursor` | Reads registered resources, including stale leases |
 | `nook_url` | optional `hostname` or `app`; `mode`: `registered`/`configured` (default `registered`) | Looks up an observed resource or calculates a configured local URL |
 | `nook_status` | `detail`: `summary`/`full` (default `summary`) | Inspects existing configuration, registry, Caddy and process identities; `full` also checks CA trust |
 | `nook_alias_set` | required `hostname`, `target` (port 1–65535 or HTTP(S) URL); `tls` (default true), `preserve_host` (default false) | Creates or repairs an authorized persistent alias without replacing another owner |
@@ -210,7 +210,7 @@ and 2 for invalid CLI arguments. Status's read-only CLI uses full diagnostics.
 The [portable agent skill](AGENT_USAGE.md) can use these optional interfaces after
 checking installed capabilities. An agent should inspect status, resolve the URL,
 launch `nook run` in its shell if needed, then observe the registered resource.
-A future doctor can reuse the typed observation API. V1 deliberately has no
+The CLI `nook doctor` also observes Compose ownership without calling Docker. V1 has no
 `nook_doctor`, process launch/stop tool, or MCP prune.
 
 ## Validation
@@ -225,3 +225,12 @@ requests use the fixture CA via curl `--cacert`, without installing it. Windows
 also uses `--ssl-revoke-best-effort` because the ephemeral CA has no CRL
 distribution point; certificate chain and hostname verification remain enabled.
 Tests create only temporary configuration/state and never install a CA.
+
+Compose entries include a `compose` object with `project`, `service`, `port`,
+`active`, `desired`, and `last_status` from the registry. Their liveness is always
+`unknown`: read tools do not inspect Docker or update saved publications. Context
+scope includes Compose projects whose canonical root equals `--cwd`; an explicit
+hostname grant or `--scope user` can expose other projects. A matching configured
+hostname alone does not expose another Compose worktree. Inactive reservations
+remain visible but do not require a Caddy route; a leftover route is reported as
+drift. Alias mutation tools cannot take over active or inactive Compose owners.

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -58,6 +58,8 @@ pub(crate) struct Registry {
     pub(crate) format_version: u32,
     #[serde(default)]
     pub(crate) aliases: BTreeMap<String, Alias>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) compose_projects: BTreeMap<String, crate::compose::Project>,
     #[serde(default)]
     pub(crate) leases: BTreeMap<Uuid, Lease>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -235,7 +237,12 @@ pub(crate) fn decode(contents: &[u8]) -> Result<Registry, Error> {
         .ok_or(Error::MissingVersion)?;
     match version {
         1 => migrate_v1(value),
-        2 => serde_json::from_value(value).map_err(Error::InvalidJson),
+        2 | 3 => {
+            let mut registry: Registry =
+                serde_json::from_value(value).map_err(Error::InvalidJson)?;
+            registry.format_version = FORMAT_VERSION;
+            Ok(registry)
+        }
         other => Err(Error::UnsupportedVersion(other)),
     }
 }
@@ -290,10 +297,21 @@ impl Store {
                 if raw
                     .get("aliases")
                     .and_then(Value::as_object)
-                    .is_some_and(|aliases| aliases.values().any(|alias| alias.get("id").is_none()))
+                    .into_iter()
+                    .flat_map(|aliases| aliases.values())
+                    .chain(
+                        raw.get("compose_projects")
+                            .and_then(Value::as_object)
+                            .into_iter()
+                            .flat_map(|projects| projects.values())
+                            .filter_map(|project| project.get("routes").and_then(Value::as_object))
+                            .flat_map(|routes| routes.values())
+                            .filter_map(|endpoint| endpoint.get("alias")),
+                    )
+                    .any(|alias| alias.get("id").is_none())
                 {
                     return Err(Error::InvalidJson(serde::de::Error::custom(
-                        "legacy alias has no stable owner ID; diagnostic cannot infer ownership",
+                        "alias has no stable owner ID; diagnostic cannot infer ownership",
                     )));
                 }
                 Ok((Some(decode(&bytes)?), Some(bytes)))
@@ -441,7 +459,30 @@ impl Store {
             Err(source) => return Err(io_error(&temporary_path, source)),
         }
         let mut registry = match fs::read(&self.path) {
-            Ok(contents) => decode(&contents)?,
+            Ok(contents) => {
+                let registry = decode(&contents)?;
+                let old: Value = serde_json::from_slice(&contents).map_err(Error::InvalidJson)?;
+                if old["format_version"]
+                    .as_u64()
+                    .is_some_and(|v| v < u64::from(FORMAT_VERSION))
+                {
+                    let backup = self.path.with_extension("pre-compose.json");
+                    match OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&backup)
+                    {
+                        Ok(mut file) => {
+                            file.write_all(&contents)
+                                .map_err(|e| io_error(&backup, e))?;
+                            file.sync_all().map_err(|e| io_error(&backup, e))?;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(e) => return Err(io_error(&backup, e)),
+                    }
+                }
+                registry
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Registry::empty(),
             Err(source) => return Err(io_error(&self.path, source)),
         };
@@ -576,8 +617,8 @@ mod tests {
     #[test]
     fn unknown_versions_corruption_and_unknown_fields_are_safe_errors() {
         assert!(matches!(
-            decode(br#"{"format_version":3}"#),
-            Err(Error::UnsupportedVersion(3))
+            decode(br#"{"format_version":4}"#),
+            Err(Error::UnsupportedVersion(4))
         ));
         assert!(matches!(decode(b"not json"), Err(Error::InvalidJson(_))));
         assert!(matches!(decode(br#"{"format_version":1,"aliases":{},"leases":{},"selected_servers":{},"last_synchronized_at_unix_ms":null,"pending_operations":[],"surprise":true}"#), Err(Error::InvalidJson(_))));
@@ -589,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_registry_is_rewritten_as_v2_without_losing_runs_aliases_or_journals() {
+    fn v1_registry_is_rewritten_as_v3_without_losing_runs_aliases_or_journals() {
         let directory = temporary_directory("migration");
         let path = directory.join("state.json");
         let alias_id = Uuid::new_v4();
@@ -611,7 +652,7 @@ mod tests {
         store.mutate(|_| Ok(())).unwrap();
 
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(written["format_version"], 2);
+        assert_eq!(written["format_version"], 3);
         let registry = decode(&fs::read(&path).unwrap()).unwrap();
         assert!(registry.aliases["api.localhost"].preserve_host);
         assert_eq!(registry.aliases["api.localhost"].id, alias_id);
