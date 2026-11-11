@@ -60,7 +60,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --locked --release
 ```
 
-Integration tests are isolated in temporary directories, use Caddy `2.11.x`, install no CA, and clean up their processes. The MVP release requires every linked MVP ticket to be resolved; Tailscale work remains explicitly post-MVP and pending.
+Integration tests are isolated in temporary directories, use Caddy `2.11.x`, install no CA, and clean up their processes. The MVP release requires every linked MVP ticket to be resolved. Post-MVP Tailscale, workspace runner, and worktree requirements listed above are delivered and covered by their linked checks.
 
 ## Git worktrees (NOOK-74)
 

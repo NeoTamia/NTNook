@@ -1,4 +1,4 @@
-# Nook 0.1.0 — MVP release notes
+# Nook release guide
 
 GitHub Releases provide a static Linux archive and a native Windows archive:
 
@@ -62,9 +62,11 @@ See [the MCP guide](docs/MCP.md) for the v1 contract, client setup and recovery 
 ## Delivered features
 
 - supervised launch of a local application under a `*.localhost` domain over HTTPS or HTTP;
+- multi-app workspaces, external monorepo runners, and isolated Git worktrees;
 - persistent aliases to a port or HTTP(S) URL;
 - atomic, ownership-aware mutation of routes in an existing Caddy instance;
 - `list`, `status`, `stop`, `prune`, and `update` commands, with recovery after interruption;
+- optional LAN/mDNS, Tailscale Serve, and Tailscale Funnel exposure;
 - static Bash, Zsh, and PowerShell completion generation with `nook completions`;
 - TLS verification for HTTPS upstreams and diagnostics for Caddy's local CA.
 
@@ -77,14 +79,15 @@ See [the MCP guide](docs/MCP.md) for the v1 contract, client setup and recovery 
 Native `caddy.exe` over its loopback TCP Admin API is the primary Windows path. Docker Desktop
 with the official image is a supported secondary path.
 
-The reproducible build uses Rust `1.98.0` and `Cargo.lock`. OpenSSL, Python 3, curl with HTTP/2,
+The reproducible build uses the Rust version pinned in `rust-toolchain.toml` and `Cargo.lock`. OpenSSL, Python 3, curl with HTTP/2,
 util-linux, and iproute2 are required only by the Linux integration tests, not by the binary.
 
 ## Out of scope
 
 The binary provides no daemon, IPC or embedded server, implicit shell, hosts-file modification,
-Caddy installation or startup, automatic CA installation, Docker orchestration, LAN/mDNS,
-multiple services, native macOS support, Tailscale Serve/Funnel, or public exposure.
+Caddy installation or startup, automatic CA installation, Docker orchestration, native macOS
+support, worktree creation/removal, agent orchestration, or application data isolation. Funnel is
+not available in worktree mode.
 
 The repository provides a supported official Caddy Compose setup on Linux and tested compatibility with caddy-docker-proxy. `nook ca export` retrieves the public CA without a Caddy executable on the host. See `docs/DOCKER.md`.
 
