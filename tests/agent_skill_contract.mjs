@@ -220,8 +220,15 @@ https://foreign.localhost {
     };
     await until(() => responds('neighbor.localhost'), 'neighbor ready', diagnostics);
     const standalone = start(binary, ['run']);
-    await until(() => responds('web.localhost'), 'documented standalone ready', diagnostics);
-    assert.match(standalone.log, /domain=web\.localhost url=https:\/\/web\.localhost port=\d+/);
+    // Force HTTPS readiness to precede capture of Nook's stderr announcement.
+    standalone.stderr.pause();
+    try {
+      await until(() => responds('web.localhost'), 'documented standalone ready', diagnostics);
+    } finally {
+      standalone.stderr.resume();
+    }
+    await until(() => /domain=web\.localhost url=https:\/\/web\.localhost port=\d+/.test(standalone.log),
+      'documented standalone announcement', diagnostics);
     assert.equal(command(['stop', 'web.localhost']).status, 0);
     await until(() => standalone.exitCode !== null || standalone.signalCode !== null, 'standalone stopped');
 
@@ -259,7 +266,8 @@ for(const child of children)child.on('exit',code=>process.exit(code??1));`);
       const webBody = JSON.parse((await http(443, web, '/', ca)).body);
       assert.notEqual(apiBody.port, webBody.port);
       assert.equal(webBody.api, `http://127.0.0.1:${apiBody.port}`);
-      assert.ok(child.log.includes(`url=https://${web}`), child.log);
+      await until(() => child.log.includes(`url=https://${web}`),
+        `workspace announcement (runner=${runner})`, diagnostics);
       const stopped = command(['stop', api]);
       assert.equal(stopped.status, 0, stopped.stderr);
       await until(() => child.exitCode !== null || child.signalCode !== null, 'workspace exited');
