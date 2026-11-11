@@ -178,6 +178,35 @@ fn quick_inspection_does_not_initialize_state_update_cache_or_ca() {
 }
 
 #[test]
+fn commandless_project_is_valid_for_doctor_but_not_for_run() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("project/nook.toml"),
+        "format_version = 1\nname = 'preview'\n",
+    )
+    .unwrap();
+    let before = fixture.config.lock().unwrap().clone();
+    let (output, report) = fixture.doctor(&[]);
+    assert_eq!(
+        check(&report, "config.project")["status"],
+        "pass",
+        "{report}"
+    );
+    assert_eq!(output.status.code(), Some(0), "{report}");
+    assert_eq!(
+        check(&report, "config.project")["resource"]["hostname"],
+        "preview.localhost"
+    );
+    assert!(!fixture.root.join("state").exists());
+    assert_eq!(*fixture.config.lock().unwrap(), before);
+    fixture.assert_read_only();
+
+    let run = fixture.command().args(["run"]).output().unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("a child command is required"));
+}
+
+#[test]
 fn missing_route_is_reported_before_reconciliation_and_registry_is_unchanged() {
     let fixture = Fixture::new();
     let owner = fixture.alias();
