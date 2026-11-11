@@ -150,6 +150,7 @@ pub(crate) struct ProjectConfig {
     pub(crate) name: Option<String>,
     command: Option<Vec<String>>,
     tls: Option<bool>,
+    tunnel: Option<TunnelChoice>,
     tailscale: Option<bool>,
     funnel: Option<bool>,
     lan: Option<bool>,
@@ -165,6 +166,8 @@ pub(crate) struct ProjectConfig {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub(crate) struct GlobalConfig {
+    #[serde(default)]
+    pub(crate) cloudflare: crate::cloudflare::Settings,
     format_version: u32,
     pub(crate) caddy_admin: String,
     pub(crate) https_server: Option<String>,
@@ -206,6 +209,7 @@ impl GlobalConfig {
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
+            cloudflare: Default::default(),
             format_version: FORMAT_VERSION,
             caddy_admin: DEFAULT_CADDY_ADMIN.to_owned(),
             https_server: None,
@@ -221,6 +225,7 @@ impl Default for GlobalConfig {
 #[allow(dead_code)]
 pub(crate) struct ResolvedRunConfig {
     pub(crate) provenance: BTreeMap<String, String>,
+    pub(crate) tunnel: bool,
     pub(crate) worktree: Option<crate::worktree::Identity>,
     pub(crate) hostname: String,
     pub(crate) command: Vec<OsString>,
@@ -327,6 +332,13 @@ fn write_global_at(path: &Path, config: &GlobalConfig, force: bool) -> Result<()
 }
 
 fn validate_global(config: &GlobalConfig) -> Result<(), Error> {
+    config
+        .cloudflare
+        .validate()
+        .map_err(|reason| Error::InvalidGlobal {
+            field: "cloudflare",
+            reason,
+        })?;
     #[cfg(windows)]
     if config.caddy_admin.starts_with("unix/") {
         return Err(Error::InvalidGlobal {
@@ -458,6 +470,7 @@ pub(crate) fn merge_project(
         worktree: local.worktree.or(base.worktree),
         command: local.command.or(base.command),
         tls: local.tls.or(base.tls),
+        tunnel: local.tunnel.or(base.tunnel),
         tailscale: local.tailscale.or(base.tailscale),
         funnel: local.funnel.or(base.funnel),
         lan: local.lan.or(base.lan),
@@ -492,6 +505,7 @@ pub(crate) fn merge_run(
         worktree: None,
         command: None,
         tls: None,
+        tunnel: None,
         tailscale: None,
         funnel: None,
         lan: None,
@@ -507,6 +521,7 @@ pub(crate) fn merge_run(
         "name",
         "command",
         "tls",
+        "tunnel",
         "tailscale",
         "funnel",
         "lan",
@@ -531,6 +546,7 @@ pub(crate) fn merge_run(
         ("name", arguments.name.is_some()),
         ("command", !arguments.command.is_empty()),
         ("tls", arguments.no_tls),
+        ("tunnel", arguments.tunnel.is_some() || arguments.no_tunnel),
         (
             "tailscale",
             arguments.tailscale || arguments.funnel || arguments.no_tailscale,
@@ -576,6 +592,18 @@ pub(crate) fn merge_run(
     } else {
         arguments.command.clone()
     };
+    let tunnel = !arguments.no_tunnel
+        && (arguments.tunnel.is_some() || project.tunnel == Some(TunnelChoice::Cloudflare));
+    if !tunnel
+        && command
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("{tunnel_url}"))
+    {
+        return Err(Error::InvalidGlobal {
+            field: "command",
+            reason: "{tunnel_url} requires --tunnel cloudflare".into(),
+        });
+    }
     let funnel = !arguments.no_tailscale
         && !arguments.tailscale
         && (arguments.funnel || project.funnel.unwrap_or(false));
@@ -597,6 +625,7 @@ pub(crate) fn merge_run(
     };
     Ok(ResolvedRunConfig {
         provenance,
+        tunnel,
         worktree,
         hostname,
         command,
@@ -1508,6 +1537,7 @@ mod tests {
     fn project() -> ProjectConfig {
         ProjectConfig {
             provenance: Default::default(),
+            tunnel: None,
             worktree: None,
             format_version: 1,
             name: Some("project".into()),
@@ -1551,4 +1581,11 @@ mod tests {
         fs::create_dir(&path).unwrap();
         path
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TunnelChoice {
+    None,
+    Cloudflare,
 }

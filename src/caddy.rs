@@ -921,7 +921,7 @@ impl ManagedCaddyRoutes<'_> {
             owner_route_id(owner_id)
         };
         let lan_ranges = ["0.0.0.0/0".to_owned()];
-        let proxy = build_proxy_route_for_network(
+        let mut proxy = build_proxy_route_for_network(
             &id,
             &hostname,
             &upstream.url,
@@ -933,6 +933,7 @@ impl ManagedCaddyRoutes<'_> {
                 self.client_ip_ranges
             },
         );
+        apply_public_host(&mut proxy, route.public_host.as_deref());
         self.client.mutate_server_routes(server, move |mut routes| {
             reject_foreign_hostname_claims(&routes, std::slice::from_ref(&hostname))?;
             reject_managed_hostname_claim(
@@ -954,6 +955,10 @@ impl ManagedCaddyRoutes<'_> {
 }
 
 impl RouteBackend for ManagedCaddyRoutes<'_> {
+    fn local_ca(&self) -> Result<String, RouteError> {
+        self.client.fetch_local_ca().map_err(route_error)
+    }
+
     fn ensure(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
         if route.lan {
             let (server, _) = self.server(false).map_err(route_error)?;
@@ -1569,6 +1574,20 @@ pub(crate) fn normalize_upstream(target: &str) -> Result<Upstream, Error> {
         return Err(Error::Fragment);
     }
     Ok(Upstream { url })
+}
+
+// Shared by writes and read-only Doctor comparisons.
+pub(crate) fn apply_public_host(proxy: &mut Value, public_host: Option<&str>) {
+    if let Some(host) = public_host {
+        if host.is_empty() {
+            proxy["handle"] = json!([{ "handler": "static_response", "status_code": 503 }]);
+        } else {
+            let headers = &mut proxy["handle"][0]["headers"]["request"]["set"];
+            headers["Host"] = json!([host]);
+            headers["X-Forwarded-Host"] = json!([host]);
+            headers["X-Forwarded-Proto"] = json!(["https"]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2240,6 +2259,7 @@ mod tests {
         };
         backend
             .ensure(&RouteSpec {
+                public_host: None,
                 lan: false,
                 owner_id: owner,
                 hostname: "api.localhost".into(),

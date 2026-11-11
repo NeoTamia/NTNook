@@ -94,6 +94,12 @@ pub(crate) enum CompletionKind {
 
 #[derive(Debug, Args)]
 pub(crate) struct InitArgs {
+    /// Publish a temporary public URL through Cloudflare (no SSE support).
+    #[arg(long, value_parser = ["cloudflare"], conflicts_with = "no_tunnel")]
+    pub(crate) tunnel: Option<String>,
+    /// Disable the tunnel configured by the project.
+    #[arg(long)]
+    pub(crate) no_tunnel: bool,
     /// Isolate this Git worktree; optionally choose its DNS label.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ID", conflicts_with = "no_worktree")]
     pub(crate) worktree: Option<String>,
@@ -239,6 +245,13 @@ pub(crate) struct RunArgs {
     /// Resolve routing without requiring a child command (internal observation API).
     #[arg(skip)]
     pub(crate) observation: bool,
+
+    /// Publish a temporary public URL through Cloudflare (no SSE support).
+    #[arg(long, value_parser = ["cloudflare"], conflicts_with = "no_tunnel")]
+    pub(crate) tunnel: Option<String>,
+    /// Disable the tunnel configured by the project.
+    #[arg(long)]
+    pub(crate) no_tunnel: bool,
     /// Isolate this Git worktree; optionally choose its DNS label.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "ID", conflicts_with = "no_worktree")]
     pub(crate) worktree: Option<String>,
@@ -663,6 +676,16 @@ fn project_config_template(arguments: &InitArgs, directory: &Path) -> crate::Res
     contents.push_str(
         "\n# Align Vite/Nuxt/Astro when the command is that CLI. Use \"none\" to disable.\n",
     );
+    if arguments.tunnel.is_some() || arguments.no_tunnel {
+        contents.push_str(&format!(
+            "tunnel = {}\n",
+            toml_string(if arguments.no_tunnel {
+                "none"
+            } else {
+                "cloudflare"
+            })
+        ));
+    }
     match arguments.framework.as_deref() {
         Some(framework) => contents.push_str(&format!("framework = {}\n", toml_string(framework))),
         None => contents.push_str("# framework = \"vite\"\n"),
@@ -674,6 +697,8 @@ fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::R
     if arguments.local {
         if !arguments.command.is_empty()
             || arguments.no_tls
+            || arguments.tunnel.is_some()
+            || arguments.no_tunnel
             || arguments.lan
             || arguments.no_lan
             || arguments.app_port.is_some()
@@ -728,6 +753,16 @@ fn workspace_config_template(arguments: &InitArgs, directory: &Path) -> crate::R
         worktree_config_template(arguments)?,
         toml::Value::Array(command)
     );
+    if arguments.tunnel.is_some() || arguments.no_tunnel {
+        contents.push_str(&format!(
+            "tunnel = {}\n",
+            toml_string(if arguments.no_tunnel {
+                "none"
+            } else {
+                "cloudflare"
+            })
+        ));
+    }
     if arguments.no_tls {
         contents.push_str("tls = false\n");
     }
@@ -1541,6 +1576,9 @@ fn run_command(
     }
     let config =
         crate::config::resolve_run(&arguments, &current_directory, global.run_bind_address)?;
+    if config.tunnel {
+        crate::cloudflare::preflight()?;
+    }
     reconcile_before_command(global, errors)?;
     if let Some(path) = &config.ignored_local_config {
         writeln!(
@@ -1558,85 +1596,96 @@ fn run_command(
         crate::tailscale::reachable_bind_address(config.bind_address)?;
         client.require_ready()?;
     }
-    with_caddy_routes(global, config.tls, !config.tls || config.lan, |routes| {
-        if config.lan {
-            routes.require_lan_listener()?;
-        }
-        let mut exposure = tailscale.as_ref().map(crate::tailscale::ServeExposure::new);
-        let mut running = match &mut exposure {
-            Some(exposure) => crate::process::start_exposed_run(&config, &store, routes, exposure)?,
-            None => crate::process::start_run(&config, &store, routes)?,
-        };
-        let registration = exposure.and_then(|exposure| exposure.registration);
-        let scheme = if config.tls { "https" } else { "http" };
-        if config.funnel {
+    with_caddy_routes(
+        global,
+        config.tls || config.tunnel,
+        !config.tls || config.lan,
+        |routes| {
+            if config.lan {
+                routes.require_lan_listener()?;
+            }
+            let mut exposure = tailscale.as_ref().map(crate::tailscale::ServeExposure::new);
+            let mut running = match &mut exposure {
+                Some(exposure) => {
+                    crate::process::start_exposed_run(&config, &store, routes, exposure)?
+                }
+                None => crate::process::start_run(&config, &store, routes)?,
+            };
+            let registration = exposure.and_then(|exposure| exposure.registration);
+            let scheme = if config.tls { "https" } else { "http" };
+            if config.funnel {
+                writeln!(
+                    errors,
+                    "nook: exposure=public (Tailscale Funnel; accessible from the internet)"
+                )?;
+            }
+            let tailscale_url = registration
+                .as_ref()
+                .map(|registration| format!(" tailscale_url={}", registration.url))
+                .unwrap_or_default();
             writeln!(
                 errors,
-                "nook: exposure=public (Tailscale Funnel; accessible from the internet)"
+                "nook: domain={} url={scheme}://{} port={}{tailscale_url}",
+                running.hostname, running.hostname, running.port
             )?;
-        }
-        let tailscale_url = registration
-            .as_ref()
-            .map(|registration| format!(" tailscale_url={}", registration.url))
-            .unwrap_or_default();
-        writeln!(
-            errors,
-            "nook: domain={} url={scheme}://{} port={}{tailscale_url}",
-            running.hostname, running.hostname, running.port
-        )?;
-        if config.lan {
-            writeln!(
-                errors,
-                "nook: lan_url=http://{}",
-                crate::lan::hostname(&running.hostname)
-            )?;
-            match crate::lan::addresses() {
-                Ok(addresses) if !addresses.is_empty() => {
-                    for address in addresses {
-                        if config.bind_address == std::net::IpAddr::V4(address)
-                            || config.bind_address == std::net::Ipv4Addr::UNSPECIFIED
-                        {
-                            writeln!(errors, "nook: lan_ip_url=http://{address}:{}", running.port)?;
+            if config.lan {
+                writeln!(
+                    errors,
+                    "nook: lan_url=http://{}",
+                    crate::lan::hostname(&running.hostname)
+                )?;
+                match crate::lan::addresses() {
+                    Ok(addresses) if !addresses.is_empty() => {
+                        for address in addresses {
+                            if config.bind_address == std::net::IpAddr::V4(address)
+                                || config.bind_address == std::net::Ipv4Addr::UNSPECIFIED
+                            {
+                                writeln!(
+                                    errors,
+                                    "nook: lan_ip_url=http://{address}:{}",
+                                    running.port
+                                )?;
+                            }
                         }
                     }
+                    Ok(_) => writeln!(
+                        errors,
+                        "warning: no LAN IPv4 address found; connect to a network to use --lan"
+                    )?,
+                    Err(error) => writeln!(errors, "warning: cannot list LAN addresses: {error}")?,
                 }
-                Ok(_) => writeln!(
-                    errors,
-                    "warning: no LAN IPv4 address found; connect to a network to use --lan"
-                )?,
-                Err(error) => writeln!(errors, "warning: cannot list LAN addresses: {error}")?,
             }
-        }
-        if let Some(warning) = &running.warning {
-            writeln!(errors, "warning: {warning}")?;
-        }
-        for warning in registration
-            .iter()
-            .flat_map(|registration| &registration.warnings)
-        {
-            writeln!(errors, "warning: {warning}")?;
-        }
-        // Registration happens before displaced owners leave the registry.
-        // Withdraw their Serve registrations once the replacement is recorded.
-        if config.force {
-            for warning in converge_tailscale_now(&store) {
+            if let Some(warning) = &running.warning {
                 writeln!(errors, "warning: {warning}")?;
             }
-        }
-        let _ready = running.wait_for_readiness(&store, |warning| {
-            let _ = writeln!(errors, "warning: {warning}");
-        })?;
-        let outcome = running.finish(&store, routes)?;
-        for warning in outcome.warnings {
-            writeln!(errors, "warning: {warning}")?;
-        }
-        if registration.is_some() {
-            for warning in converge_tailscale_now(&store) {
+            for warning in registration
+                .iter()
+                .flat_map(|registration| &registration.warnings)
+            {
                 writeln!(errors, "warning: {warning}")?;
             }
-        }
-        Ok(outcome.exit_code)
-    })
+            // Registration happens before displaced owners leave the registry.
+            // Withdraw their Serve registrations once the replacement is recorded.
+            if config.force {
+                for warning in converge_tailscale_now(&store) {
+                    writeln!(errors, "warning: {warning}")?;
+                }
+            }
+            let _ready = running.wait_for_readiness(&store, |warning| {
+                let _ = writeln!(errors, "warning: {warning}");
+            })?;
+            let outcome = running.finish(&store, routes)?;
+            for warning in outcome.warnings {
+                writeln!(errors, "warning: {warning}")?;
+            }
+            if registration.is_some() {
+                for warning in converge_tailscale_now(&store) {
+                    writeln!(errors, "warning: {warning}")?;
+                }
+            }
+            Ok(outcome.exit_code)
+        },
+    )
 }
 
 fn run_workspace_command(
@@ -1646,8 +1695,18 @@ fn run_workspace_command(
     global: &crate::config::GlobalConfig,
     errors: &mut impl Write,
 ) -> crate::Result<i32> {
+    if workspace
+        .apps
+        .iter()
+        .any(|app| app.config.tunnel && only.is_none_or(|id| id == app.id))
+    {
+        crate::cloudflare::preflight()?;
+    }
     let prepared = crate::workspace::prepare(workspace, only)?;
-    let https = prepared.apps.iter().any(|app| app.app.config.tls);
+    let https = prepared
+        .apps
+        .iter()
+        .any(|app| app.app.config.tls || app.app.config.tunnel);
     let http = prepared
         .apps
         .iter()
@@ -1719,6 +1778,35 @@ fn run_workspace_command(
 fn stop_command(arguments: StopArgs, output: &mut impl Write) -> crate::Result<()> {
     let hostname = crate::config::normalize_hostname(&arguments.name)?;
     let store = state_store()?;
+    let cancelled = store.mutate(|registry| {
+        let mut cancelled = false;
+        for entry in registry
+            .preparing
+            .values_mut()
+            .filter(|entry| entry.hostname == hostname)
+        {
+            entry.cancelled = true;
+            cancelled = true;
+        }
+        for entry in registry
+            .tunnels
+            .values_mut()
+            .filter(|entry| entry.hostname == hostname)
+        {
+            entry.phase = crate::cloudflare::Phase::Stopping;
+        }
+        Ok(cancelled)
+    })?;
+    if cancelled
+        && !store
+            .load()?
+            .leases
+            .values()
+            .any(|lease| lease.hostname == hostname)
+    {
+        writeln!(output, "cancelled startup of {hostname}")?;
+        return Ok(());
+    }
     let mut system = crate::process::NativeStopSystem;
     let signal = crate::process::stop_managed(&store, &hostname, arguments.force, &mut system)?;
     let signal_name = match signal {
@@ -1851,6 +1939,7 @@ fn write_registry_list(
     registry: &crate::state::Registry,
     output: &mut impl Write,
 ) -> crate::Result<()> {
+    write_tunnels(registry, output)?;
     let mut leases: Vec<_> = registry.leases.values().collect();
     leases.sort_by(|left, right| left.hostname.cmp(&right.hostname));
     for lease in leases {
@@ -1983,6 +2072,7 @@ fn status_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let registry = state_store()?.load()?;
+    write_tunnels(&registry, output)?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
     let config = client.fetch_config()?;
     let selection = available_servers(global, &config)?;
@@ -2066,6 +2156,9 @@ fn prune_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
+    for warning in crate::cloudflare::revoke_orphans(&store)? {
+        writeln!(errors, "warning: {warning}")?;
+    }
     let operations = store.lock_operations()?;
     let registry = store.load()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
@@ -2119,6 +2212,9 @@ fn reconcile_before_command(
     errors: &mut impl Write,
 ) -> crate::Result<()> {
     let store = state_store()?;
+    for warning in crate::cloudflare::revoke_orphans(&store)? {
+        writeln!(errors, "warning: {warning}")?;
+    }
     let operations = store.lock_operations()?;
     let registry = store.load()?;
     let client = crate::caddy::Client::new(&global.caddy_admin)?;
@@ -2209,7 +2305,11 @@ fn reconcile_and_record(
         .try_into()
         .unwrap_or(u64::MAX);
     Ok(store.mutate(|registry| {
-        let report = crate::reconcile::reconcile(registry, routes, crate::process::lease_liveness);
+        let mut report =
+            crate::reconcile::reconcile(registry, routes, crate::process::lease_liveness);
+        report
+            .warnings
+            .extend(crate::cloudflare::reconcile(registry, store, routes));
         registry.selected_servers.https = selection.https.clone();
         registry.selected_servers.http = selection.http.clone();
         registry.last_synchronized_at_unix_ms = Some(synchronized_at);
@@ -2285,6 +2385,12 @@ fn expected_routes(
                 endpoint.alias.tls,
             ));
         }
+    }
+    for entry in registry.tunnels.values() {
+        routes.insert((entry.id, entry.route().hostname, true));
+    }
+    for (id, entry) in &registry.preparing {
+        routes.insert((*id, entry.hostname.clone(), entry.tls));
     }
     for lease in registry.leases.values().filter(|lease| lease.lan) {
         routes.insert((lease.id, crate::lan::hostname(&lease.hostname), false));
@@ -2489,6 +2595,19 @@ fn observation_url(
         .into());
     }
     Ok(i32::from(value["ok"] != true))
+}
+
+fn write_tunnels(registry: &crate::state::Registry, output: &mut impl Write) -> crate::Result<()> {
+    for entry in registry.tunnels.values() {
+        writeln!(
+            output,
+            "tunnel\tcloudflare\t{:?}\t{}\t{}",
+            entry.phase,
+            entry.hostname,
+            entry.url.as_deref().unwrap_or("pending")
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -19,6 +19,13 @@ fn graceful_child_helper() {
     let Some(marker) = std::env::var_os("NOOK_GRACEFUL_STOP_MARKER") else {
         return;
     };
+    if let Some(path) = std::env::var_os("NOOK_TUNNEL_APP_MARKER") {
+        fs::write(
+            path,
+            std::env::var("NOOK_TUNNEL_URL").expect("URL before spawn"),
+        )
+        .unwrap();
+    }
     ctrlc::set_handler(move || {
         fs::write(&marker, b"stopped gracefully").unwrap();
         std::process::exit(0);
@@ -166,6 +173,71 @@ fn native_caddy_supports_status_and_owned_aliases() {
     );
     wait_for_exit(&mut running, Duration::from_secs(10));
     assert_eq!(fs::read(&graceful_marker).unwrap(), b"stopped gracefully");
+
+    // A real Caddy TLS origin plus a native auxiliary executable exercises
+    // Windows quoting, CA trust, suspended spawn/Job ownership and stop.
+    let source = root.join("cloudflared_mock.rs");
+    fs::write(&source, include_str!("support/cloudflared_mock.rs")).unwrap();
+    let connector = root.join("cloudflared mock.exe");
+    assert!(
+        Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&connector)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let config_path = app_data.join("Nook/config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        "\n[cloudflare]\nbinary = {}\n",
+        toml::Value::String(connector.to_string_lossy().into_owned())
+    ));
+    fs::write(&config_path, config).unwrap();
+    let url_marker = root.join("tunnel-url.txt");
+    let mut running = nook_command(&app_data, &local_app_data)
+        .args([
+            "run",
+            "--name",
+            "windows-tunnel",
+            "--tunnel",
+            "cloudflare",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "graceful_child_helper", "--nocapture"])
+        .env("NOOK_GRACEFUL_STOP_MARKER", root.join("tunnel-stop.txt"))
+        .env("NOOK_TUNNEL_APP_MARKER", &url_marker)
+        .env("TUNNEL_TOKEN", "not-inherited")
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_state(&state_path, "windows-tunnel.localhost", &mut running);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !url_marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fs::read_to_string(url_marker).unwrap(),
+        "https://windows-fixture.trycloudflare.com"
+    );
+    assert!(
+        nook(&app_data, &local_app_data, &["stop", "windows-tunnel"])
+            .status
+            .success()
+    );
+    wait_for_exit(&mut running, Duration::from_secs(15));
+    assert!(
+        nook(&app_data, &local_app_data, &["prune"])
+            .status
+            .success()
+    );
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert!(registry["tunnels"].as_object().unwrap().is_empty());
 
     drop(caddy);
     fs::remove_dir_all(root).unwrap();

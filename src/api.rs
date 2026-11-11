@@ -1066,6 +1066,8 @@ impl Context {
                                 let orphan = inspection.routes.iter().any(|route| {
                                     registry.as_ref().is_ok_and(|registry| {
                                         !registry.leases.contains_key(&route.owner_id)
+                                            && !registry.preparing.contains_key(&route.owner_id)
+                                            && !registry.tunnels.contains_key(&route.owner_id)
                                             && !registry
                                                 .aliases
                                                 .values()
@@ -1235,6 +1237,10 @@ impl Context {
             .leases
             .values()
             .any(|lease| lease.hostname == hostname)
+            || registry
+                .preparing
+                .values()
+                .any(|entry| entry.hostname == hostname)
         {
             return Err(Failure::new(
                 Code::Conflict,
@@ -1324,6 +1330,7 @@ impl Context {
         if !matching {
             routes
                 .ensure_alias(&crate::reconcile::RouteSpec {
+                    public_host: None,
                     lan: false,
                     owner_id: alias.id,
                     hostname,

@@ -575,9 +575,17 @@ fn wait_for_state(state_home: &Path, hostname: &str, expected: &str) {
     let state_path = state_home.join("nook/state.json");
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if fs::read_to_string(&state_path).is_ok_and(|state| {
-            state.contains(hostname) && state.contains(&format!("\"state\": \"{expected}\""))
-        }) {
+        if fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|registry| {
+                registry["leases"].as_object().is_some_and(|leases| {
+                    leases
+                        .values()
+                        .any(|lease| lease["hostname"] == hostname && lease["state"] == expected)
+                })
+            })
+        {
             return;
         }
         thread::sleep(Duration::from_millis(20));

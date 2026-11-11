@@ -42,6 +42,7 @@ resolves environment references:
 | Reference | Value |
 | --- | --- |
 | `${api.url}` | Public route, for example `https://api.shop.localhost` |
+| `${api.tunnel_url}` | Public Cloudflare URL (requires `tunnel = "cloudflare"` on that app) |
 | `${api.lan_url}` | LAN route, for example `http://api.shop.local` (requires LAN on that app) |
 | `${api.upstream}` | Actual application address, for example `http://127.0.0.1:41001` |
 | `${api.host}` | Application bind IP, for example `127.0.0.1` |
@@ -432,3 +433,12 @@ Use `nook doctor --json` to inspect configuration and ownership without reconcil
 resources. `--deep` explicitly enables active network probes; local reachability
 does not prove container, LAN or external tunnel reachability. See the
 [diagnostic guide](DIAGNOSTICS.md). `status` still reconciles before reporting.
+## Cloudflare Quick Tunnels
+
+Set `tunnel = "cloudflare"` on individual `[[apps]]` entries, or use
+`nook run --tunnel cloudflare` to expose all selected apps. All tunnel URLs are
+resolved before apps or the root runner start. `${api.tunnel_url}` can therefore
+be used in another app's environment. Each child also receives its own
+`NOOK_TUNNEL_URL`; joining wrappers must not override exposure options.
+Worktrees remain isolated. These are public, ephemeral URLs, without SSE support.
+See [the Cloudflare guide](CLOUDFLARE.md) for prerequisites and recovery.

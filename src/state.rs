@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-const FORMAT_VERSION: u32 = 3;
+// v3 was independently emitted by Compose and Cloudflare. v4 belongs to
+// the experimental ngrok branch; never reinterpret it as this combined schema.
+const FORMAT_VERSION: u32 = 5;
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -55,6 +57,10 @@ impl std::error::Error for Error {
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Registry {
+    #[serde(default)]
+    pub(crate) preparing: BTreeMap<Uuid, StartingRun>,
+    #[serde(default)]
+    pub(crate) tunnels: BTreeMap<Uuid, crate::cloudflare::Registration>,
     pub(crate) format_version: u32,
     #[serde(default)]
     pub(crate) aliases: BTreeMap<String, Alias>,
@@ -237,7 +243,7 @@ pub(crate) fn decode(contents: &[u8]) -> Result<Registry, Error> {
         .ok_or(Error::MissingVersion)?;
     match version {
         1 => migrate_v1(value),
-        2 | 3 => {
+        2 | 3 | 5 => {
             let mut registry: Registry =
                 serde_json::from_value(value).map_err(Error::InvalidJson)?;
             registry.format_version = FORMAT_VERSION;
@@ -466,7 +472,9 @@ impl Store {
                     .as_u64()
                     .is_some_and(|v| v < u64::from(FORMAT_VERSION))
                 {
-                    let backup = self.path.with_extension("pre-compose.json");
+                    // Keep the Compose-era backup intact. This snapshot belongs to
+                    // the combined v5 migration and must contain the exact input.
+                    let backup = self.path.with_extension("pre-v5.json");
                     match OpenOptions::new()
                         .write(true)
                         .create_new(true)
@@ -477,10 +485,21 @@ impl Store {
                                 .map_err(|e| io_error(&backup, e))?;
                             file.sync_all().map_err(|e| io_error(&backup, e))?;
                         }
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                            let previous = fs::read(&backup).map_err(|e| io_error(&backup, e))?;
+                            if previous != contents {
+                                return Err(io_error(
+                                    &backup,
+                                    io::Error::other(
+                                        "migration backup differs from registry; preserve both files and resolve explicitly",
+                                    ),
+                                ));
+                            }
+                        }
                         Err(e) => return Err(io_error(&backup, e)),
                     }
                 }
+                crate::platform::sync_directory(parent).map_err(|e| io_error(parent, e))?;
                 registry
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Registry::empty(),
@@ -630,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_registry_is_rewritten_as_v3_without_losing_runs_aliases_or_journals() {
+    fn v1_registry_is_rewritten_as_v5_without_losing_runs_aliases_or_journals() {
         let directory = temporary_directory("migration");
         let path = directory.join("state.json");
         let alias_id = Uuid::new_v4();
@@ -652,7 +671,7 @@ mod tests {
         store.mutate(|_| Ok(())).unwrap();
 
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(written["format_version"], 3);
+        assert_eq!(written["format_version"], 5);
         let registry = decode(&fs::read(&path).unwrap()).unwrap();
         assert!(registry.aliases["api.localhost"].preserve_host);
         assert_eq!(registry.aliases["api.localhost"].id, alias_id);
@@ -670,6 +689,116 @@ mod tests {
         assert_eq!(registry.pending_operations[0].id, operation_id);
         assert!(registry.tailscale.registrations.is_empty());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    mod compose_fixture {
+        include!("../tests/support/compose_registry.rs");
+    }
+
+    #[test]
+    fn both_v3_shapes_migrate_losslessly_and_observations_never_write() {
+        use serde_json::json;
+        for (compose, tunnel) in [(true, false), (false, true), (true, true)] {
+            let directory = temporary_directory("v3-shapes");
+            let path = directory.join("state.json");
+            let id = Uuid::new_v4();
+            let mut value = compose_fixture::registry(&directory, id, true);
+            if !compose {
+                value.as_object_mut().unwrap().remove("compose_projects");
+            }
+            if tunnel {
+                value["preparing"] = json!({id.to_string(): {
+                    "hostname":"tunnel-app.localhost", "lan":true, "tls":true,
+                    "supervisor":{"pid":42,"process_start_time_ticks":7},"cancelled":false
+                }});
+                value["tunnels"] = json!({id.to_string(): {
+                    "id":id,"owner_id":id,"hostname":"tunnel-app.localhost",
+                    "target":"http://127.0.0.1:9000/",
+                    "supervisor":{"pid":42,"process_start_time_ticks":7},
+                    "child":null,"url":"https://fixture.trycloudflare.com",
+                    "metrics_port":1234,"phase":"connected","committed":false
+                }});
+                value["pending_operations"] = json!([{"id":Uuid::new_v4(),"kind":{
+                    "kind":"install_route","owner_id":id,"hostname":"tunnel-app.localhost",
+                    "target":"http://127.0.0.1:9000/","scheme":"http","tls":true
+                }}]);
+            }
+            let original = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&path, &original).unwrap();
+            let old_backup = path.with_extension("pre-compose.json");
+            fs::write(&old_backup, b"previous v2 snapshot").unwrap();
+            let store = Store::new(path.clone());
+            let expected = decode(&original).unwrap();
+            assert_eq!(store.snapshot().unwrap(), expected);
+            let (observed, bytes) = store.inspect().unwrap();
+            assert_eq!(observed.unwrap(), expected);
+            assert_eq!(bytes.unwrap(), original);
+            assert_eq!(store.load_for_completion().unwrap(), expected);
+            assert!(!path.with_extension("lock").exists());
+            assert!(!path.with_extension("pre-v5.json").exists());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            store.mutate(|_| Ok(())).unwrap();
+            assert_eq!(store.snapshot().unwrap(), expected);
+            assert_eq!(expected.format_version, 5);
+            assert_eq!(expected.compose_projects.len(), usize::from(compose));
+            assert_eq!(expected.tunnels.len(), usize::from(tunnel));
+            assert_eq!(
+                fs::read(path.with_extension("pre-v5.json")).unwrap(),
+                original
+            );
+            assert_eq!(fs::read(&old_backup).unwrap(), b"previous v2 snapshot");
+            store
+                .mutate(|r| {
+                    r.last_synchronized_at_unix_ms = Some(99);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                fs::read(path.with_extension("pre-v5.json")).unwrap(),
+                original
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_refuses_unknown_schemas_or_conflicting_backups_without_data_loss() {
+        for original in [
+            br#"{"format_version":4,"tunnels":{"provider":"ngrok"}}"#.as_slice(),
+            br#"{"format_version":6}"#,
+            br#"{"format_version":3,"future_provider":{},"last_synchronized_at_unix_ms":null}"#,
+            b"corrupt",
+        ] {
+            let directory = temporary_directory("refuse-migration");
+            let path = directory.join("state.json");
+            fs::write(&path, original).unwrap();
+            assert!(
+                Store::new(path.clone())
+                    .mutate::<()>(|_| panic!("must not mutate"))
+                    .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!path.with_extension("pre-v5.json").exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+        for version in [1, 2, 3] {
+            let directory = temporary_directory("backup");
+            let path = directory.join("state.json");
+            let original =
+                format!(r#"{{"format_version":{version},"last_synchronized_at_unix_ms":null}}"#);
+            fs::write(&path, &original).unwrap();
+            let backup = path.with_extension("pre-v5.json");
+            fs::write(&backup, b"different original").unwrap();
+            let store = Store::new(path.clone());
+            assert!(store.mutate::<()>(|_| panic!("must not mutate")).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(fs::read(&backup).unwrap(), b"different original");
+            fs::write(&backup, &original).unwrap();
+            store.mutate(|_| Ok(())).unwrap();
+            assert_eq!(store.snapshot().unwrap().format_version, 5);
+            assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -829,4 +958,15 @@ mod tests {
         fs::create_dir(&path).unwrap();
         path
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartingRun {
+    pub(crate) hostname: String,
+    #[serde(default)]
+    pub(crate) lan: bool,
+    pub(crate) tls: bool,
+    pub(crate) supervisor: WorkspaceSupervisor,
+    pub(crate) cancelled: bool,
 }

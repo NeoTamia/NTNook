@@ -149,6 +149,7 @@ impl std::error::Error for Error {
 pub(crate) struct ManagedChild {
     child: Child,
     output_threads: Vec<thread::JoinHandle<()>>,
+    pub(crate) auxiliary_output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     pub(crate) pid: u32,
     pub(crate) pgid: i32,
     pub(crate) start_time_ticks: u64,
@@ -368,6 +369,7 @@ pub(crate) struct RunningChild {
     readiness_warn_after: Duration,
     signals: ForwardedSignals,
     lan: Option<crate::lan::Advertisement>,
+    tunnel: Option<crate::cloudflare::Tunnel>,
 }
 
 /// Additional exposure of a run beyond its local Caddy route.
@@ -432,6 +434,40 @@ fn start_run_with_hook(
     let operations = store.lock_operations()?;
     let reservation = reserve_port_on(config.bind_address, config.app_port, config.strict_port)?;
     let mut prepared = prepare_run(config, reservation, store, routes, &operations, exposure)?;
+    drop(operations);
+    if config.tunnel {
+        match crate::cloudflare::Tunnel::start(
+            config,
+            prepared.owner_id,
+            &prepared.target,
+            store,
+            routes,
+        ) {
+            Ok((tunnel, url)) => {
+                prepared.tunnel = Some(tunnel);
+                prepared
+                    .exposed
+                    .push((crate::cloudflare::URL_VARIABLE.into(), url.into()));
+            }
+            Err(error) => {
+                let operations = store.lock_operations()?;
+                exposure.withdraw(&operations, store, prepared.owner_id);
+                abandon_prepared_run(config, &prepared, store, routes)?;
+                return Err(error);
+            }
+        }
+    }
+    let operations = store.lock_operations()?;
+    if store
+        .load()?
+        .preparing
+        .get(&prepared.owner_id)
+        .is_none_or(|entry| entry.cancelled)
+    {
+        exposure.withdraw(&operations, store, prepared.owner_id);
+        abandon_prepared_run(config, &prepared, store, routes)?;
+        return Err(RunError::Conflict("run startup cancelled".into()));
+    }
     let mut running =
         match spawn_prepared_run(config, &mut prepared, None, None, &[], after_release) {
             Ok(running) => running,
@@ -465,10 +501,11 @@ fn start_run_with_hook(
 
 /// A reserved port and journaled route, with no child launched yet.
 pub(crate) struct PreparedRun {
+    pub(crate) tunnel: Option<crate::cloudflare::Tunnel>,
     reservation: Option<PortReservation>,
     pub(crate) owner_id: Uuid,
     operation_id: Uuid,
-    target: String,
+    pub(crate) target: String,
     displaced: Vec<RouteSpec>,
     pub(crate) exposed: Vec<(OsString, OsString)>,
     pub(crate) warnings: Vec<String>,
@@ -492,16 +529,33 @@ pub(crate) fn prepare_run(
     if crate::compose::claims(&registry, &config.hostname) {
         return Err(RunError::WorktreeConflict(config.hostname.clone()));
     }
+    if registry
+        .preparing
+        .values()
+        .any(|entry| entry.hostname == config.hostname)
+    {
+        return Err(RunError::Conflict(config.hostname.clone()));
+    }
+    let supervisor_identity = read_process_identity(std::process::id())
+        .ok_or(Error::ProcessIdentity(std::process::id()))?;
     if config.lan {
         let hostname = crate::lan::hostname(&config.hostname);
-        if let Some(lease) = registry.leases.values().find(|lease| {
-            lease.lan
-                && lease.hostname != config.hostname
-                && crate::lan::hostname(&lease.hostname) == hostname
+        let mut owners = registry
+            .leases
+            .values()
+            .map(|lease| (&lease.hostname, lease.lan))
+            .chain(
+                registry
+                    .preparing
+                    .values()
+                    .map(|entry| (&entry.hostname, entry.lan)),
+            );
+        if let Some((project, _)) = owners.find(|(project, lan)| {
+            *lan && **project != config.hostname && crate::lan::hostname(project) == hostname
         }) {
             return Err(RunError::LanHostnameConflict {
                 hostname,
-                project: lease.hostname.clone(),
+                project: project.clone(),
             });
         }
     }
@@ -545,6 +599,7 @@ pub(crate) fn prepare_run(
         SocketAddr::new(readiness_probe_address(config.bind_address), port)
     );
     let route = RouteSpec {
+        public_host: None,
         lan: config.lan,
         owner_id,
         hostname: config.hostname.clone(),
@@ -555,6 +610,19 @@ pub(crate) fn prepare_run(
         preserve_host: false,
     };
     store.mutate(|registry| {
+        registry.preparing.insert(
+            owner_id,
+            crate::state::StartingRun {
+                hostname: config.hostname.clone(),
+                lan: config.lan,
+                tls: config.tls,
+                cancelled: false,
+                supervisor: WorkspaceSupervisor {
+                    pid: std::process::id(),
+                    process_start_time_ticks: supervisor_identity.start_time_ticks,
+                },
+            },
+        );
         registry.pending_operations.push(PendingOperation {
             id: operation_id,
             kind: PendingOperationKind::InstallRoute {
@@ -606,6 +674,7 @@ pub(crate) fn prepare_run(
         ));
     }
     Ok(PreparedRun {
+        tunnel: None,
         reservation: Some(reservation),
         owner_id,
         operation_id,
@@ -642,6 +711,7 @@ pub(crate) fn spawn_prepared_run(
     after_release(port);
     let environment: Vec<_> = extra_environment
         .iter()
+        .filter(|(key, _)| key != crate::cloudflare::URL_VARIABLE)
         .cloned()
         .chain(environment)
         .collect();
@@ -669,6 +739,7 @@ pub(crate) fn spawn_prepared_run(
         readiness_warn_after: Duration::from_secs(config.readiness_warn_after_seconds),
         signals,
         lan,
+        tunnel: prepared.tunnel.take(),
     })
 }
 
@@ -679,6 +750,20 @@ pub(crate) fn child_command(
     exposed: &[(OsString, OsString)],
 ) -> (Vec<OsString>, Vec<(OsString, OsString)>) {
     let argv = substitute_port(&config.command, port);
+    let argv = if let Some((_, url)) = exposed
+        .iter()
+        .find(|(key, _)| key == crate::cloudflare::URL_VARIABLE)
+    {
+        let values = std::collections::BTreeMap::from([(
+            "tunnel_url".to_owned(),
+            url.to_string_lossy().into_owned(),
+        )]);
+        argv.iter()
+            .map(|value| substitute_literal(value, "{tunnel_url}", &values["tunnel_url"]))
+            .collect()
+    } else {
+        argv
+    };
     let framework = config.framework.resolve(&argv);
     let tailscale_hostname = exposed
         .iter()
@@ -688,8 +773,15 @@ pub(crate) fn child_command(
         .and_then(|url| url.host_str().map(str::to_owned));
     // Vite-based servers already allow *.localhost. Add the exposed hostname.
     let lan_hostname = config.lan.then(|| crate::lan::hostname(&config.hostname));
-    let allowed_hostname = tailscale_hostname
+    let tunnel_hostname = exposed
+        .iter()
+        .find(|(name, _)| name == crate::cloudflare::URL_VARIABLE)
+        .and_then(|(_, value)| value.to_str())
+        .and_then(|value| url::Url::parse(value).ok())
+        .and_then(|url| url.host_str().map(str::to_owned));
+    let allowed_hostname = tunnel_hostname
         .as_deref()
+        .or(tailscale_hostname.as_deref())
         .or(lan_hostname.as_deref())
         .unwrap_or(&config.hostname);
     let argv = match framework {
@@ -724,6 +816,33 @@ pub(crate) fn child_command(
             environment.push((variable.into(), value));
         }
     }
+    if tunnel_hostname.is_some() {
+        let variable = "__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS";
+        let existing = environment
+            .iter()
+            .find(|(key, _)| key == variable)
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os(variable))
+            .unwrap_or_default();
+        let mut hosts: Vec<String> = existing
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .collect();
+        for host in tunnel_hostname
+            .iter()
+            .chain(tailscale_hostname.iter())
+            .chain(lan_hostname.iter())
+        {
+            if !hosts.contains(host) {
+                hosts.push(host.clone());
+            }
+        }
+        environment.retain(|(key, _)| key != variable);
+        environment.push((variable.into(), hosts.join(",").into()));
+    }
     environment.extend_from_slice(exposed);
     (argv, environment)
 }
@@ -738,6 +857,28 @@ pub(crate) fn commit_prepared_runs(
     let mut cleanup_failures = Vec::new();
     let mut warnings = Vec::new();
     for (config, prepared, _) in runs {
+        let displaced_ids: Vec<_> = prepared
+            .displaced
+            .iter()
+            .map(|route| route.owner_id)
+            .collect();
+        store.mutate(|registry| {
+            for entry in registry
+                .tunnels
+                .values_mut()
+                .filter(|t| displaced_ids.contains(&t.owner_id))
+            {
+                entry.phase = crate::cloudflare::Phase::Stopping;
+                if let Some(child) = &entry.child {
+                    let _ = kill_owned_lease(child);
+                }
+                if let Err(error) = routes.remove_if_owned(&entry.route().hostname, entry.id, true)
+                {
+                    warnings.push(error.to_string());
+                }
+            }
+            Ok(())
+        })?;
         for displaced in &prepared.displaced {
             if let Err(error) =
                 routes.remove_if_owned(&config.hostname, displaced.owner_id, displaced.tls)
@@ -757,6 +898,14 @@ pub(crate) fn commit_prepared_runs(
     // One atomic registry mutation preserves displaced owners if any spawn fails.
     store.mutate(|registry| {
         for (config, prepared, child) in runs {
+            registry.preparing.remove(&prepared.owner_id);
+            for tunnel in registry
+                .tunnels
+                .values_mut()
+                .filter(|t| t.owner_id == prepared.owner_id)
+            {
+                tunnel.committed = true;
+            }
             let replaced_ids: std::collections::BTreeSet<_> = prepared
                 .displaced
                 .iter()
@@ -831,11 +980,20 @@ fn abandon_route(
         // The registry still records these owners, so failed restorations are
         // retried by the next reconciliation.
         let _ = routes.ensure(&RouteSpec {
+            public_host: None,
             replace_existing: true,
             ..route.clone()
         });
     }
     store.mutate(|registry| {
+        registry.preparing.remove(&owner_id);
+        for tunnel in registry
+            .tunnels
+            .values_mut()
+            .filter(|t| t.owner_id == owner_id)
+        {
+            tunnel.phase = crate::cloudflare::Phase::Stopping;
+        }
         registry
             .pending_operations
             .retain(|operation| operation.id != operation_id);
@@ -865,6 +1023,14 @@ fn pending_owner(kind: &PendingOperationKind) -> Option<Uuid> {
 }
 
 impl RunningChild {
+    pub(crate) fn poll_tunnel(&mut self) {
+        if let Some(tunnel) = &mut self.tunnel {
+            tunnel.poll();
+        }
+    }
+    pub(crate) fn stop_tunnel(&mut self) {
+        self.tunnel.take();
+    }
     pub(crate) fn wait_for_readiness(
         &mut self,
         store: &Store,
@@ -873,6 +1039,7 @@ impl RunningChild {
         let started = Instant::now();
         let mut warned = false;
         loop {
+            self.poll_tunnel();
             if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
                 self.lan.take();
             }
@@ -919,7 +1086,11 @@ impl RunningChild {
         store: &Store,
         routes: &mut impl RouteBackend,
     ) -> Result<RunOutcome, RunError> {
+        let tunnel = &mut self.tunnel;
         let exit_code = self.child.wait_with_signals(&mut self.signals, || {
+            if let Some(tunnel) = tunnel {
+                tunnel.poll();
+            }
             use std::io::Write;
             if self.lan.as_mut().is_some_and(|lan| lan.is_displaced(store)) {
                 self.lan.take();
@@ -942,6 +1113,7 @@ impl RunningChild {
         store: &Store,
         routes: &mut impl RouteBackend,
     ) -> Result<Vec<String>, RunError> {
+        self.tunnel.take();
         self.lan.take();
         cleanup_run_route(&self.hostname, self.lease_id, self.tls, store, routes)
     }
@@ -981,6 +1153,7 @@ pub(crate) fn cleanup_run_route(
     let mut warnings = Vec::new();
     store.mutate(|registry| {
         registry.leases.remove(&owner_id);
+        warnings.extend(crate::cloudflare::reconcile(registry, store, routes));
         if let Err(error) = &cleanup {
             registry.pending_operations.push(PendingOperation {
                 id: Uuid::new_v4(),
@@ -1171,6 +1344,21 @@ pub(crate) fn spawn_managed_child_in(
     directory: Option<&std::path::Path>,
     prefix: Option<&str>,
 ) -> Result<ManagedChild, Error> {
+    spawn_child_options(argv, environment, lease_id, directory, prefix, false)
+}
+
+pub(crate) fn spawn_auxiliary(argv: &[OsString], lease_id: Uuid) -> Result<ManagedChild, Error> {
+    spawn_child_options(argv, &[], lease_id, None, None, true)
+}
+
+fn spawn_child_options(
+    argv: &[OsString],
+    environment: &[(OsString, OsString)],
+    lease_id: Uuid,
+    directory: Option<&std::path::Path>,
+    prefix: Option<&str>,
+    auxiliary: bool,
+) -> Result<ManagedChild, Error> {
     #[cfg(unix)]
     let _ = lease_id;
     let (program, arguments) = argv.split_first().ok_or(Error::EmptyCommand)?;
@@ -1187,6 +1375,7 @@ pub(crate) fn spawn_managed_child_in(
     // A run started from an exposed run must not inherit its tailnet URL;
     // an exposed child gets its own value back from `environment`.
     command
+        .env_remove(crate::cloudflare::URL_VARIABLE)
         .env_remove(crate::tailscale::URL_VARIABLE)
         .env_remove("NOOK_WORKSPACE_SESSION")
         .env_remove(crate::workspace_session::PROCESS_VARIABLE)
@@ -1204,7 +1393,19 @@ pub(crate) fn spawn_managed_child_in(
     if let Some(directory) = directory {
         command.current_dir(directory);
     }
-    if prefix.is_some() {
+    if auxiliary {
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy().to_ascii_uppercase();
+            if name.starts_with("TUNNEL_")
+                || name.starts_with("CLOUDFLARED_")
+                || name == "NO_AUTOUPDATE"
+                || name == "NO_TLS_VERIFY"
+            {
+                command.env_remove(key);
+            }
+        }
+    }
+    if prefix.is_some() || auxiliary {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1218,7 +1419,8 @@ pub(crate) fn spawn_managed_child_in(
     // Session members keep the runner's inherited streams, but must never
     // take its foreground or propagate a background stdin stop to its group.
     // The root runner carries SESSION_VARIABLE; only members carry PROCESS_VARIABLE.
-    let terminal_job_control = prefix.is_none()
+    let terminal_job_control = !auxiliary
+        && prefix.is_none()
         && !environment
             .iter()
             .any(|(key, _)| key == crate::workspace_session::PROCESS_VARIABLE);
@@ -1254,6 +1456,15 @@ pub(crate) fn spawn_managed_child_in(
         return Err(Error::Spawn(error));
     }
     let mut output_threads = Vec::new();
+    let auxiliary_output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    if auxiliary {
+        if let Some(stdout) = child.stdout.take() {
+            output_threads.push(capture_auxiliary_output(stdout, auxiliary_output.clone()));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            output_threads.push(capture_auxiliary_output(stderr, auxiliary_output.clone()));
+        }
+    }
     if let Some(prefix) = prefix {
         if let Some(stdout) = child.stdout.take() {
             output_threads.push(prefix_output(stdout, prefix.to_owned(), false));
@@ -1269,6 +1480,7 @@ pub(crate) fn spawn_managed_child_in(
     Ok(ManagedChild {
         child,
         output_threads,
+        auxiliary_output,
         pid,
         pgid: identity.pgid,
         start_time_ticks: identity.start_time_ticks,
@@ -1283,6 +1495,26 @@ pub(crate) fn spawn_managed_child_in(
         terminal_job_control,
         #[cfg(windows)]
         job,
+    })
+}
+
+// Drain continuously with a fixed total budget. Never print raw connector logs:
+// they can contain credentials, URLs, or request details.
+fn capture_auxiliary_output(
+    mut stream: impl io::Read + Send + 'static,
+    output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        while let Ok(count) = stream.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            if let Ok(mut output) = output.lock() {
+                let remaining = 65536usize.saturating_sub(output.len());
+                output.extend_from_slice(&buffer[..count.min(remaining)]);
+            }
+        }
     })
 }
 
@@ -4903,6 +5135,7 @@ sys.exit(3)
     fn run_config(command: Vec<&str>, readiness: u64) -> ResolvedRunConfig {
         ResolvedRunConfig {
             provenance: Default::default(),
+            tunnel: false,
             worktree: None,
             hostname: "api.localhost".into(),
             command: command.into_iter().map(OsString::from).collect(),
@@ -5165,5 +5398,29 @@ mod windows_tests {
         assert_eq!(lease_liveness(&lease), Liveness::Alive);
         lease.process_start_time_ticks = lease.process_start_time_ticks.saturating_add(1);
         assert_eq!(lease_liveness(&lease), Liveness::Dead);
+    }
+}
+
+pub(crate) fn substitute_literal(
+    value: &std::ffi::OsStr,
+    needle: &str,
+    replacement: &str,
+) -> OsString {
+    #[cfg(unix)]
+    {
+        OsString::from_vec(replace_bytes(
+            value.as_bytes(),
+            needle.as_bytes(),
+            replacement.as_bytes(),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        OsString::from_wide(&replace_wide(
+            &value.encode_wide().collect::<Vec<_>>(),
+            &needle.encode_utf16().collect::<Vec<_>>(),
+            &replacement.encode_utf16().collect::<Vec<_>>(),
+        ))
     }
 }

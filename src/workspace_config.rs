@@ -445,7 +445,10 @@ fn validate_environment(path: &Path, apps: &[WorkspaceApp]) -> Result<(), config
                     )
                 })?;
                 let (id, field) = token.rsplit_once('.').ok_or_else(|| invalid(path, format!("invalid environment token `${{{token}}}`; expected ${{id.url}}, ${{id.upstream}}, ${{id.host}}, or ${{id.port}}")))?;
-                if !matches!(field, "url" | "lan_url" | "upstream" | "host" | "port") {
+                if !matches!(
+                    field,
+                    "url" | "lan_url" | "tunnel_url" | "upstream" | "host" | "port"
+                ) {
                     return Err(invalid(
                         path,
                         format!("unsupported environment token `${{{token}}}`"),
@@ -460,6 +463,12 @@ fn validate_environment(path: &Path, apps: &[WorkspaceApp]) -> Result<(), config
                         ),
                     )
                 })?;
+                if field == "tunnel_url" && !target.config.tunnel {
+                    return Err(invalid(
+                        path,
+                        format!("`${{{token}}}` requires a tunnel on app `{id}`"),
+                    ));
+                }
                 if field == "lan_url" && !target.config.lan {
                     return Err(invalid(
                         path,

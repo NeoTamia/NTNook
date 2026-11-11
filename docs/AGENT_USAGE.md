@@ -96,11 +96,12 @@ provides optional [structured JSON/URL discovery and local MCP](MCP.md), with a
 versioned output/error contract, read-only defaults and explicit alias grants.
 Check the installed binary's help before using these additions; the skill's
 baseline remains usable with older versions. MCP does not launch or stop apps.
-Doctor, Compose orchestration and additional managed tunnels remain separate
+Doctor, Compose orchestration and named tunnels with stable domains remain separate
 future milestones. Doctor must separate diagnosis from repair; Compose and
 additional tunnels require separate ownership and exposure designs.
 
-Existing LAN, standalone Tailscale Serve and Funnel are already documented in
-Nook. They are not those future milestones. Serve is not supported for multi-app
+Existing LAN, standalone Tailscale Serve/Funnel and
+[Cloudflare Quick Tunnels](CLOUDFLARE.md) are available. Quick Tunnel URLs are
+public and ephemeral; cloudflared installation is explicit. Serve is not supported for multi-app
 workspaces; Funnel is excluded from worktree mode. The skill preserves those
 limits and never turns Nook into a Caddy service manager.

@@ -66,7 +66,8 @@ multi-request transaction; let Nook maintain its ownership and recovery journal.
 
 Keep local exposure unless the task or existing project configuration calls for
 more. `--no-lan` disables configured LAN; `--no-tailscale` disables both Serve
-and Funnel. Neither resets an explicitly configured application bind address.
+and Funnel; `--no-tunnel` disables a configured Quick Tunnel. These options
+leave an explicitly configured application bind address unchanged.
 
 - **LAN:** `--lan` adds `http://<name>.local` and mDNS, requiring a suitable Caddy
   port 80 listener. The app remains loopback-bound by default. Binding
@@ -75,7 +76,12 @@ and Funnel. Neither resets an explicitly configured application bind address.
   through Tailscale. It is rejected for multi-app workspaces.
 - **Funnel:** existing `--funnel` is public internet exposure. It is rejected
   whenever worktree isolation is enabled and requires existing authorization.
-- **External tunnel to Caddy:** configured outside Nook. Preserve the selected
+- **Cloudflare Quick Tunnel:** `--tunnel cloudflare` adds a public, ephemeral URL
+  to a run or workspace. Install cloudflared explicitly and keep Caddy/CA setup.
+  Nook owns connector cleanup; local development remains available after connector
+  failure. Quick Tunnels do not support SSE. For configuration, URL interpolation
+  or recovery, read the [Quick Tunnel contract](https://github.com/NeoTamia/NTNook/blob/dev/docs/CLOUDFLARE.md).
+- **Other external tunnels to Caddy:** configured outside Nook. Preserve the selected
   app Host/routing key; `.localhost` resolves at the client and `.local` mDNS
   does not automatically cross the tunnel. Do not create DNS/tunnel endpoints.
 
