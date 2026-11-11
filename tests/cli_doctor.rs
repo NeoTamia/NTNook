@@ -11,6 +11,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "support/compose_registry.rs"]
+mod compose_registry;
+
 struct Fixture {
     root: PathBuf,
     stop: Arc<AtomicBool>,
@@ -623,4 +626,81 @@ fn fixture_waits_for_complete_request_headers() {
         serde_json::from_str::<Value>(body).unwrap(),
         *fixture.config.lock().unwrap()
     );
+}
+
+#[test]
+fn compose_owners_are_observed_without_docker_or_registry_mutation() {
+    let fixture = Fixture::new();
+    let owner = uuid::Uuid::new_v4();
+    for active in [true, false] {
+        fixture.write_state(&compose_registry::registry(
+            &fixture.root.join("project"),
+            owner,
+            active,
+        ));
+        let before = fs::read(fixture.state()).unwrap();
+        let (_, report) = fixture.doctor(&["--owner", &owner.to_string()]);
+        let observation = check(&report, "compose.recorded");
+        assert_eq!(observation["reason_code"], "docker_not_observed");
+        assert_eq!(observation["resource"]["owner_id"], owner.to_string());
+        assert_eq!(observation["evidence"]["active"], active);
+        let missing = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["reason_code"] == "expected_route_absent");
+        assert_eq!(missing, active, "{report}");
+        assert_eq!(fs::read(fixture.state()).unwrap(), before);
+        assert!(!fixture.state().with_extension("pre-compose.json").exists());
+        fixture.assert_read_only();
+    }
+    // A leftover inactive route is recorded drift, never an ownerless route to adopt.
+    fixture.config.lock().unwrap()["apps"]["http"]["servers"]["plain"]["routes"] = json!([{
+        "@id":"nook_http_routes_v1","handle":[{"handler":"subroute","routes":[{
+            "@id":format!("nook_route_v1_{owner}"),"match":[{"host":["web.localhost"]}],
+            "handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"127.0.0.1:8080"}]}],"terminal":true
+        }]}]
+    }]);
+    let (_, report) = fixture.doctor(&["--owner", &owner.to_string()]);
+    assert_eq!(
+        check(&report, "caddy.route")["reason_code"],
+        "inactive_compose_route"
+    );
+    assert!(
+        !report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "caddy.unmatched")
+    );
+    fixture.assert_read_only();
+}
+
+#[test]
+fn doctor_never_invents_a_compose_owner_or_persists_legacy_migrations() {
+    let fixture = Fixture::new();
+    let mut registry =
+        compose_registry::registry(&fixture.root.join("project"), uuid::Uuid::new_v4(), true);
+    registry["compose_projects"]["identity"]["routes"]["web/http"]["alias"]
+        .as_object_mut()
+        .unwrap()
+        .remove("id");
+    fixture.write_state(&registry);
+    let before = fs::read(fixture.state()).unwrap();
+    let (_, report) = fixture.doctor(&[]);
+    assert_eq!(check(&report, "state.snapshot")["status"], "fail");
+    assert_eq!(fs::read(fixture.state()).unwrap(), before);
+    for version in [1, 2] {
+        fixture.alias();
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(fixture.state()).unwrap()).unwrap();
+        registry["format_version"] = json!(version);
+        fixture.write_state(&registry);
+        let before = fs::read(fixture.state()).unwrap();
+        let (_, report) = fixture.doctor(&[]);
+        assert_eq!(check(&report, "state.snapshot")["status"], "pass");
+        assert_eq!(fs::read(fixture.state()).unwrap(), before);
+        assert!(!fixture.state().with_extension("pre-compose.json").exists());
+    }
+    fixture.assert_read_only();
 }

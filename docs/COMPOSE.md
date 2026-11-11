@@ -169,6 +169,16 @@ When Caddy is unavailable, down still stops owned containers and leaves route
 cleanup pending. When Docker is unavailable or its engine identity changed,
 Nook preserves ownership evidence instead of assuming the stack disappeared.
 
+`doctor`, MCP reads, and `list/status --read-only --json` only observe recorded
+Compose intent and Caddy configuration. They never invoke Docker, reconcile routes,
+or migrate registry files. Compose liveness remains unknown; `active`, `desired`
+and the last status describe the saved snapshot, not current container health.
+Active endpoints are expected in Caddy; inactive reservations are not. Doctor's
+`--owner` accepts Compose route UUIDs and `--deep` can probe active recorded targets.
+MCP lists these resources as `kind: "compose"`, scoped to their recorded project
+root (or an explicit hostname grant / user scope); alias mutation tools cannot
+claim them. Run an explicit mutating Nook command to reconcile when needed.
+
 An external recreation is recognized only if it retains Nook ownership labels.
 An unowned replacement is never adopted or stopped. A foreign container carrying
 the same Compose project name blocks up/down. Manual `alias --force` and

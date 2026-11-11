@@ -330,7 +330,9 @@ pub(crate) fn execute(
     };
     if let Some(owner) = args.owner
         && !registry.as_ref().is_some_and(|r| {
-            r.leases.contains_key(&owner) || r.aliases.values().any(|a| a.id == owner)
+            r.leases.contains_key(&owner)
+                || r.aliases.values().any(|a| a.id == owner)
+                || crate::compose::observations(r).any(|(_, e)| e.alias.id == owner)
         })
     {
         report.simple(
@@ -348,8 +350,20 @@ pub(crate) fn execute(
                 .values()
                 .map(reconcile::route_for_lease)
                 .chain(r.aliases.values().map(reconcile::route_for_alias))
+                .chain(
+                    crate::compose::observations(r)
+                        .filter(|(_, e)| e.active)
+                        .map(|(_, e)| reconcile::route_for_alias(&e.alias)),
+                )
         })
         .filter(|r| args.owner.is_none_or(|id| id == r.owner_id))
+        .collect();
+    let inactive_compose: BTreeSet<_> = registry
+        .as_ref()
+        .into_iter()
+        .flat_map(crate::compose::observations)
+        .filter(|(_, e)| !e.active && args.owner.is_none_or(|id| id == e.alias.id))
+        .map(|(_, e)| caddy::owner_route_id(e.alias.id))
         .collect();
     let mut observed = None;
     if let Some(global) = &global {
@@ -373,6 +387,7 @@ pub(crate) fn execute(
                         &specs,
                         registry.is_some(),
                         &desired,
+                        &inactive_compose,
                     );
                     observed = Some(value);
                 }
@@ -622,6 +637,7 @@ fn inspect_state(report: &mut Report, registry: &state::Registry, selected: Opti
         .keys()
         .copied()
         .chain(registry.aliases.values().map(|a| a.id))
+        .chain(crate::compose::observations(registry).map(|(_, e)| e.alias.id))
     {
         if !owners.insert(id) {
             report.simple(
@@ -631,6 +647,14 @@ fn inspect_state(report: &mut Report, registry: &state::Registry, selected: Opti
                 format!("Duplicate owner UUID {id}"),
             );
         }
+    }
+    for (project, endpoint) in crate::compose::observations(registry)
+        .filter(|(_, e)| selected.is_none_or(|id| id == e.alias.id))
+    {
+        report.add("compose.recorded", json!({"owner_id": endpoint.alias.id, "hostname": endpoint.alias.hostname}),
+            Status::Warning, "docker_not_observed", "Recorded Compose intent only; Docker liveness and published ports are not inspected",
+            json!({"project": project.name, "service": endpoint.service, "port": endpoint.port,
+                "active": endpoint.active, "desired": endpoint.desired, "last_status": endpoint.status}));
     }
     for lease in registry
         .leases
@@ -807,6 +831,7 @@ fn inspect_routes(
     specs: &[reconcile::RouteSpec],
     state_known: bool,
     desired: &[config::ResolvedRunConfig],
+    inactive_compose: &BTreeSet<String>,
 ) {
     let Some(servers) = config
         .pointer("/apps/http/servers")
@@ -1057,6 +1082,10 @@ fn inspect_routes(
         }
     }
     for (id, rows) in observed {
+        if inactive_compose.contains(&id) {
+            report.add("caddy.route", json!({"route_id": id}), Status::Warning, "inactive_compose_route", "Route remains for a recorded inactive Compose endpoint; inspection does not remove it", json!({"count": rows.len()}));
+            continue;
+        }
         if state_known && !expected_ids.contains(&id) {
             report.add("caddy.unmatched", json!({"route_id": id}), Status::Warning, "outside_selected_owners", "Route has no owner in the selected snapshot; it may belong to another selection. No deletion authorized", json!({"count": rows.len()}));
         }
@@ -1375,6 +1404,7 @@ mod tests {
                 std::slice::from_ref(&spec),
                 true,
                 &[],
+                &BTreeSet::new(),
             );
             report.finish();
             assert_eq!(
@@ -1391,7 +1421,15 @@ mod tests {
         let (global, spec, mut config) = route_fixture();
         config["apps"]["http"]["servers"]["http"]["routes"].as_array_mut().unwrap().push(json!({"match":[{"host":["app.localhost"]}],"handle":[{"handler":"static_response","body":"foreign"}]}));
         let mut report = Report::new(false, Duration::from_secs(1));
-        inspect_routes(&mut report, &global, &config, &[spec], true, &[]);
+        inspect_routes(
+            &mut report,
+            &global,
+            &config,
+            &[spec],
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
         assert!(
             report
                 .checks

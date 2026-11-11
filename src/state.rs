@@ -297,10 +297,21 @@ impl Store {
                 if raw
                     .get("aliases")
                     .and_then(Value::as_object)
-                    .is_some_and(|aliases| aliases.values().any(|alias| alias.get("id").is_none()))
+                    .into_iter()
+                    .flat_map(|aliases| aliases.values())
+                    .chain(
+                        raw.get("compose_projects")
+                            .and_then(Value::as_object)
+                            .into_iter()
+                            .flat_map(|projects| projects.values())
+                            .filter_map(|project| project.get("routes").and_then(Value::as_object))
+                            .flat_map(|routes| routes.values())
+                            .filter_map(|endpoint| endpoint.get("alias")),
+                    )
+                    .any(|alias| alias.get("id").is_none())
                 {
                     return Err(Error::InvalidJson(serde::de::Error::custom(
-                        "legacy alias has no stable owner ID; diagnostic cannot infer ownership",
+                        "alias has no stable owner ID; diagnostic cannot infer ownership",
                     )));
                 }
                 Ok((Some(decode(&bytes)?), Some(bytes)))

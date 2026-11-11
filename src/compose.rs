@@ -98,8 +98,8 @@ struct Down {
 pub(crate) struct Project {
     id: Uuid,
     identity: String,
-    root: PathBuf,
-    name: String,
+    pub(crate) root: PathBuf,
+    pub(crate) name: String,
     namespace: String,
     host: String,
     engine: String,
@@ -109,6 +109,16 @@ pub(crate) struct Project {
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
+}
+
+/// Recorded intent only: observation must not discover Docker or reconcile routes.
+pub(crate) fn observations(registry: &Registry) -> impl Iterator<Item = (&Project, &Endpoint)> {
+    registry.compose_projects.values().flat_map(|project| {
+        project
+            .routes
+            .values()
+            .map(move |endpoint| (project, endpoint))
+    })
 }
 fn hash(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
