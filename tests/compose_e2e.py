@@ -45,9 +45,9 @@ def main():
         caddy_args = [os.environ.get("NOOK_TEST_CADDY", "caddy"), "run", "--config", str(caddyfile), "--adapter", "caddyfile"]
         docker_caddy = os.environ.get("NOOK_TEST_CADDY_DOCKER") == "1"
         if docker_caddy:
-            caddy_args = ["docker", "run", "--rm", "--name", project + "-caddy", "--add-host", "host.docker.internal:host-gateway", "-p", f"127.0.0.1:{admin}:2019", "-p", f"127.0.0.1:{http}:80", "-p", f"127.0.0.1:{https}:443", "-v", str(caddyfile) + ":/etc/caddy/Caddyfile:ro", "caddy:2.11.4-alpine", "caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+            caddy_args = ["docker", "run", "--rm", "--name", project + "-caddy", "--add-host", "host.docker.internal:host-gateway", "-p", f"127.0.0.1:{admin}:2019", "-p", f"127.0.0.1:{http}:80", "-p", f"127.0.0.1:{https}:443", "-v", str(caddyfile) + ":/etc/caddy/Caddyfile:ro", "caddy:2.11.9-alpine", "caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
         if docker_caddy and os.environ.get("NOOK_TEST_CADDY_PROXY") == "1":
-            image_index = caddy_args.index("caddy:2.11.4-alpine")
+            image_index = caddy_args.index("caddy:2.11.9-alpine")
             caddy_args[image_index:] = ["-v", "/var/run/docker.sock:/var/run/docker.sock:ro", "lucaslorentz/caddy-docker-proxy:2.13.1-alpine", "docker-proxy", "--caddyfile-path", "/etc/caddy/Caddyfile"]
         caddy = subprocess.Popen(caddy_args, env=env, stdout=log, stderr=log)
 
@@ -81,7 +81,7 @@ def main():
 
         compose_file = root / "compose.yaml"
         service = {
-            "image": "caddy:2.11.4-alpine",
+            "image": "caddy:2.11.9-alpine",
             "command": ["sh", "-c", "caddy respond --listen :9090 --body nook-admin & exec caddy respond --listen :8080 --body nook-http"],
             "ports": [{"target": 8080, "host_ip": ("0.0.0.0" if docker_caddy else "127.0.0.1"), "protocol": "tcp"}],
             "labels": {"io.ntnook.route.http.port": "8080", "io.ntnook.route.http.name": "web", "io.ntnook.route.http.tls": "false"},
