@@ -521,6 +521,7 @@ pub(crate) fn merge_run(
         "name",
         "command",
         "tls",
+        "tunnel",
         "tailscale",
         "funnel",
         "lan",
@@ -545,6 +546,7 @@ pub(crate) fn merge_run(
         ("name", arguments.name.is_some()),
         ("command", !arguments.command.is_empty()),
         ("tls", arguments.no_tls),
+        ("tunnel", arguments.tunnel.is_some() || arguments.no_tunnel),
         (
             "tailscale",
             arguments.tailscale || arguments.funnel || arguments.no_tailscale,

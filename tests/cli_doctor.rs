@@ -308,7 +308,7 @@ fn json_usage_errors_accept_both_global_socket_spellings() {
 #[test]
 fn project_simulation_never_executes_the_child_and_preserves_overlay_rules() {
     let fixture = Fixture::new();
-    fs::write(fixture.root.join("project/nook.toml"), "format_version = 1\nname = 'base'\ncommand = ['this-command-does-not-exist']\nrun_bind_address = '127.0.0.1'").unwrap();
+    fs::write(fixture.root.join("project/nook.toml"), "format_version = 1\nname = 'base'\ntunnel = 'cloudflare'\ncommand = ['this-command-does-not-exist']\nrun_bind_address = '127.0.0.1'").unwrap();
     fs::write(
         fixture.root.join("project/nook.local.toml"),
         "format_version = 1\nname = 'local'",
@@ -325,6 +325,14 @@ fn project_simulation_never_executes_the_child_and_preserves_overlay_rules() {
         assert_eq!(
             check(&report, "config.project")["resource"]["hostname"],
             expected
+        );
+        let evidence = &check(&report, "config.project")["evidence"];
+        assert_eq!(evidence["tunnel"], true);
+        assert!(
+            evidence["provenance"]["tunnel"]
+                .as_str()
+                .unwrap()
+                .contains("nook.toml")
         );
     }
     fixture.assert_read_only();
@@ -652,6 +660,7 @@ fn compose_owners_are_observed_without_docker_or_registry_mutation() {
         assert_eq!(missing, active, "{report}");
         assert_eq!(fs::read(fixture.state()).unwrap(), before);
         assert!(!fixture.state().with_extension("pre-compose.json").exists());
+        assert!(!fixture.state().with_extension("pre-v5.json").exists());
         fixture.assert_read_only();
     }
     // A leftover inactive route is recorded drift, never an ownerless route to adopt.
@@ -701,6 +710,7 @@ fn doctor_never_invents_a_compose_owner_or_persists_legacy_migrations() {
         assert_eq!(check(&report, "state.snapshot")["status"], "pass");
         assert_eq!(fs::read(fixture.state()).unwrap(), before);
         assert!(!fixture.state().with_extension("pre-compose.json").exists());
+        assert!(!fixture.state().with_extension("pre-v5.json").exists());
     }
     fixture.assert_read_only();
 }

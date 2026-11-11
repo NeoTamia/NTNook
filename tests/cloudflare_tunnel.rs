@@ -1,5 +1,7 @@
 //! Deterministic connector lifecycle with a real Caddy TLS origin, no public traffic.
 #![cfg(target_os = "linux")]
+#[path = "support/compose_registry.rs"]
+mod compose_registry;
 mod support;
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt;
@@ -88,6 +90,16 @@ fn nook(root: &Path) -> Command {
         .env("NOOK_DISABLE_UPDATE_CHECK", "1")
         .env_remove("NOOK_WORKSPACE_SESSION")
         .stdout(Stdio::null());
+    if root.join("bin/docker").exists() {
+        c.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        );
+    }
     c
 }
 fn isolated(test: &str) -> bool {
@@ -130,6 +142,157 @@ fn fixture() -> CaddyHarness {
     fs::write(root.join("app.py"), APP).unwrap();
     c
 }
+fn assert_doctor_routes_read_only(c: &CaddyHarness) {
+    let root = c.root();
+    let path = root.join("state/nook/state.json");
+    let before = fs::read(&path).unwrap();
+    let config = c.config_json();
+    let output = nook(root)
+        .args(["doctor", "--json"])
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let routes: Vec<_> = checks
+        .iter()
+        .filter(|check| check["id"] == "caddy.route")
+        .collect();
+    assert!(!routes.is_empty(), "{report}");
+    for route in routes {
+        assert_eq!(route["reason_code"], "matches", "{report}");
+    }
+    assert_eq!(fs::read(path).unwrap(), before);
+    assert_eq!(c.config_json(), config);
+}
+
+#[test]
+fn compose_and_tunnel_migration_observation_reconcile_and_cleanup_preserve_each_other() {
+    if isolated(
+        "compose_and_tunnel_migration_observation_reconcile_and_cleanup_preserve_each_other",
+    ) {
+        return;
+    }
+    let c = fixture();
+    let root = c.root();
+    let initial: Value = serde_json::from_str(&c.config_json()).unwrap();
+    let mut upstream = Running(
+        Command::new("python3")
+            .args(["-m", "http.server", "8080", "--bind", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    until(|| std::net::TcpStream::connect("127.0.0.1:8080").is_ok());
+    assert!(
+        nook(root)
+            .args(["alias", "set", "web", "8080", "--no-tls"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let alias = state(root)["aliases"]["web.localhost"].clone();
+    let mut legacy =
+        compose_registry::registry(root, alias["id"].as_str().unwrap().parse().unwrap(), true);
+    legacy["compose_projects"]["identity"]["routes"]["web/http"]["alias"] = alias;
+    legacy["compose_projects"]["identity"]["routes"]["web/http"]["status"] = "ready".into();
+    let project = legacy["compose_projects"]["identity"].clone();
+    let path = root.join("state/nook/state.json");
+    let original = serde_json::to_vec_pretty(&legacy).unwrap();
+    fs::write(&path, &original).unwrap();
+    fs::create_dir(root.join("bin")).unwrap();
+    let docker = root.join("bin/docker");
+    fs::write(
+        &docker,
+        r#"#!/usr/bin/env python3
+import json,pathlib,sys
+root=pathlib.Path(__file__).resolve().parent.parent
+a=sys.argv[1:]
+if a[0]=='info': print(json.dumps({'ID':'engine','OSType':'linux'}))
+elif a[0]=='ps': print('owned' if not (root/'compose-stopped').exists() else '')
+elif a[0]=='inspect': print((root/'containers.json').read_text())
+else: raise SystemExit('unexpected Docker mutation: '+repr(a))
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(root.join("containers.json"), serde_json::to_vec(&serde_json::json!([{
+        "Id":"owned", "Config":{"Labels":{"io.ntnook.owner":project["id"],
+        "io.ntnook.identity":"identity","com.docker.compose.project":"app","com.docker.compose.service":"web"}},
+        "State":{"Running":true},"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}
+    }])).unwrap()).unwrap();
+    assert_doctor_routes_read_only(&c);
+    assert_no_orphan_route_diagnostic(root);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(!path.with_extension("pre-v5.json").exists());
+    let mut child = Running(
+        nook(root)
+            .args([
+                "run",
+                "--name",
+                "tunnel-app",
+                "--tunnel",
+                "cloudflare",
+                "--",
+                "python3",
+                "app.py",
+            ])
+            .stderr(fs::File::create(root.join("nook.log")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    until(|| {
+        root.join("app-env.json").exists()
+            && state(root)["preparing"]
+                .as_object()
+                .is_some_and(|p| p.is_empty())
+    });
+    assert_eq!(state(root)["format_version"], 5);
+    assert_eq!(
+        fs::read(path.with_extension("pre-v5.json")).unwrap(),
+        original
+    );
+    assert_eq!(state(root)["compose_projects"]["identity"], project);
+    assert_doctor_routes_read_only(&c);
+    assert_no_orphan_route_diagnostic(root);
+    assert!(nook(root).arg("prune").status().unwrap().success());
+    assert_eq!(state(root)["compose_projects"]["identity"], project);
+    assert_eq!(state(root)["tunnels"].as_object().unwrap().len(), 1);
+    // Removing a stopped Compose endpoint must leave both tunnel routes intact.
+    fs::write(root.join("compose-stopped"), "").unwrap();
+    assert!(nook(root).arg("prune").status().unwrap().success());
+    assert!(
+        !state(root)["compose_projects"]["identity"]["routes"]["web/http"]["active"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_doctor_routes_read_only(&c);
+    assert_eq!(state(root)["tunnels"].as_object().unwrap().len(), 1);
+    fs::remove_file(root.join("compose-stopped")).unwrap();
+    assert!(nook(root).arg("prune").status().unwrap().success());
+    assert_eq!(state(root)["compose_projects"]["identity"], project);
+    // Supervisor crash and prune revoke the connector, never Compose or foreign routes.
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert!(nook(root).arg("prune").status().unwrap().success());
+    assert!(state(root)["tunnels"].as_object().unwrap().is_empty());
+    assert_eq!(state(root)["compose_projects"]["identity"], project);
+    assert_doctor_routes_read_only(&c);
+    assert!(upstream.0.try_wait().unwrap().is_none());
+    let after: Value = serde_json::from_str(&c.config_json()).unwrap();
+    for (name, server) in initial["apps"]["http"]["servers"].as_object().unwrap() {
+        for route in server["routes"].as_array().unwrap() {
+            assert!(
+                after["apps"]["http"]["servers"][name]["routes"]
+                    .as_array()
+                    .unwrap()
+                    .contains(route)
+            );
+        }
+    }
+}
+
 #[test]
 fn quick_tunnel_routes_tls_and_recovers_without_leaking_ownership() {
     if isolated("quick_tunnel_routes_tls_and_recovers_without_leaking_ownership") {
@@ -351,6 +514,36 @@ fn aliases_and_lan_runs_cannot_replace_routes_reserved_by_starting_runs() {
         });
         let before = c.config_json();
         assert_no_orphan_route_diagnostic(root);
+        assert_doctor_routes_read_only(&c);
+        if workspace {
+            fs::create_dir(root.join("bin")).unwrap();
+            fs::write(root.join("compose.yaml"), "services: {}\n").unwrap();
+            let docker = root.join("bin/docker");
+            fs::write(&docker, r#"#!/usr/bin/env python3
+import json,sys
+a=sys.argv[1:]
+if a[0]=='info': print(json.dumps({'ID':'engine','OSType':'linux'}))
+elif a[0]=='ps': pass
+elif a[0]=='compose' and 'config' in a:
+ print(json.dumps({'name':'shop','services':{'web':{'ports':[{'target':8080,'host_ip':'127.0.0.1'}],'labels':{'io.ntnook.route.http.port':'8080','io.ntnook.route.http.name':'web'}}}}))
+else: raise SystemExit('unexpected Docker mutation: '+repr(a))
+"#).unwrap();
+            fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = nook(root)
+                .env_remove("DOCKER_CONTEXT")
+                .env("DOCKER_HOST", "unix:///unused.sock")
+                .args(["compose", "--no-worktree", "up", "-d"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("hostname web.shop.localhost is already owned"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(state(root).get("compose_projects").is_none());
+        }
         for force in [true, false] {
             let mut alias = nook(root);
             alias.args(["alias", "set", name, "9000"]);

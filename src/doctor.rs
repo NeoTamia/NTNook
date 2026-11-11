@@ -331,6 +331,8 @@ pub(crate) fn execute(
     if let Some(owner) = args.owner
         && !registry.as_ref().is_some_and(|r| {
             r.leases.contains_key(&owner)
+                || r.tunnels.contains_key(&owner)
+                || r.preparing.contains_key(&owner)
                 || r.aliases.values().any(|a| a.id == owner)
                 || crate::compose::observations(r).any(|(_, e)| e.alias.id == owner)
         })
@@ -350,6 +352,12 @@ pub(crate) fn execute(
                 .values()
                 .map(reconcile::route_for_lease)
                 .chain(r.aliases.values().map(reconcile::route_for_alias))
+                .chain(reconcile::preparing_routes(r))
+                .chain(
+                    r.tunnels
+                        .values()
+                        .map(crate::cloudflare::Registration::route),
+                )
                 .chain(
                     crate::compose::observations(r)
                         .filter(|(_, e)| e.active)
@@ -539,6 +547,8 @@ fn inspect_project(
         return Vec::new();
     }
     let run = crate::cli::RunArgs {
+        tunnel: None,
+        no_tunnel: false,
         observation: false,
         config: args.config.clone(),
         local: args.local,
@@ -612,7 +622,7 @@ fn inspect_project(
                         error.to_string(),
                     );
                 }
-                report.add("config.project", json!({"hostname": config.hostname, "worktree": config.worktree}), Status::Pass, "resolved", "Resolved launch configuration; no command executed or port reserved", json!({"bind": config.bind_address, "tls": config.tls, "lan": config.lan, "tailscale": config.tailscale, "funnel": config.funnel, "app_port": config.app_port, "strict_port": config.strict_port, "readiness_warn_after_seconds": config.readiness_warn_after_seconds, "ignored_local_config": config.ignored_local_config, "provenance": config.provenance, "config": args.config.as_ref().unwrap_or(&cwd.join("nook.toml"))}));
+                report.add("config.project", json!({"hostname": config.hostname, "worktree": config.worktree}), Status::Pass, "resolved", "Resolved launch configuration; no command executed or port reserved", json!({"bind": config.bind_address, "tls": config.tls, "tunnel": config.tunnel, "lan": config.lan, "tailscale": config.tailscale, "funnel": config.funnel, "app_port": config.app_port, "strict_port": config.strict_port, "readiness_warn_after_seconds": config.readiness_warn_after_seconds, "ignored_local_config": config.ignored_local_config, "provenance": config.provenance, "config": args.config.as_ref().unwrap_or(&cwd.join("nook.toml"))}));
             }
             configs
         }
@@ -1034,7 +1044,7 @@ fn inspect_routes(
             } else {
                 global.caddy_client_ip_ranges.clone()
             };
-            let expected = caddy::build_proxy_route_for_network(
+            let mut expected = caddy::build_proxy_route_for_network(
                 &id,
                 &hostname,
                 &target.url,
@@ -1042,6 +1052,7 @@ fn inspect_routes(
                 &global.caddy_loopback_host,
                 &ranges,
             );
+            caddy::apply_public_host(&mut expected, spec.public_host.as_deref());
             let rows = observed.get(&id);
             let correct = rows.is_some_and(|rows| {
                 rows.len() == 1
@@ -1338,6 +1349,7 @@ mod tests {
     fn route_fixture() -> (config::GlobalConfig, reconcile::RouteSpec, Value) {
         let global = config::GlobalConfig::default();
         let spec = reconcile::RouteSpec {
+            public_host: None,
             lan: false,
             owner_id: Uuid::new_v4(),
             hostname: "app.localhost".into(),

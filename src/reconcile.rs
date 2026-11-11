@@ -642,6 +642,40 @@ pub(crate) fn route_for_lease(lease: &Lease) -> RouteSpec {
     }
 }
 
+pub(crate) fn preparing_routes(registry: &Registry) -> impl Iterator<Item = RouteSpec> + '_ {
+    registry.pending_operations.iter().filter_map(|operation| {
+        let (hostname, target, scheme, owner_id, tls) = match &operation.kind {
+            PendingOperationKind::InstallRoute {
+                hostname,
+                target,
+                scheme,
+                owner_id,
+                tls,
+            }
+            | PendingOperationKind::StartProcess {
+                hostname,
+                target,
+                scheme,
+                owner_id,
+                tls,
+            } => (hostname, target, scheme, owner_id, tls),
+            _ => return None,
+        };
+        let preparation = registry.preparing.get(owner_id)?;
+        Some(RouteSpec {
+            owner_id: *owner_id,
+            hostname: hostname.clone(),
+            target: target.clone(),
+            scheme: *scheme,
+            tls: *tls,
+            lan: preparation.lan,
+            public_host: None,
+            replace_existing: false,
+            preserve_host: false,
+        })
+    })
+}
+
 pub(crate) fn route_for_alias(alias: &Alias) -> RouteSpec {
     RouteSpec {
         public_host: None,

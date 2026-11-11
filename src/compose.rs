@@ -658,9 +658,13 @@ pub(crate) fn execute(
             endpoint.active = old.active;
         }
         if registry
-            .aliases
+            .preparing
             .values()
-            .any(|a| a.hostname == endpoint.alias.hostname)
+            .any(|p| p.hostname == endpoint.alias.hostname)
+            || registry
+                .aliases
+                .values()
+                .any(|a| a.hostname == endpoint.alias.hostname)
             || registry
                 .leases
                 .values()
@@ -729,7 +733,11 @@ pub(crate) fn execute(
             return Err(invalid("Compose project was claimed by another operation").into());
         }
         for endpoint in project.routes.values() {
-            if latest.aliases.contains_key(&endpoint.alias.hostname)
+            if latest
+                .preparing
+                .values()
+                .any(|p| p.hostname == endpoint.alias.hostname)
+                || latest.aliases.contains_key(&endpoint.alias.hostname)
                 || latest
                     .leases
                     .values()

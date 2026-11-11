@@ -202,9 +202,19 @@ owned process. Connector output is drained with a 64 KiB total memory budget;
 raw logs are not printed or persisted because they can contain credentials or
 request information. Startup errors instead report actionable categories.
 
-The registry migrates to format 3, adding connector and preparation journals.
-Stop existing runs before upgrading, and do not mix old/new Nook binaries against
-one registry. Older binaries reject format 3. No automatic downgrade is provided.
+The registry writes format 5, combining Compose projects, connector journals and
+preparing runs. Both previously emitted format-3 variants (Compose and Cloudflare),
+as well as versions 1/2, migrate without dropping any sections. The first mutation
+saves the exact original bytes in `state.pre-v5.json`; an existing
+`state.pre-compose.json` is retained. A conflicting v5 backup stops migration
+without overwriting either file. Doctor and MCP read-only observations decode in
+memory and never migrate the file or create a backup.
+
+Version 4 is reserved for the experimental ngrok schema and is deliberately
+rejected, as are unknown fields and future versions. It must receive an explicit
+migration when that extension is integrated; do not renumber its files manually.
+Stop existing runs before upgrading and do not mix old/new binaries against one
+registry. Older binaries reject format 5. No automatic downgrade is provided.
 
 ## Verification
 

@@ -342,6 +342,18 @@ fn compose_observations_are_read_only_and_scoped_to_the_recorded_root() {
     fixture.global("http://127.0.0.1:1");
     let owner = Uuid::new_v4();
     let mut registry = compose_registry::registry(&fixture.root, owner, false);
+    let tunnel = Uuid::new_v4();
+    registry["tunnels"] = json!({tunnel.to_string(): {
+        "id":tunnel,"owner_id":tunnel,"hostname":"public.localhost",
+        "target":"http://127.0.0.1:9000/",
+        "supervisor":{"pid":std::process::id(),"process_start_time_ticks":1},
+        "child":null,"url":"https://fixture.trycloudflare.com",
+        "metrics_port":1234,"phase":"connected","committed":false
+    }});
+    registry["preparing"] = json!({tunnel.to_string(): {
+        "hostname":"public.localhost", "lan":false,"tls":true,"cancelled":false,
+        "supervisor":{"pid":std::process::id(),"process_start_time_ticks":1}
+    }});
     let path = fixture.registry();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, registry.to_string()).unwrap();
@@ -376,6 +388,7 @@ fn compose_observations_are_read_only_and_scoped_to_the_recorded_root() {
     assert_eq!(live["status"], "unknown");
     assert_eq!(fs::read(&path).unwrap(), original);
     assert!(!path.with_extension("pre-compose.json").exists());
+    assert!(!path.with_extension("pre-v5.json").exists());
     client.close();
 
     // A matching hostname is not sufficient to expose another worktree's project.

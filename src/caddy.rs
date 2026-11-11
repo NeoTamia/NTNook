@@ -933,16 +933,7 @@ impl ManagedCaddyRoutes<'_> {
                 self.client_ip_ranges
             },
         );
-        if let Some(host) = &route.public_host {
-            if host.is_empty() {
-                proxy["handle"] = json!([{ "handler": "static_response", "status_code": 503 }]);
-            } else {
-                let headers = &mut proxy["handle"][0]["headers"]["request"]["set"];
-                headers["Host"] = json!([host]);
-                headers["X-Forwarded-Host"] = json!([host]);
-                headers["X-Forwarded-Proto"] = json!(["https"]);
-            }
-        }
+        apply_public_host(&mut proxy, route.public_host.as_deref());
         self.client.mutate_server_routes(server, move |mut routes| {
             reject_foreign_hostname_claims(&routes, std::slice::from_ref(&hostname))?;
             reject_managed_hostname_claim(
@@ -1583,6 +1574,20 @@ pub(crate) fn normalize_upstream(target: &str) -> Result<Upstream, Error> {
         return Err(Error::Fragment);
     }
     Ok(Upstream { url })
+}
+
+// Shared by writes and read-only Doctor comparisons.
+pub(crate) fn apply_public_host(proxy: &mut Value, public_host: Option<&str>) {
+    if let Some(host) = public_host {
+        if host.is_empty() {
+            proxy["handle"] = json!([{ "handler": "static_response", "status_code": 503 }]);
+        } else {
+            let headers = &mut proxy["handle"][0]["headers"]["request"]["set"];
+            headers["Host"] = json!([host]);
+            headers["X-Forwarded-Host"] = json!([host]);
+            headers["X-Forwarded-Proto"] = json!(["https"]);
+        }
+    }
 }
 
 #[cfg(test)]

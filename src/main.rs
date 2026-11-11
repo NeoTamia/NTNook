@@ -3,9 +3,9 @@
 mod api;
 mod caddy;
 mod cli;
+mod cloudflare;
 mod compose;
 mod compose_config;
-mod cloudflare;
 mod config;
 mod doctor;
 mod doctor_io;
