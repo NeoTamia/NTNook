@@ -625,6 +625,21 @@ fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, Error> {
 
 #[cfg(unix)]
 pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
+    local_ca_trust(pem, false)
+}
+
+#[cfg(unix)]
+pub(crate) fn inspect_local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
+    local_ca_trust(pem, true)
+}
+
+#[cfg(windows)]
+pub(crate) fn inspect_local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
+    local_ca_is_trusted(pem)
+}
+
+#[cfg(unix)]
+fn local_ca_trust(pem: &str, strict: bool) -> Result<bool, Error> {
     let (canonical, _) = canonical_local_ca(pem)?;
     let certificate = pem_certificates(&canonical).remove(0);
     for path in [
@@ -636,6 +651,11 @@ pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
             Ok(bundle) if pem_certificates(&bundle).contains(&certificate) => return Ok(true),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if strict => {
+                return Err(Error::AdminRequest(format!(
+                    "cannot inspect trust bundle {path}: {error}"
+                )));
+            }
             Err(_) => {}
         }
     }
@@ -647,9 +667,8 @@ pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
 pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
     use windows_sys::Win32::Security::Cryptography::{
         CERT_QUERY_ENCODING_TYPE, CERT_STORE_OPEN_EXISTING_FLAG, CERT_STORE_PROV_SYSTEM_W,
-        CERT_STORE_READONLY_FLAG, CERT_SYSTEM_STORE_LOCAL_MACHINE, CertCloseStore,
-        CertEnumCertificatesInStore, CertFreeCertificateContext, CertOpenStore,
-        CertOpenSystemStoreW,
+        CERT_STORE_READONLY_FLAG, CERT_SYSTEM_STORE_CURRENT_USER, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+        CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateContext, CertOpenStore,
     };
 
     let (_, expected) = canonical_local_ca(pem)?;
@@ -675,7 +694,17 @@ pub(crate) fn local_ca_is_trusted(pem: &str) -> Result<bool, Error> {
         }
     };
 
-    let current_user = unsafe { CertOpenSystemStoreW(0, store_name.as_ptr()) };
+    let current_user = unsafe {
+        CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_W,
+            CERT_QUERY_ENCODING_TYPE::default(),
+            0,
+            CERT_SYSTEM_STORE_CURRENT_USER
+                | CERT_STORE_OPEN_EXISTING_FLAG
+                | CERT_STORE_READONLY_FLAG,
+            store_name.as_ptr() as _,
+        )
+    };
     let current_user_error = current_user.is_null().then(std::io::Error::last_os_error);
     if !current_user.is_null() {
         let trusted = contains_certificate(current_user);
@@ -1255,7 +1284,10 @@ pub(crate) fn build_containers(routes: &[ManagedRoute]) -> (Option<Value>, Optio
     )
 }
 
-fn build_container<'a>(id: &str, routes: impl Iterator<Item = &'a ManagedRoute>) -> Option<Value> {
+pub(crate) fn build_container<'a>(
+    id: &str,
+    routes: impl Iterator<Item = &'a ManagedRoute>,
+) -> Option<Value> {
     let routes: Vec<_> = routes.collect();
     if routes.is_empty() {
         return None;

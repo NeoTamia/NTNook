@@ -42,8 +42,10 @@ pub(crate) enum Command {
     Alias(AliasArgs),
     /// List managed runs and aliases.
     List(ReadArgs),
-    /// Diagnose Nook and Caddy state.
+    /// Reconcile resources, then report state; --read-only skips reconciliation.
     Status(ReadArgs),
+    /// Inspect without reconciliation; --deep explicitly sends probe traffic.
+    Doctor(crate::doctor::Args),
     /// Stop a managed run.
     Stop(StopArgs),
     /// Diagnose Tailscale Serve and Funnel exposure.
@@ -369,13 +371,36 @@ pub(crate) struct StopArgs {
 
 pub(crate) fn run() -> crate::Result<i32> {
     let arguments: Vec<_> = std::env::args_os().collect();
+    if arguments.get(1).is_some_and(|arg| arg == "__doctor_probe") {
+        return crate::doctor_io::worker().map(|()| 0).map_err(Into::into);
+    }
     if arguments
         .get(1)
         .is_some_and(|argument| argument == "__complete")
     {
         return completion_query(&arguments);
     }
-    let cli = parse_from(arguments)?;
+    let cli = match parse_from(arguments.clone()) {
+        Ok(cli) => cli,
+        Err(error)
+            if (arguments.get(1).is_some_and(|a| a == "doctor")
+                || (arguments.get(1).is_some_and(|a| a == "--caddy-socket")
+                    && arguments.get(3).is_some_and(|a| a == "doctor"))
+                || (arguments
+                    .get(1)
+                    .is_some_and(|a| a.as_encoded_bytes().starts_with(b"--caddy-socket="))
+                    && arguments.get(2).is_some_and(|a| a == "doctor")))
+                && arguments
+                    .iter()
+                    .take_while(|a| *a != "--")
+                    .any(|a| a == "--json")
+                && error.exit_code() != 0 =>
+        {
+            crate::doctor::usage_error(&mut io::stdout())?;
+            return Ok(2);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     execute(cli, &mut stdout, &mut stderr)
@@ -397,6 +422,7 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         caddy_socket,
         command,
     } = cli;
+    // Observations must precede update notifications and reconciliation.
     let command = match command {
         Command::Mcp(args) => return crate::mcp::run(args, caddy_socket),
         Command::Url(args) => return observation_url(args, caddy_socket, output),
@@ -409,6 +435,9 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Alias(AliasArgs {
             command: AliasCommand::List(args),
         }) if args.read_only => return observation_read("aliases", args, caddy_socket, output),
+        Command::Doctor(arguments) => {
+            return crate::doctor::execute(arguments, caddy_socket, output);
+        }
         command => command,
     };
     // Turbo's strict environment may omit XDG configuration variables. Members
@@ -478,7 +507,7 @@ fn execute(cli: Cli, output: &mut impl Write, errors: &mut impl Write) -> crate:
         Command::Ca(CaArgs {
             command: CaCommand::Export(arguments),
         }) => ca_export_command(arguments, &global, output).map(|()| 0),
-        Command::Mcp(_) | Command::Url(_) => {
+        Command::Mcp(_) | Command::Url(_) | Command::Doctor(_) => {
             unreachable!("observations handled before reconciliation")
         }
         Command::Config(_) => unreachable!("configuration commands return before loading Caddy"),

@@ -125,3 +125,10 @@ and is therefore not exercised by the Linux Docker E2E.
 
 The Windows CI gate uses native `caddy.exe`. Docker Desktop validation supplements that gate and
 never replaces it.
+
+## Read-only diagnostics
+
+Use `nook doctor --json` to inspect configuration and ownership without reconciling
+resources. `--deep` explicitly enables active network probes; local reachability
+does not prove container, LAN or external tunnel reachability. See the
+[diagnostic guide](DIAGNOSTICS.md). `status` still reconciles before reporting.

@@ -103,6 +103,14 @@ fn native_caddy_supports_status_and_owned_aliases() {
         "alias set failed: {}",
         String::from_utf8_lossy(&set.stderr)
     );
+    let doctor = nook(&app_data, &local_app_data, &["doctor", "--json"]);
+    assert!(
+        doctor.status.success(),
+        "doctor: {}",
+        String::from_utf8_lossy(&doctor.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
     let remove = nook(
         &app_data,
         &local_app_data,

@@ -104,7 +104,7 @@ pub(crate) fn resolve(
 }
 
 fn git_path(directory: &Path, argument: &str) -> Result<PathBuf, Error> {
-    let output = crate::operation::git_output(
+    let output = crate::doctor_io::git_output(
         Command::new("git")
             .arg("-C")
             .arg(directory)

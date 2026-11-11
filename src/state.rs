@@ -268,6 +268,41 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    /// Diagnostic snapshot: never create directories/locks or wait for a writer.
+    /// Keep both handles alive until the registry bytes have been copied.
+    pub(crate) fn inspect(&self) -> Result<(Option<Registry>, Option<Vec<u8>>), Error> {
+        let mut guards = Vec::new();
+        for extension in ["operations.lock", "lock"] {
+            let path = self.path.with_extension(extension);
+            match File::open(&path) {
+                Ok(file) => {
+                    file.try_lock_shared()
+                        .map_err(|error| io_error(&path, error.into()))?;
+                    guards.push(file);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(&path, error)),
+            }
+        }
+        match fs::read(&self.path) {
+            Ok(bytes) => {
+                let raw: Value = serde_json::from_slice(&bytes).map_err(Error::InvalidJson)?;
+                if raw
+                    .get("aliases")
+                    .and_then(Value::as_object)
+                    .is_some_and(|aliases| aliases.values().any(|alias| alias.get("id").is_none()))
+                {
+                    return Err(Error::InvalidJson(serde::de::Error::custom(
+                        "legacy alias has no stable owner ID; diagnostic cannot infer ownership",
+                    )));
+                }
+                Ok((Some(decode(&bytes)?), Some(bytes)))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((None, None)),
+            Err(error) => Err(io_error(&self.path, error)),
+        }
+    }
+
     pub(crate) fn new(path: PathBuf) -> Self {
         Self { path, budget: None }
     }

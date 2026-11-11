@@ -1168,6 +1168,7 @@ mod tests {
                         directory: self.root.join(id),
                         environment: BTreeMap::new(),
                         config: ResolvedRunConfig {
+                            provenance: Default::default(),
                             worktree: None,
                             hostname: format!("{id}.demo.localhost"),
                             command: argv.iter().map(OsString::from).collect(),

@@ -143,6 +143,8 @@ impl std::error::Error for Error {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectConfig {
+    #[serde(skip)]
+    pub(crate) provenance: BTreeMap<String, String>,
     pub(crate) worktree: Option<crate::worktree::Setting>,
     format_version: u32,
     pub(crate) name: Option<String>,
@@ -218,6 +220,7 @@ impl Default for GlobalConfig {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct ResolvedRunConfig {
+    pub(crate) provenance: BTreeMap<String, String>,
     pub(crate) worktree: Option<crate::worktree::Identity>,
     pub(crate) hostname: String,
     pub(crate) command: Vec<OsString>,
@@ -425,7 +428,13 @@ pub(crate) fn load_project_file(
     let Some(contents) = contents else {
         return Ok(None);
     };
-    let config: ProjectConfig = parse(path, &contents)?;
+    let mut config: ProjectConfig = parse(path, &contents)?;
+    let fields: toml::Table = parse(path, &contents)?;
+    config.provenance = fields
+        .keys()
+        .filter(|key| key.as_str() != "env" && key.as_str() != "format_version")
+        .map(|key| (key.clone(), path.display().to_string()))
+        .collect();
     validate_version(path, config.format_version)?;
     Ok(Some(config))
 }
@@ -440,7 +449,10 @@ pub(crate) fn merge_project(
     let Some(base) = base else {
         return Some(local);
     };
+    let mut provenance = base.provenance.clone();
+    provenance.extend(local.provenance.clone());
     Some(ProjectConfig {
+        provenance,
         format_version: local.format_version,
         name: local.name.or(base.name),
         worktree: local.worktree.or(base.worktree),
@@ -474,6 +486,7 @@ pub(crate) fn merge_run(
     default_bind_address: IpAddr,
 ) -> Result<ResolvedRunConfig, Error> {
     let project = project.unwrap_or(ProjectConfig {
+        provenance: Default::default(),
         format_version: FORMAT_VERSION,
         name: None,
         worktree: None,
@@ -489,6 +502,64 @@ pub(crate) fn merge_run(
         framework: None,
         env: None,
     });
+    let mut provenance = project.provenance.clone();
+    for key in [
+        "name",
+        "command",
+        "tls",
+        "tailscale",
+        "funnel",
+        "lan",
+        "worktree",
+        "app_port",
+        "strict_port",
+        "readiness_warn_after_seconds",
+        "run_bind_address",
+        "framework",
+    ] {
+        provenance.entry(key.into()).or_insert_with(|| {
+            if key == "run_bind_address" {
+                "global/default".into()
+            } else if key == "name" {
+                "inferred Git root/directory".into()
+            } else {
+                "default".into()
+            }
+        });
+    }
+    for (key, supplied) in [
+        ("name", arguments.name.is_some()),
+        ("command", !arguments.command.is_empty()),
+        ("tls", arguments.no_tls),
+        (
+            "tailscale",
+            arguments.tailscale || arguments.funnel || arguments.no_tailscale,
+        ),
+        (
+            "funnel",
+            arguments.funnel || arguments.tailscale || arguments.no_tailscale,
+        ),
+        ("lan", arguments.lan || arguments.no_lan),
+        (
+            "worktree",
+            arguments.worktree.is_some() || arguments.no_worktree,
+        ),
+        ("app_port", arguments.app_port.is_some()),
+        ("strict_port", arguments.strict_port),
+        (
+            "readiness_warn_after_seconds",
+            arguments.readiness_warn_after.is_some(),
+        ),
+        ("run_bind_address", arguments.run_bind_address.is_some()),
+        (
+            "framework",
+            arguments.framework.is_some() || arguments.no_framework,
+        ),
+    ] {
+        if supplied {
+            provenance.insert(key.into(), "CLI".into());
+        }
+    }
     let lan = arguments.lan || (!arguments.no_lan && project.lan.unwrap_or(false));
     let hostname = resolve_hostname(
         arguments.name.as_deref(),
@@ -525,6 +596,7 @@ pub(crate) fn merge_run(
         None => hostname,
     };
     Ok(ResolvedRunConfig {
+        provenance,
         worktree,
         hostname,
         command,
@@ -672,7 +744,7 @@ fn invalid_name<T>(name: &str, reason: &'static str) -> Result<T, Error> {
 }
 
 fn find_git_root(current_directory: &Path) -> Option<PathBuf> {
-    let output = crate::operation::git_output(
+    let output = crate::doctor_io::git_output(
         Command::new("git")
             .arg("-C")
             .arg(current_directory)
@@ -1435,6 +1507,7 @@ mod tests {
 
     fn project() -> ProjectConfig {
         ProjectConfig {
+            provenance: Default::default(),
             worktree: None,
             format_version: 1,
             name: Some("project".into()),

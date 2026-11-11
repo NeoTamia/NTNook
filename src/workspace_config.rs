@@ -36,6 +36,8 @@ struct Manifest {
 
 #[derive(Deserialize)]
 struct Member {
+    #[serde(skip)]
+    provenance: std::collections::BTreeMap<String, String>,
     id: String,
     dir: Option<PathBuf>,
     #[serde(flatten)]
@@ -82,6 +84,18 @@ fn load_inner(
         source,
     })?;
     let mut manifest: Manifest = config::parse(&path, &contents)?;
+    for member in &mut manifest.apps {
+        member.provenance = member
+            .settings
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    format!("{} [[apps]] {}", path.display(), member.id),
+                )
+            })
+            .collect();
+    }
     debug_assert_eq!(manifest.format_version, 2);
     if manifest.command.is_some() {
         return Err(invalid(
@@ -139,6 +153,12 @@ fn load_inner(
                 if let Some(dir) = member.dir {
                     base.dir = Some(dir);
                 }
+                base.provenance.extend(member.settings.keys().map(|key| {
+                    (
+                        key.clone(),
+                        format!("{} [[apps]] {}", local_path.display(), member.id),
+                    )
+                }));
                 merge_settings(&mut base.settings, member.settings);
             }
         }
@@ -235,13 +255,14 @@ fn load_inner(
             ));
         }
         settings.insert("format_version".into(), toml::Value::Integer(1));
-        let project: config::ProjectConfig =
+        let mut project: config::ProjectConfig =
             toml::Value::Table(settings)
                 .try_into()
                 .map_err(|source| config::Error::Parse {
                     path: path.clone(),
                     source,
                 })?;
+        project.provenance = member.provenance;
         let member_path = directory.join("nook.toml");
         // A root member points at the manifest itself, not a second v1 config.
         let base = if member_path == path {
@@ -265,8 +286,12 @@ fn load_inner(
         project = config::merge_project(Some(project), local).unwrap();
         if project.name.is_none() {
             project.name = Some(format!("{}.{}", member.id, workspace_name));
+            project
+                .provenance
+                .insert("name".into(), "workspace namespace + app id".into());
         }
         let hostname = config::normalize_hostname(project.name.as_deref().unwrap())?;
+        let name_source = project.provenance.get("name").cloned();
         let environment = project.env.take().unwrap_or_default();
         let mut resolved = config::merge_run(
             &member_arguments,
@@ -283,6 +308,12 @@ fn load_inner(
             None => hostname,
         };
         resolved.worktree = worktree.clone();
+        if let Some(source) = name_source {
+            resolved.provenance.insert("name".into(), source);
+        }
+        resolved
+            .provenance
+            .insert("worktree".into(), "workspace root / CLI".into());
         if worktree.is_some() && resolved.funnel {
             return Err(config::Error::InvalidWorktree(
                 "Funnel is not supported in worktree mode".into(),

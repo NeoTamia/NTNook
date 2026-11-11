@@ -41,6 +41,146 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const HTTPS_SETTINGS_URL: &str = "https://login.tailscale.com/admin/dns";
 const DOWNLOAD_URL: &str = "https://tailscale.com/download";
 
+/// Bounded, read-only observations. Never call reconcile/register/withdraw here.
+pub(crate) fn doctor(
+    emit: &mut impl FnMut(&str, crate::doctor::Status, &str, String, Value),
+    registry: Option<&Registry>,
+    owner: Option<Uuid>,
+    deadline: Instant,
+) -> bool {
+    use crate::doctor::Status;
+    let client = Client::from_environment();
+    let read = |arguments: &[&str]| -> std::io::Result<String> {
+        let budget = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "budget exhausted"))?
+            .min(Duration::from_secs(3));
+        let execute = |program: &Path| {
+            crate::doctor_io::output(Command::new(program).args(arguments), budget, 1024 * 1024)
+        };
+        let bytes = match execute(&client.program) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !client.overridden => {
+                match windows_install_location() {
+                    Some(path) => execute(&path),
+                    None => Err(error),
+                }
+            }
+            result => result,
+        }?;
+        String::from_utf8(bytes).map_err(std::io::Error::other)
+    };
+    match read(&["version"]) {
+        Ok(version) => {
+            let supported = parse_version(&version).is_some_and(|v| v >= MINIMUM_VERSION);
+            emit(
+                "tailscale.version",
+                if supported {
+                    Status::Pass
+                } else {
+                    Status::Fail
+                },
+                "version",
+                "Tailscale >= 1.52 required".into(),
+                serde_json::json!({"supported": supported}),
+            );
+        }
+        Err(_) => emit(
+            "tailscale.version",
+            Status::Fail,
+            "client_unavailable",
+            "Cannot read Tailscale version; check executable and permissions".into(),
+            Value::Null,
+        ),
+    }
+    let status = read(&["status", "--json"])
+        .ok()
+        .and_then(|s| serde_json::from_str::<StatusJson>(&s).ok());
+    let mut dns = None;
+    match status {
+        Some(status) => {
+            let running = status.backend_state == "Running";
+            let https = status.cert_domains.is_some_and(|d| !d.is_empty());
+            dns = status
+                .this_device
+                .map(|d| d.dns_name.trim_end_matches('.').to_owned());
+            emit(
+                "tailscale.backend",
+                if running && https {
+                    Status::Pass
+                } else {
+                    Status::Fail
+                },
+                "backend_state",
+                "Check connection and tailnet HTTPS settings; no login or activation attempted"
+                    .into(),
+                serde_json::json!({"backend": status.backend_state, "https": https}),
+            );
+        }
+        None => emit(
+            "tailscale.backend",
+            Status::Fail,
+            "status_unavailable",
+            "Cannot read Tailscale status; check daemon, permissions and JSON output".into(),
+            Value::Null,
+        ),
+    }
+    let serve = read(&["serve", "status", "--json"])
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .map(ServeConfig);
+    if let Some(registry) = registry {
+        let identity_matches = dns
+            .as_deref()
+            .is_some_and(|dns| check_identity(registry, dns).is_ok());
+        if !identity_matches {
+            emit(
+                "tailscale.identity",
+                Status::Warning,
+                "identity_unverified",
+                "Recorded identity differs or is unavailable; do not adopt foreign Serve resources"
+                    .into(),
+                Value::Null,
+            );
+        }
+        for (port, registration) in registry
+            .tailscale
+            .registrations
+            .iter()
+            .filter(|(_, registration)| owner.is_none_or(|id| id == registration.owner_id))
+        {
+            let observation = serve
+                .as_ref()
+                .zip(dns.as_deref())
+                .filter(|_| identity_matches)
+                .map(|(serve, dns)| serve.observe_registration(dns, *port, registration));
+            let (status, reason) = match observation {
+                Some(Observation::Owned) => (Status::Pass, "owned"),
+                Some(Observation::Public) => (Status::Fail, "unexpected_public_exposure"),
+                Some(Observation::Foreign) => (Status::Fail, "foreign_registration"),
+                Some(Observation::Absent) => (Status::Fail, "registration_missing"),
+                None => (Status::Skipped, "observation_unavailable"),
+            };
+            emit(
+                "tailscale.registration",
+                status,
+                reason,
+                "Serve/Funnel registration observed without convergence".into(),
+                serde_json::json!({"owner_id": registration.owner_id, "port": port, "funnel": registration.funnel}),
+            );
+        }
+    }
+    if serve.is_none() {
+        emit(
+            "tailscale.serve",
+            Status::Fail,
+            "serve_unavailable",
+            "Cannot read Serve configuration".into(),
+            Value::Null,
+        );
+    }
+    Instant::now() < deadline
+}
+
 #[derive(Debug)]
 pub(crate) enum Error {
     MissingClient(PathBuf),
