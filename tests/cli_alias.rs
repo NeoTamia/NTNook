@@ -245,19 +245,8 @@ fn stop_command_targets_the_current_managed_process_group() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let state_path = state_home.join("nook/state.json");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if fs::read_to_string(&state_path).is_ok_and(|state| state.contains("sleeper.localhost")) {
-            break;
-        }
-        thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        fs::read_to_string(&state_path)
-            .unwrap()
-            .contains("sleeper.localhost")
-    );
+    // sleep never listens: wait for its committed process lease, not Ready.
+    wait_for_lease_state(&state_home, "sleeper.localhost", "starting");
     let stop = nook(&config_home, &state_home, &["stop", "sleeper"]);
     assert_success(&stop);
     assert_eq!(
@@ -592,9 +581,17 @@ fn wait_for_lease_state(state_home: &Path, hostname: &str, state_name: &str) {
     let state_path = state_home.join("nook/state.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        if fs::read_to_string(&state_path).is_ok_and(|state| {
-            state.contains(hostname) && state.contains(&format!("\"state\": \"{state_name}\""))
-        }) {
+        if fs::read(&state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|registry| {
+                registry["leases"].as_object().is_some_and(|leases| {
+                    leases
+                        .values()
+                        .any(|lease| lease["hostname"] == hostname && lease["state"] == state_name)
+                })
+            })
+        {
             return;
         }
         thread::sleep(std::time::Duration::from_millis(20));
