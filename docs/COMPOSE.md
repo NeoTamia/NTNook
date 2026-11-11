@@ -206,12 +206,11 @@ mechanism for these dynamic routes.
 
 ## State and tests
 
-The first registry write migrates versions 1/2 and both format-3 variants to
-version 5, preserving Compose projects and Cloudflare journals together. The exact
-input is saved as `state.pre-v5.json`; any existing `state.pre-compose.json` is
-retained. Read-only observations never rewrite state. Experimental ngrok format 4
-is rejected until an explicit migration is integrated. Older binaries cannot read
-version 5. See [registry compatibility](CLOUDFLARE.md#failure-and-recovery). Do not restore
+The first registry write migrates historical versions 1–5 to version 6, retaining
+Compose and provider-aware tunnels together. Exact input is saved as
+`state.pre-v6.json`; older backups are preserved and a conflicting v6 backup
+blocks mutation. Read-only observations never rewrite state. See
+[registry compatibility](CLOUDFLARE.md#failure-and-recovery). Do not restore
 an old registry while managed Compose resources are running; stop them first.
 Ownership labels alone are not sufficient to adopt resources after losing state.
 

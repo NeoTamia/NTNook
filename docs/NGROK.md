@@ -178,8 +178,8 @@ certificate is not installed in the system trust store; private keys are unused.
   process identity/group/Windows Job Object lifecycle. Cleanup is journaled and
   idempotent. `prune` never republishes anything and never revokes a reserved
   ngrok domain. Indeterminate identity cannot authorize killing a process.
-- State upgrades from formats 1–3 to format 4. Stop active runs before upgrading;
-  do not mix old/new binaries against one registry. Old binaries reject format 4.
+- State upgrades from historical formats 1–5 to provider-aware format 6, preserving Compose and all tunnel ownership. See [registry compatibility](CLOUDFLARE.md#failure-and-recovery). Stop active runs before upgrading;
+  do not mix old/new binaries against one registry. Old binaries reject format 6.
 - Credential variables are removed from app/runner children. Only the ngrok
   child receives `NGROK_AUTHTOKEN`; API keys are not needed. Tokens never enter
   argv or the Nook registry. Output is bounded/drained and never printed raw.

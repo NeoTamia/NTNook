@@ -660,7 +660,7 @@ fn compose_owners_are_observed_without_docker_or_registry_mutation() {
         assert_eq!(missing, active, "{report}");
         assert_eq!(fs::read(fixture.state()).unwrap(), before);
         assert!(!fixture.state().with_extension("pre-compose.json").exists());
-        assert!(!fixture.state().with_extension("pre-v5.json").exists());
+        assert!(!fixture.state().with_extension("pre-v6.json").exists());
         fixture.assert_read_only();
     }
     // A leftover inactive route is recorded drift, never an ownerless route to adopt.
@@ -699,7 +699,7 @@ fn doctor_never_invents_a_compose_owner_or_persists_legacy_migrations() {
     let (_, report) = fixture.doctor(&[]);
     assert_eq!(check(&report, "state.snapshot")["status"], "fail");
     assert_eq!(fs::read(fixture.state()).unwrap(), before);
-    for version in [1, 2] {
+    for version in [1, 2, 3, 4, 5] {
         fixture.alias();
         let mut registry: Value =
             serde_json::from_slice(&fs::read(fixture.state()).unwrap()).unwrap();
@@ -710,7 +710,7 @@ fn doctor_never_invents_a_compose_owner_or_persists_legacy_migrations() {
         assert_eq!(check(&report, "state.snapshot")["status"], "pass");
         assert_eq!(fs::read(fixture.state()).unwrap(), before);
         assert!(!fixture.state().with_extension("pre-compose.json").exists());
-        assert!(!fixture.state().with_extension("pre-v5.json").exists());
+        assert!(!fixture.state().with_extension("pre-v6.json").exists());
     }
     fixture.assert_read_only();
 }

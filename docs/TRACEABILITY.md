@@ -96,7 +96,7 @@ Integration tests are isolated in temporary directories, use Caddy `2.11.x`, ins
 
 ## Cloudflare Quick Tunnels
 
-- Configuration/preflight: `tests/cli_tunnel_config.rs`, `cloudflare::tests`.
+- Configuration/preflight: `tests/cli_tunnel_config.rs`, `tunnel::tests`.
 - Verified Caddy TLS, public Host forwarding, rollback, cancellation, supervisor
   crash, forced transfer, workspace interpolation and runner ownership:
   `tests/cloudflare_tunnel.rs` (isolated Linux namespaces, no public traffic).
@@ -107,7 +107,7 @@ Integration tests are isolated in temporary directories, use Caddy `2.11.x`, ins
 
 ## ngrok
 
-- Shared foreground tunnel lifecycle, state format 4, structured endpoint discovery:
+- Shared foreground tunnel lifecycle, state format 6, structured endpoint discovery:
   `ngrok::tests`, `tests/ngrok_tunnel.rs`, existing Cloudflare lifecycle tests.
 - CLI/templates and native Windows process ownership: `tests/cli_tunnel_config.rs`,
   `tests/windows_caddy_e2e.rs` with `tests/support/ngrok_mock.rs`.

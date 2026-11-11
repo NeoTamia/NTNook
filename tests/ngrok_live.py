@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Opt-in real ngrok proof. Run in a disposable container (owns :443).
-Requires nook, Caddy 2.11.x, ngrokd 2026.10.7, Python, Node and Vite on PATH.
+Requires nook, Caddy 2.11.x, ngrok 3.39.13, Python, Node and Vite on PATH.
 Only the generated fixture is publicly exposed. Never serves repository files.
 """
 import base64

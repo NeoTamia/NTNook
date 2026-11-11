@@ -2730,6 +2730,7 @@ fn tunnel_command(
                 .cloned()
                 .ok_or_else(|| io::Error::other("unknown alias"))?;
             let config = crate::config::ResolvedRunConfig {
+                provenance: Default::default(),
                 tunnel: true,
                 ngrok: true,
                 ngrok_url,

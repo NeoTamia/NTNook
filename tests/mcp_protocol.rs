@@ -388,7 +388,7 @@ fn compose_observations_are_read_only_and_scoped_to_the_recorded_root() {
     assert_eq!(live["status"], "unknown");
     assert_eq!(fs::read(&path).unwrap(), original);
     assert!(!path.with_extension("pre-compose.json").exists());
-    assert!(!path.with_extension("pre-v5.json").exists());
+    assert!(!path.with_extension("pre-v6.json").exists());
     client.close();
 
     // A matching hostname is not sufficient to expose another worktree's project.
@@ -952,4 +952,38 @@ fn worktree_scope_uses_identity_and_pagination_detects_state_changes() {
     first.close();
     second.close();
     all.close();
+}
+
+#[test]
+fn provider_aware_and_combined_legacy_registries_are_observation_only() {
+    for version in [4, 5] {
+        let fixture = Fixture::new();
+        fixture.global("http://127.0.0.1:0");
+        let owner = Uuid::new_v4();
+        let mut registry = compose_registry::registry(&fixture.root, owner, false);
+        registry["format_version"] = json!(version);
+        registry["tunnels"] = json!({owner.to_string(): {
+            "id":owner,"owner_id":owner,"hostname":"web.localhost",
+            "target":"http://127.0.0.1:8080/",
+            "supervisor":{"pid":1,"process_start_time_ticks":2},
+            "child":null,"url":null,"metrics_port":1234,"phase":"failed","committed":true
+        }});
+        if version == 4 {
+            registry.as_object_mut().unwrap().remove("compose_projects");
+            registry["tunnels"][owner.to_string()]["provider"] = json!("ngrok");
+            registry["tunnels"][owner.to_string()]["alias"] = json!(true);
+        }
+        let path = fixture.registry();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::to_vec_pretty(&registry).unwrap();
+        fs::write(&path, &original).unwrap();
+        let mut client = fixture.spawn(&[]);
+        client.initialize("2025-11-25");
+        let result = client.call("nook_list", json!({}));
+        assert_eq!(result["ok"], true, "{result}");
+        client.close();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("pre-v6.json").exists());
+        assert!(!path.with_extension("lock").exists());
+    }
 }

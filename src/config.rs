@@ -537,6 +537,7 @@ pub(crate) fn merge_run(
         "command",
         "tls",
         "tunnel",
+        "ngrok_url",
         "tailscale",
         "funnel",
         "lan",
@@ -562,6 +563,7 @@ pub(crate) fn merge_run(
         ("command", !arguments.command.is_empty()),
         ("tls", arguments.no_tls),
         ("tunnel", arguments.tunnel.is_some() || arguments.no_tunnel),
+        ("ngrok_url", arguments.ngrok_url.is_some()),
         (
             "tailscale",
             arguments.tailscale || arguments.funnel || arguments.no_tailscale,
