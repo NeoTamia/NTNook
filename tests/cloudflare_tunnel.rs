@@ -248,6 +248,15 @@ else: raise SystemExit('unexpected Docker mutation: '+repr(a))
                 .as_object()
                 .is_some_and(|p| p.is_empty())
     });
+    // The supervisor records Ready after spawn; let that write finish before
+    // asserting that Doctor leaves the registry bytes unchanged.
+    until(|| {
+        state(root)["leases"].as_object().is_some_and(|leases| {
+            leases.values().any(|lease| {
+                lease["hostname"] == "tunnel-app.localhost" && lease["state"] == "ready"
+            })
+        })
+    });
     assert_eq!(state(root)["format_version"], 5);
     assert_eq!(
         fs::read(path.with_extension("pre-v5.json")).unwrap(),
