@@ -114,7 +114,7 @@ if [[ "$compose_file" == *caddy-docker-proxy* ]]; then
   docker run --detach --rm --name "$project_name-trigger" \
     --network nook-caddy-proxy-network --entrypoint sleep \
     --label caddy=event.localhost --label caddy.respond='"event"' \
-    caddy:2.11.4-alpine 30 >/dev/null
+    caddy:2.11.9-alpine 30 >/dev/null
   sleep 2
   target/debug/nook status >/dev/null 2>"$test_root/proxy-reconcile.err"
   curl --silent --fail --cacert "$test_root/caddy-local-ca.pem" \

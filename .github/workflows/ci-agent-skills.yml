@@ -50,7 +50,7 @@ jobs:
       - name: Install Caddy on Linux
         if: runner.os == 'Linux'
         run: |
-          curl --fail --silent --show-error --location https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz --output /tmp/caddy.tar.gz
+          curl --fail --silent --show-error --location https://github.com/caddyserver/caddy/releases/download/v2.11.9/caddy_2.11.9_linux_amd64.tar.gz --output /tmp/caddy.tar.gz
           tar --extract --gzip --file /tmp/caddy.tar.gz --directory "$HOME/.cargo/bin" caddy
       - name: Install Caddy on Windows
         if: runner.os == 'Windows'
@@ -58,7 +58,7 @@ jobs:
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'caddy.zip'
           $directory = Join-Path $env:RUNNER_TEMP 'caddy'
-          Invoke-WebRequest -Uri https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_windows_amd64.zip -OutFile $archive
+          Invoke-WebRequest -Uri https://github.com/caddyserver/caddy/releases/download/v2.11.9/caddy_2.11.9_windows_amd64.zip -OutFile $archive
           Expand-Archive -LiteralPath $archive -DestinationPath $directory
           $directory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Linux isolated lifecycle smoke

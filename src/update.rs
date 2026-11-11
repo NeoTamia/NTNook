@@ -394,7 +394,16 @@ fn extract_nook(archive: &[u8]) -> Result<Vec<u8>, Error> {
         let mut entry = zip
             .by_index(index)
             .map_err(|error| Error::Archive(error.to_string()))?;
-        if entry.is_file() && Path::new(entry.name()).file_name() == Some(OsStr::new("nook.exe")) {
+        let is_binary = entry.is_file()
+            && Path::new(
+                entry
+                    .name()
+                    .map_err(|error| Error::Archive(error.to_string()))?
+                    .as_ref(),
+            )
+            .file_name()
+                == Some(OsStr::new("nook.exe"));
+        if is_binary {
             return read_limited(&mut entry, ARCHIVE_SIZE_LIMIT)
                 .map_err(|error| Error::Archive(error.to_string()));
         }
@@ -894,6 +903,25 @@ mod tests {
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[cfg(windows)]
+    #[test]
+    fn zip_update_extracts_only_the_binary_and_rejects_missing_or_corrupt_archives() {
+        use std::io::{Cursor, Write};
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("README.md", options).unwrap();
+        archive.write_all(b"documentation").unwrap();
+        let missing = archive.finish().unwrap().into_inner();
+        assert!(super::extract_nook(&missing).is_err());
+        assert!(super::extract_nook(b"not a zip").is_err());
+
+        let mut archive = zip::ZipWriter::new_append(Cursor::new(missing)).unwrap();
+        archive.start_file("release/nook.exe", options).unwrap();
+        archive.write_all(b"binary payload").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        assert_eq!(super::extract_nook(&bytes).unwrap(), b"binary payload");
+    }
 
     #[cfg(windows)]
     #[test]

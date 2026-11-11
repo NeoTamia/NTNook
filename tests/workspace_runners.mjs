@@ -1,5 +1,5 @@
 // Explicit integration gate: build nook, install the pinned test runners, then run:
-// npm install --prefix target/workspace-runner-tools --no-audit --no-fund turbo@2.11.10 lerna@10.1.1 pnpm@12.15.0 bun@1.4.4 vite-plus@1.4.0 nx@24.0.0 @moonrepo/cli@2.6.2 @yarnpkg/cli-dist@4.18.1
+// npm install --prefix target/workspace-runner-tools --no-audit --no-fund turbo@2.11.10 lerna@10.1.1 pnpm@12.18.0 bun@1.4.4 vite-plus@1.4.0 nx@24.0.0 @moonrepo/cli@2.6.2 @yarnpkg/cli-dist@4.18.1
 // node --test tests/workspace_runners.mjs
 // Requires Node 24.15+, Caddy 2.11.x (no CA installation).
 import assert from "node:assert/strict";
@@ -200,7 +200,7 @@ for (const { id: runner, command, filter } of runners.filter(({ id }) => !select
       await writeFile(path.join(root, "config/nook/config.toml"), `format_version = 1\ncaddy_admin = "${admin}"\n`);
       await writeFile(path.join(root, "package.json"), JSON.stringify({
         name: "nook-runner-fixture", private: true, version: "1.0.0",
-        packageManager: runner === "yarn" ? "yarn@4.18.1" : runner === "pnpm" ? "pnpm@12.15.0" : "npm@11.19.1", workspaces: ["apps/*", "wrapper"],
+        packageManager: runner === "yarn" ? "yarn@4.18.1" : runner === "pnpm" ? "pnpm@12.18.0" : "npm@11.19.1", workspaces: ["apps/*", "wrapper"],
         scripts: { dev: `node root-probe.mjs && ${command}` },
       }));
       await writeFile(path.join(root, "pnpm-workspace.yaml"), `packages:\n  - apps/*\n  - wrapper\npmOnFail: ignore\nincludeWorkspaceRoot: false\nlinkWorkspacePackages: true\nstoreDir: ${JSON.stringify(path.join(root, "pnpm-store"))}\n`);
