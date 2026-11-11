@@ -371,6 +371,9 @@ pub(crate) fn resolve_run(
     current_directory: &Path,
     default_bind_address: IpAddr,
 ) -> Result<ResolvedRunConfig, Error> {
+    let mut arguments = arguments.clone();
+    arguments.config = arguments.config.map(|path| current_directory.join(path));
+    let arguments = &arguments;
     let (project, ignored_local_config) = load_project(arguments, current_directory)?;
     let git_root = find_git_root(current_directory);
     let mut resolved = merge_run(
@@ -497,7 +500,7 @@ pub(crate) fn merge_run(
         project
             .command
             .map(|values| values.into_iter().map(OsString::from).collect())
-            .or_else(|| arguments.runner.then(Vec::new))
+            .or_else(|| (arguments.runner || arguments.observation).then(Vec::new))
             .ok_or(Error::MissingCommand)?
     } else {
         arguments.command.clone()
@@ -669,12 +672,13 @@ fn invalid_name<T>(name: &str, reason: &'static str) -> Result<T, Error> {
 }
 
 fn find_git_root(current_directory: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(current_directory)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
+    let output = crate::operation::git_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(current_directory)
+            .args(["rev-parse", "--show-toplevel"]),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

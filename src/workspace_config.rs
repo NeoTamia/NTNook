@@ -291,7 +291,7 @@ fn load_inner(
         resolved.ignored_local_config = ignored_root_local.clone().or_else(|| {
             (!use_local && member_local.exists() && member_local != path).then_some(member_local)
         });
-        if resolved.command.is_empty() && !arguments.runner {
+        if resolved.command.is_empty() && !arguments.runner && !arguments.observation {
             return Err(invalid(
                 &path,
                 format!("app `{}` requires a nonempty command argv", member.id),

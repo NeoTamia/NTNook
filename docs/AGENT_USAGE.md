@@ -91,12 +91,14 @@ hooks or MCP server are required by this skill.
 
 ## Capability boundary
 
-The current workflow uses existing CLI text output and lifecycle commands.
-Structured JSON/URL discovery, MCP, doctor, Compose orchestration and additional
-managed tunnels are separate future milestones, not available commands. JSON
-needs a versioned output/error contract first; MCP would need explicit operation
-permissions; doctor must separate diagnosis from repair. Compose and additional
-tunnels require separate ownership and exposure designs.
+The portable workflow uses CLI launch and lifecycle commands. This checkout also
+provides optional [structured JSON/URL discovery and local MCP](MCP.md), with a
+versioned output/error contract, read-only defaults and explicit alias grants.
+Check the installed binary's help before using these additions; the skill's
+baseline remains usable with older versions. MCP does not launch or stop apps.
+Doctor, Compose orchestration and additional managed tunnels remain separate
+future milestones. Doctor must separate diagnosis from repair; Compose and
+additional tunnels require separate ownership and exposure designs.
 
 Existing LAN, standalone Tailscale Serve and Funnel are already documented in
 Nook. They are not those future milestones. Serve is not supported for multi-app

@@ -264,11 +264,52 @@ pub(crate) fn state_path() -> Result<PathBuf, Error> {
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     path: PathBuf,
+    budget: Option<crate::operation::Budget>,
 }
 
 impl Store {
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, budget: None }
+    }
+
+    pub(crate) fn with_budget(mut self, budget: crate::operation::Budget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    fn acquire(&self, file: &File, path: &Path) -> Result<(), Error> {
+        if let Some(budget) = &self.budget {
+            budget.lock(file).map_err(|source| io_error(path, source))
+        } else {
+            file.lock().map_err(|source| io_error(path, source))
+        }
+    }
+
+    /// Strict atomic snapshot: never creates directories or lock files.
+    pub(crate) fn snapshot(&self) -> Result<Registry, Error> {
+        let path = self.path.with_extension("lock");
+        let guard = match File::open(&path) {
+            Ok(file) => {
+                if let Some(budget) = &self.budget {
+                    budget
+                        .lock_shared(&file)
+                        .map_err(|source| io_error(&path, source))?;
+                } else {
+                    file.lock_shared()
+                        .map_err(|source| io_error(&path, source))?;
+                }
+                Some(file)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        let result = match fs::read(&self.path) {
+            Ok(bytes) => decode(&bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Registry::empty()),
+            Err(source) => Err(io_error(&self.path, source)),
+        };
+        drop(guard);
+        result
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -309,7 +350,7 @@ impl Store {
             .truncate(false)
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
-        file.lock().map_err(|source| io_error(&path, source))?;
+        self.acquire(&file, &path)?;
         Ok(OperationGuard { _file: file })
     }
 
@@ -329,7 +370,7 @@ impl Store {
             .truncate(false)
             .open(&lock_path)
             .map_err(|source| io_error(&lock_path, source))?;
-        lock.lock().map_err(|source| io_error(&lock_path, source))?;
+        self.acquire(&lock, &lock_path)?;
         match fs::read(&self.path) {
             Ok(contents) => decode(&contents),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Registry::empty()),
@@ -356,7 +397,7 @@ impl Store {
             .truncate(false)
             .open(&lock_path)
             .map_err(|source| io_error(&lock_path, source))?;
-        lock.lock().map_err(|source| io_error(&lock_path, source))?;
+        self.acquire(&lock, &lock_path)?;
 
         let temporary_path = self.path.with_extension("json.tmp");
         match fs::remove_file(&temporary_path) {

@@ -21,6 +21,10 @@ name = "tailscale_serve"
 harness = false
 
 [dependencies]
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-std", "signal"] }
+tokio-util = "0.7"
+schemars = "1"
 clap = { version = "4.5.45", features = ["derive"] }
 clap_complete = "4.6.8"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -38,6 +42,7 @@ lzma-rs = "0.3.0"
 zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
 libc = "0.2.175"
 signal-hook = "0.4.0"
 ureq = { version = "3.1.0", features = ["json"] }
@@ -55,3 +60,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+jsonschema = { version = "0.61.1", default-features = false }

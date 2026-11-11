@@ -154,6 +154,7 @@ enum AdminEndpoint {
 #[derive(Debug)]
 pub(crate) struct Client {
     admin: AdminEndpoint,
+    budget: Option<crate::operation::Budget>,
 }
 
 impl Client {
@@ -176,6 +177,7 @@ impl Client {
                 ));
                 }
                 return Ok(Self {
+                    budget: None,
                     admin: AdminEndpoint::Unix {
                         address: admin.to_owned(),
                         socket,
@@ -191,7 +193,28 @@ impl Client {
         }
         Ok(Self {
             admin: AdminEndpoint::Http(admin),
+            budget: None,
         })
+    }
+
+    pub(crate) fn with_budget(mut self, budget: crate::operation::Budget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    fn timeout(&self) -> Result<Duration, Error> {
+        self.budget
+            .as_ref()
+            .map_or(Ok(Duration::from_secs(5)), |b| {
+                b.remaining().map_err(admin_request)
+            })
+    }
+
+    fn agent(&self) -> Result<ureq::Agent, Error> {
+        Ok(ureq::Agent::config_builder()
+            .timeout_global(Some(self.timeout()?))
+            .build()
+            .into())
     }
 
     pub(crate) fn fetch_config(&self) -> Result<Value, Error> {
@@ -200,7 +223,11 @@ impl Client {
                 let endpoint = admin
                     .join("/config/")
                     .map_err(|error| Error::AdminUrl(error.to_string()))?;
-                let mut response = ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
+                let mut response = self
+                    .agent()?
+                    .get(endpoint.as_str())
+                    .call()
+                    .map_err(admin_request)?;
                 response
                     .body_mut()
                     .read_json()
@@ -208,7 +235,8 @@ impl Client {
             }
             #[cfg(unix)]
             AdminEndpoint::Unix { socket, .. } => {
-                let response = unix_request(socket, "GET", "/config/", &[], None)?;
+                let response =
+                    unix_request_bounded(socket, "GET", "/config/", &[], None, self.timeout()?)?;
                 response.ensure_success()?;
                 serde_json::from_slice(&response.body)
                     .map_err(|error| Error::AdminRequest(error.to_string()))
@@ -222,7 +250,11 @@ impl Client {
                 let endpoint = admin
                     .join("/pki/ca/local")
                     .map_err(|error| Error::AdminUrl(error.to_string()))?;
-                let mut response = ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
+                let mut response = self
+                    .agent()?
+                    .get(endpoint.as_str())
+                    .call()
+                    .map_err(admin_request)?;
                 response
                     .body_mut()
                     .read_to_string()
@@ -230,7 +262,14 @@ impl Client {
             }
             #[cfg(unix)]
             AdminEndpoint::Unix { socket, .. } => {
-                let response = unix_request(socket, "GET", "/pki/ca/local", &[], None)?;
+                let response = unix_request_bounded(
+                    socket,
+                    "GET",
+                    "/pki/ca/local",
+                    &[],
+                    None,
+                    self.timeout()?,
+                )?;
                 response.ensure_success()?;
                 String::from_utf8(response.body)
                     .map_err(|error| Error::AdminRequest(error.to_string()))
@@ -266,8 +305,11 @@ impl Client {
                 let endpoint = self.server_routes_http_endpoint(server)?;
                 mutate_with_retry(
                     || {
-                        let mut response =
-                            ureq::get(endpoint.as_str()).call().map_err(admin_request)?;
+                        let mut response = self
+                            .agent()?
+                            .get(endpoint.as_str())
+                            .call()
+                            .map_err(admin_request)?;
                         let etag = response
                             .headers()
                             .get("etag")
@@ -280,7 +322,9 @@ impl Client {
                             .map_err(|error| Error::AdminRequest(error.to_string()))?;
                         Ok((etag, routes))
                     },
-                    |etag, routes| match ureq::patch(endpoint.as_str())
+                    |etag, routes| match self
+                        .agent()?
+                        .patch(endpoint.as_str())
                         .header("If-Match", etag)
                         .send_json(routes)
                     {
@@ -297,7 +341,14 @@ impl Client {
                 let endpoint = server_routes_path(server);
                 mutate_with_retry(
                     || {
-                        let response = unix_request(socket, "GET", &endpoint, &[], None)?;
+                        let response = unix_request_bounded(
+                            socket,
+                            "GET",
+                            &endpoint,
+                            &[],
+                            None,
+                            self.timeout()?,
+                        )?;
                         response.ensure_success()?;
                         let etag = response
                             .header("etag")
@@ -310,12 +361,13 @@ impl Client {
                     |etag, routes| {
                         let body = serde_json::to_vec(routes)
                             .map_err(|error| Error::AdminRequest(error.to_string()))?;
-                        let response = unix_request(
+                        let response = unix_request_bounded(
                             socket,
                             "PATCH",
                             &endpoint,
                             &[("If-Match", etag), ("Content-Type", "application/json")],
                             Some(&body),
+                            self.timeout()?,
                         )?;
                         match response.status {
                             200..=299 => Ok(WriteOutcome::Applied),
@@ -411,13 +463,31 @@ fn unix_request(
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> Result<UnixResponse, Error> {
-    let mut stream =
-        UnixStream::connect(socket).map_err(|error| unix_connect_error(socket, error))?;
+    unix_request_bounded(socket, method, path, headers, body, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn unix_request_bounded(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<UnixResponse, Error> {
+    let deadline = std::time::Instant::now() + timeout;
+    let address = socket2::SockAddr::unix(socket).map_err(admin_request)?;
+    let connection = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        .map_err(admin_request)?;
+    connection
+        .connect_timeout(&address, timeout)
+        .map_err(|error| unix_connect_error(socket, error))?;
+    let mut stream: UnixStream = connection.into();
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(timeout))
         .map_err(|error| Error::AdminRequest(error.to_string()))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(timeout))
         .map_err(|error| Error::AdminRequest(error.to_string()))?;
 
     write!(
@@ -443,9 +513,24 @@ fn unix_request(
     }
 
     let mut bytes = Vec::new();
-    stream
-        .read_to_end(&mut bytes)
-        .map_err(|error| Error::AdminRequest(error.to_string()))?;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|value| !value.is_zero())
+            .ok_or_else(|| admin_request("operation deadline exceeded"))?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(admin_request)?;
+        let mut chunk = [0; 8192];
+        let count = stream.read(&mut chunk).map_err(admin_request)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(admin_request("Caddy response exceeds 16 MiB"));
+        }
+    }
     parse_http_response(&bytes)
 }
 
@@ -735,6 +820,61 @@ impl ManagedCaddyRoutes<'_> {
 }
 
 impl ManagedCaddyRoutes<'_> {
+    pub(crate) fn check_alias(
+        &self,
+        config: &Value,
+        alias: &crate::state::Alias,
+    ) -> Result<(), Error> {
+        let (server, container) = self.server(alias.tls)?;
+        let routes = config["apps"]["http"]["servers"][server]["routes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        reject_foreign_hostname_claims(&routes, std::slice::from_ref(&alias.hostname))?;
+        reject_managed_hostname_claim(&routes, container, &alias.hostname, alias.id, false)
+    }
+
+    pub(crate) fn ensure_alias(&self, route: &RouteSpec) -> Result<(), Error> {
+        let (server, container) = self.server(route.tls)?;
+        self.ensure_proxy(route, server, container, &route.hostname, false)
+    }
+
+    pub(crate) fn remove_alias(&self, owner: Uuid, tls: bool) -> Result<(), Error> {
+        let (server, container) = self.server(tls)?;
+        self.client.mutate_server_routes(server, |mut routes| {
+            update_owned_route(&mut routes, container, owner, None)?;
+            Ok(routes)
+        })
+    }
+
+    pub(crate) fn alias_matches(
+        &self,
+        config: &Value,
+        alias: &crate::state::Alias,
+    ) -> Result<bool, Error> {
+        let (server, container) = self.server(alias.tls)?;
+        let expected = build_proxy_route_for_network(
+            &owner_route_id(alias.id),
+            &alias.hostname,
+            &normalize_upstream(&alias.target)?.url,
+            alias.preserve_host,
+            self.loopback_host,
+            self.client_ip_ranges,
+        );
+        Ok(config["apps"]["http"]["servers"][server]["routes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|route| route["@id"] == container)
+            .flat_map(|route| {
+                route["handle"][0]["routes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .any(|route| route == &expected))
+    }
+
     fn ensure_proxy(
         &self,
         route: &RouteSpec,
@@ -742,8 +882,8 @@ impl ManagedCaddyRoutes<'_> {
         container_id: &str,
         hostname: &str,
         lan: bool,
-    ) -> Result<(), RouteError> {
-        let upstream = normalize_upstream(&route.target).map_err(route_error)?;
+    ) -> Result<(), Error> {
+        let upstream = normalize_upstream(&route.target)?;
         let owner_id = route.owner_id;
         let hostname = hostname.to_owned();
         let id = if lan {
@@ -764,25 +904,23 @@ impl ManagedCaddyRoutes<'_> {
                 self.client_ip_ranges
             },
         );
-        self.client
-            .mutate_server_routes(server, move |mut routes| {
-                reject_foreign_hostname_claims(&routes, std::slice::from_ref(&hostname))?;
-                reject_managed_hostname_claim(
-                    &routes,
-                    container_id,
-                    &hostname,
-                    owner_id,
-                    route.replace_existing,
-                )?;
-                update_owned_route(
-                    &mut routes,
-                    container_id,
-                    owner_id,
-                    Some((hostname.clone(), proxy.clone())),
-                )?;
-                Ok(routes)
-            })
-            .map_err(route_error)
+        self.client.mutate_server_routes(server, move |mut routes| {
+            reject_foreign_hostname_claims(&routes, std::slice::from_ref(&hostname))?;
+            reject_managed_hostname_claim(
+                &routes,
+                container_id,
+                &hostname,
+                owner_id,
+                route.replace_existing,
+            )?;
+            update_owned_route(
+                &mut routes,
+                container_id,
+                owner_id,
+                Some((hostname.clone(), proxy.clone())),
+            )?;
+            Ok(routes)
+        })
     }
 }
 
@@ -796,10 +934,12 @@ impl RouteBackend for ManagedCaddyRoutes<'_> {
                 LAN_CONTAINER_ID,
                 &crate::lan::hostname(&route.hostname),
                 true,
-            )?;
+            )
+            .map_err(route_error)?;
         }
         let (server, container_id) = self.server(route.tls).map_err(route_error)?;
         self.ensure_proxy(route, server, container_id, &route.hostname, false)
+            .map_err(route_error)
     }
 
     fn remove_if_owned(
