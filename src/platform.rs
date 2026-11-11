@@ -140,3 +140,13 @@ pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
     unsafe { CloseHandle(token) };
     result
 }
+
+/// TLS defaults for clients using the platform's compiled HTTPS backend.
+pub(crate) fn tls_config() -> ureq::tls::TlsConfig {
+    let builder = ureq::tls::TlsConfig::builder();
+    #[cfg(windows)]
+    let builder = builder
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier);
+    builder.build()
+}

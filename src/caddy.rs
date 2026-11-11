@@ -212,6 +212,7 @@ impl Client {
 
     fn agent(&self) -> Result<ureq::Agent, Error> {
         Ok(ureq::Agent::config_builder()
+            .tls_config(crate::platform::tls_config())
             .timeout_global(Some(self.timeout()?))
             .build()
             .into())

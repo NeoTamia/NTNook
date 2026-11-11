@@ -352,6 +352,7 @@ fn download_text(url: &str, timeout: Duration) -> Result<String, Error> {
 
 fn http_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
+        .tls_config(crate::platform::tls_config())
         .timeout_global(Some(timeout))
         .user_agent(format!("nook/{CURRENT_VERSION}"))
         .build()
@@ -903,6 +904,31 @@ mod tests {
     #[cfg(unix)]
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn https_update_transport_failure_returns_an_error_without_panicking() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // A local non-TLS peer must produce a normal error, never a missing-provider panic.
+        // Use nonblocking accept so a failed connection cannot strand the fixture.
+        listener.set_nonblocking(true).unwrap();
+        let peer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok((stream, _)) = listener.accept() {
+                    drop(stream);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let result = super::download_bytes(
+            &format!("https://{address}/release"),
+            Duration::from_secs(2),
+        );
+        peer.join().unwrap();
+        assert!(matches!(result, Err(super::Error::Network(_))));
+    }
 
     #[cfg(windows)]
     #[test]
