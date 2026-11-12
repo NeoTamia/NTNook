@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.1](https://github.com/NeoTamia/NTNook/compare/nook-run-v1.1.0...nook-run-v1.1.1) (2026-11-12)
+
+
+### 📚 Documentation
+
+* **agents:** Add portable Nook usage skill ([20b8c7e](https://github.com/NeoTamia/NTNook/commit/20b8c7e76303a4a8e6a7ae359523fab5b64010e6))
+* **agents:** Add portable Nook usage skill ([5014409](https://github.com/NeoTamia/NTNook/commit/501440900397b07e4b66e337a62b51cf44c1095e))
+
+
+### 🔧 Build System
+
+* **deps:** Integrate Renovate updates and adapt Windows ZIP extraction ([786eaaf](https://github.com/NeoTamia/NTNook/commit/786eaaf609690ed5c3aee5b5e3470ca420cefb67))
+* **deps:** Update dependencies and adapt Windows ZIP extraction ([685237a](https://github.com/NeoTamia/NTNook/commit/685237a17326e9f143c975bb39f424aa48765e36))
+
 ## [1.1.0](https://github.com/NeoTamia/NTNook/compare/nook-run-v1.0.1...nook-run-v1.1.0) (2026-10-26)
 
 
