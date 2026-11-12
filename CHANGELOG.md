@@ -1,5 +1,70 @@
 # Changelog
 
+## [0.12.0](https://github.com/NeoTamia/NTNook/compare/v0.11.0...v0.12.0) (2026-11-12)
+
+
+### ✨ Features
+
+* **compose:** Route Docker Compose applications through Caddy ([d969dd1](https://github.com/NeoTamia/NTNook/commit/d969dd12997e4fc8832dad4d79bca15aa5d52a7b))
+* **compose:** Route Docker Compose applications through Caddy ([91fba46](https://github.com/NeoTamia/NTNook/commit/91fba4640d33c223c8cad583c4368421108f70e9))
+* **doctor:** Inspect Nook without reconciling resources ([3a89c3d](https://github.com/NeoTamia/NTNook/commit/3a89c3d2e00d14284017c738319b9f002b8e7c56))
+* **doctor:** Inspect Nook without reconciling resources ([7d6403b](https://github.com/NeoTamia/NTNook/commit/7d6403b00aa92daa6cb9a8348b9d2d5e46c5cc86))
+* **mcp:** Expose scoped local tools and read-only observations ([edef6c8](https://github.com/NeoTamia/NTNook/commit/edef6c803e7824094139eb041869e6de080233e0))
+* **mcp:** Expose scoped local tools for agents ([4d9105d](https://github.com/NeoTamia/NTNook/commit/4d9105d5a739bba84b7da7365ec41ef76df883ec))
+* **state:** Integrate provider-aware tunnels with registry v6 ([226703a](https://github.com/NeoTamia/NTNook/commit/226703a87a5f4507031e2800bce18cc54477027c))
+* **tunnel:** Expose runs and aliases through ngrok ([2f32f49](https://github.com/NeoTamia/NTNook/commit/2f32f49d04d257ed040fb2164be2f007ae30224b))
+* **tunnel:** Expose runs and aliases through ngrok ([d7f3ee8](https://github.com/NeoTamia/NTNook/commit/d7f3ee8a183c6c9228d096028a47ed310efb4b11))
+* **tunnel:** Expose runs through Cloudflare Quick Tunnels ([598b198](https://github.com/NeoTamia/NTNook/commit/598b198873bb30d2bbc5b009875fcec1e2d07dc2))
+* **tunnel:** Expose runs through Cloudflare Quick Tunnels ([2689cbe](https://github.com/NeoTamia/NTNook/commit/2689cbe0b544e75e7ca0c3e19a442bc615fb9741))
+
+
+### 🐛 Bug Fixes
+
+* **compose:** Integrate read-only Doctor and MCP observations ([8aaaf59](https://github.com/NeoTamia/NTNook/commit/8aaaf59326d59ad216391e9229e36fdd7deae4a4))
+* **compose:** Protect reservations from MCP alias operations ([6aca96e](https://github.com/NeoTamia/NTNook/commit/6aca96ec1af7798a01a0f6edd0569f22cfff0603))
+* Diagnose commandless projects and prevent Windows HTTPS startup panic ([dac8bd2](https://github.com/NeoTamia/NTNook/commit/dac8bd28053c5a705c0e020a05859b2eaa950fe4))
+* **doctor:** Inspect projects without requiring a launch command ([6748038](https://github.com/NeoTamia/NTNook/commit/674803850be8485a022f2b5af1947ce8c1981a87))
+* **doctor:** Respect owner selection and probe IPv6 upstreams ([c27cf3a](https://github.com/NeoTamia/NTNook/commit/c27cf3a8e98dff4a2e3087144f29e370c4fef868))
+* **doctor:** Retain validation of explicitly empty workspace commands ([ad06906](https://github.com/NeoTamia/NTNook/commit/ad069061285eefe76fae0b7c6cd85c509efd022c))
+* **mcp:** Preserve local alias routing with tunnel support ([13e6112](https://github.com/NeoTamia/NTNook/commit/13e6112018380785764840f85a075932f275e3c8))
+* **mcp:** Preserve tunnel startup ownership ([953fb0b](https://github.com/NeoTamia/NTNook/commit/953fb0bcca911b66dc9197749f0a3285aff87c64))
+* **state:** Preserve Compose and tunnel ownership in registry v5 ([425ca73](https://github.com/NeoTamia/NTNook/commit/425ca73141c7406b433f3dff4534645d206ea044))
+* **tunnel:** Reserve LAN names during startup ([7088ad6](https://github.com/NeoTamia/NTNook/commit/7088ad661346dffe22c2819559cf2d49932c2733))
+* **windows:** Select native TLS for update and Caddy clients ([5d6760c](https://github.com/NeoTamia/NTNook/commit/5d6760c044589282c20b9744a58c7998a8df5858))
+
+
+### 📚 Documentation
+
+* **agents:** Add portable Nook usage skill ([20b8c7e](https://github.com/NeoTamia/NTNook/commit/20b8c7e76303a4a8e6a7ae359523fab5b64010e6))
+* **agents:** Add portable Nook usage skill ([5014409](https://github.com/NeoTamia/NTNook/commit/501440900397b07e4b66e337a62b51cf44c1095e))
+* **agents:** Align portable skill with optional MCP discovery ([88bcb43](https://github.com/NeoTamia/NTNook/commit/88bcb43fda74808154ccb8c43ec77d72f3c2d651))
+* **agents:** Describe managed Quick Tunnel exposure ([70ab3c2](https://github.com/NeoTamia/NTNook/commit/70ab3c2379befab42b74caa896d63aa3466fb5bd))
+* **agents:** Distinguish Cloudflare named tunnels from ngrok ([37f7def](https://github.com/NeoTamia/NTNook/commit/37f7def12752ee8ab9e0d56002f0b35580e43bf3))
+* Mark post-MVP features as delivered ([f409caa](https://github.com/NeoTamia/NTNook/commit/f409caa48cd4f99473b1845feecff2abd8a67098))
+* **ngrok:** Align agent guidance and URL guarantees ([13f5dcd](https://github.com/NeoTamia/NTNook/commit/13f5dcd07267b0650b9c57a802ac6e13e42c7a01))
+
+
+### 🧪 Tests
+
+* **agents:** Exercise HTTPS without the reserved Windows HTTP port ([2bd2ad5](https://github.com/NeoTamia/NTNook/commit/2bd2ad5492382754ecb584f623f619a5d0a38f9c))
+* **agents:** Normalize Windows config paths ([c6caf50](https://github.com/NeoTamia/NTNook/commit/c6caf50235f49b3711e901c86cec46d089296877))
+* **agents:** Report HTTPS and process diagnostics on timeout ([0915c4f](https://github.com/NeoTamia/NTNook/commit/0915c4faa0e50860d9d3f6887714cef442deb071))
+* **compose:** Isolate fake Docker on Windows ([5287f5a](https://github.com/NeoTamia/NTNook/commit/5287f5abb4780e55d85dcdc2c8f858987b2c267d))
+* **doctor:** Reset inherited Winsock nonblocking mode ([c7e46b0](https://github.com/NeoTamia/NTNook/commit/c7e46b0d97fb9a50e7fac8661f6ec05bab1789ca))
+* **lifecycle:** Distinguish process leases from startup reservations ([eb0083b](https://github.com/NeoTamia/NTNook/commit/eb0083b9ec5fa6ada33d926f8d7a27907dee8c43))
+* **mcp:** Expose native Caddy startup failures ([c7bb29f](https://github.com/NeoTamia/NTNook/commit/c7bb29fb8f6e6f8dbaf2db7013eac412ca5fbb0e))
+* **mcp:** Handle absent revocation data for the fixture CA ([bee25b9](https://github.com/NeoTamia/NTNook/commit/bee25b90f0af83e428bbabba8e12d3dd905462ec))
+* **mcp:** Use HTTPS for native Windows Caddy ([e5a0212](https://github.com/NeoTamia/NTNook/commit/e5a0212696e9089e31cd9621faec42d59899e40f))
+* **skill:** Await CLI announcements independently of HTTP readiness ([cc1322a](https://github.com/NeoTamia/NTNook/commit/cc1322a519c9d8edb71c82dc27507abf291b4e08))
+* **tunnel:** Await ready lease before Doctor nonmutation checks ([0e2d50f](https://github.com/NeoTamia/NTNook/commit/0e2d50f9723e2b7730fad3c3ce11435b714dc049))
+* **workspace:** Synchronize runner lifecycle assertions ([13a2a01](https://github.com/NeoTamia/NTNook/commit/13a2a01be49afbfdbee82dfbcc3e3c752d6cb157))
+
+
+### 🔧 Build System
+
+* **deps:** Integrate Renovate updates and adapt Windows ZIP extraction ([786eaaf](https://github.com/NeoTamia/NTNook/commit/786eaaf609690ed5c3aee5b5e3470ca420cefb67))
+* **deps:** Update dependencies and adapt Windows ZIP extraction ([685237a](https://github.com/NeoTamia/NTNook/commit/685237a17326e9f143c975bb39f424aa48765e36))
+
 ## [0.11.0](https://github.com/NeoTamia/NTNook/compare/v0.10.0...v0.11.0) (2026-11-10)
 
 
