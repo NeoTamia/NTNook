@@ -8,9 +8,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
-pub(crate) const PREFIX: &str = "io.ntnook.route.";
-pub(crate) const OWNER: &str = "io.ntnook.owner";
-pub(crate) const IDENTITY: &str = "io.ntnook.identity";
+pub(crate) const PREFIX: &str = "re.neotamia.nook.route.";
+pub(crate) const OWNER: &str = "re.neotamia.nook.owner";
+pub(crate) const IDENTITY: &str = "re.neotamia.nook.identity";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,7 +235,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     fn model() -> Value {
-        json!({"name":"app", "services":{"web":{"ports":[{"target":3000,"protocol":"tcp"}],"labels":{"io.ntnook.route.web.port":"3000"}},"db":{"expose":[5432]}}})
+        json!({"name":"app", "services":{"web":{"ports":[{"target":3000,"protocol":"tcp"}],"labels":{"re.neotamia.nook.route.web.port":"3000"}},"db":{"expose":[5432]}}})
     }
     #[test]
     fn only_explicit_http_is_routed() {

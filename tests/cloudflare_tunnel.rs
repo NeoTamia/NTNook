@@ -225,8 +225,8 @@ else: raise SystemExit('unexpected Docker mutation: '+repr(a))
     .unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(root.join("containers.json"), serde_json::to_vec(&serde_json::json!([{
-        "Id":"owned", "Config":{"Labels":{"io.ntnook.owner":project["id"],
-        "io.ntnook.identity":"identity","com.docker.compose.project":"app","com.docker.compose.service":"web"}},
+        "Id":"owned", "Config":{"Labels":{"re.neotamia.nook.owner":project["id"],
+        "re.neotamia.nook.identity":"identity","com.docker.compose.project":"app","com.docker.compose.service":"web"}},
         "State":{"Running":true},"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}}
     }])).unwrap()).unwrap();
     assert_doctor_routes_read_only(&c);
@@ -592,7 +592,7 @@ a=sys.argv[1:]
 if a[0]=='info': print(json.dumps({'ID':'engine','OSType':'linux'}))
 elif a[0]=='ps': pass
 elif a[0]=='compose' and 'config' in a:
- print(json.dumps({'name':'shop','services':{'web':{'ports':[{'target':8080,'host_ip':'127.0.0.1'}],'labels':{'io.ntnook.route.http.port':'8080','io.ntnook.route.http.name':'web'}}}}))
+ print(json.dumps({'name':'shop','services':{'web':{'ports':[{'target':8080,'host_ip':'127.0.0.1'}],'labels':{'re.neotamia.nook.route.http.port':'8080','re.neotamia.nook.route.http.name':'web'}}}}))
 else: raise SystemExit('unexpected Docker mutation: '+repr(a))
 "#).unwrap();
             fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();

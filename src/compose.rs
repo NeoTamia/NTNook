@@ -702,7 +702,7 @@ pub(crate) fn execute(
     }
     if incoming.is_empty() && project.routes.is_empty() {
         return Err(invalid(
-            "no HTTP endpoints selected; declare io.ntnook.route.<id>.port labels",
+            "no HTTP endpoints selected; declare re.neotamia.nook.route.<id>.port labels",
         )
         .into());
     }
@@ -1268,7 +1268,7 @@ mod tests {
     use clap::Parser;
 
     fn project() -> Project {
-        let model = json!({"name":"app","services":{"web":{"ports":[{"target":8080}],"labels":{"io.ntnook.route.http.port":"8080","io.ntnook.route.http.tls":"false"}}}});
+        let model = json!({"name":"app","services":{"web":{"ports":[{"target":8080}],"labels":{"re.neotamia.nook.route.http.port":"8080","re.neotamia.nook.route.http.tls":"false"}}}});
         Project {
             id: Uuid::new_v4(),
             identity: "identity".into(),

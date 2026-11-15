@@ -84,13 +84,13 @@ def main():
             "image": "caddy:2.11.9-alpine",
             "command": ["sh", "-c", "caddy respond --listen :9090 --body nook-admin & exec caddy respond --listen :8080 --body nook-http"],
             "ports": [{"target": 8080, "host_ip": ("0.0.0.0" if docker_caddy else "127.0.0.1"), "protocol": "tcp"}],
-            "labels": {"io.ntnook.route.http.port": "8080", "io.ntnook.route.http.name": "web", "io.ntnook.route.http.tls": "false"},
+            "labels": {"re.neotamia.nook.route.http.port": "8080", "re.neotamia.nook.route.http.name": "web", "re.neotamia.nook.route.http.tls": "false"},
         }
         service["ports"].append({"target": 9090, "host_ip": ("0.0.0.0" if docker_caddy else "127.0.0.1"), "protocol": "tcp"})
-        service["labels"].update({"io.ntnook.route.admin.port": "9090", "io.ntnook.route.admin.name": "admin", "io.ntnook.route.admin.tls": "false"})
-        service["labels"].update({"io.ntnook.route.secure.port": "8080", "io.ntnook.route.secure.name": "secure"})
+        service["labels"].update({"re.neotamia.nook.route.admin.port": "9090", "re.neotamia.nook.route.admin.name": "admin", "re.neotamia.nook.route.admin.tls": "false"})
+        service["labels"].update({"re.neotamia.nook.route.secure.port": "8080", "re.neotamia.nook.route.secure.name": "secure"})
         api_labels = {key: value for key, value in service["labels"].items() if ".admin." not in key and ".secure." not in key}
-        model = {"services": {"web": dict(service), "api": dict(service, labels={**api_labels, "io.ntnook.route.http.name": "api"}), "db": {"image": "alpine:3.20", "command": ["sleep", "3600"], "volumes": ["data:/data"], "expose": ["5432", "6379/udp"]}}, "volumes": {"data": {}}}
+        model = {"services": {"web": dict(service), "api": dict(service, labels={**api_labels, "re.neotamia.nook.route.http.name": "api"}), "db": {"image": "alpine:3.20", "command": ["sleep", "3600"], "volumes": ["data:/data"], "expose": ["5432", "6379/udp"]}}, "volumes": {"data": {}}}
         # JSON is a YAML subset and keeps test fixtures platform independent.
         compose_file.write_text(json.dumps(model))
         try:
@@ -172,7 +172,7 @@ def main():
 
             print("PROOF multi-file, env-file, profiles and partial up", flush=True)
             override = root / "compose.extra.json"
-            extra = dict(service, profiles=["tools"], labels={**api_labels, "io.ntnook.route.http.name": "${NOOK_ROUTE_NAME}"})
+            extra = dict(service, profiles=["tools"], labels={**api_labels, "re.neotamia.nook.route.http.name": "${NOOK_ROUTE_NAME}"})
             override.write_text(json.dumps({"services": {"debug": extra}}))
             env_file = root / "local env"
             env_file.write_text("NOOK_ROUTE_NAME=debug\n")
@@ -186,7 +186,7 @@ def main():
             with socket.socket() as occupied:
                 occupied.bind(("0.0.0.0", 0))
                 occupied.listen()
-                collision = dict(service, labels={**api_labels, "io.ntnook.route.http.name": "collision"}, ports=[{"target": 8080, "published": str(occupied.getsockname()[1]), "host_ip": "0.0.0.0"}])
+                collision = dict(service, labels={**api_labels, "re.neotamia.nook.route.http.name": "collision"}, ports=[{"target": 8080, "published": str(occupied.getsockname()[1]), "host_ip": "0.0.0.0"}])
                 override.write_text(json.dumps({"services": {"collision": collision}}))
                 result = nook("compose", "-f", "compose.yaml", "-f", "compose.extra.json", "--no-worktree", "-p", project, "up", "-d", "collision", success=False)
                 assert result.returncode != 0

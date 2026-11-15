@@ -24,8 +24,8 @@ services:
         protocol: tcp
         # No published port: Docker allocates one.
     labels:
-      io.ntnook.route.web.port: "3000"
-      io.ntnook.route.web.name: "web"
+      re.neotamia.nook.route.web.port: "3000"
+      re.neotamia.nook.route.web.name: "web"
 ```
 
 ```sh
@@ -40,10 +40,9 @@ The application must listen on its container network interface, usually
 `0.0.0.0:3000`. Nook does not inject application environment variables or framework
 flags. It does not modify the Compose files or publish additional ports.
 
-Each `io.ntnook.route.<id>.port` declares an internal HTTP/TCP port. It must already
+Each `re.neotamia.nook.route.<id>.port` declares an internal HTTP/TCP port. It must already
 be published by Compose. `EXPOSE`, `expose`, port names and `app_protocol` alone
 never create routes. Databases, caches and UDP ports are not routed.
-
 Optional fields in the same group:
 
 | Field | Default | Meaning |

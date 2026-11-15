@@ -22,7 +22,7 @@ fn main() {
     fs::copy(env!("CARGO_BIN_EXE_nook"), &nook_binary).unwrap();
     fs::write(root.join("compose.yaml"), "services: {}\n").unwrap();
     fs::write(root.join("local env"), "VALUE=private\n").unwrap();
-    let model = json!({"name":"app","services":{"web":{"ports":[{"target":8080,"protocol":"udp"}],"labels":{"io.ntnook.route.http.port":"8080"}}}});
+    let model = json!({"name":"app","services":{"web":{"ports":[{"target":8080,"protocol":"udp"}],"labels":{"re.neotamia.nook.route.http.port":"8080"}}}});
     fs::write(root.join("model.json"), model.to_string()).unwrap();
     let path = env::join_paths(
         std::iter::once(root.clone())
