@@ -104,7 +104,7 @@ impl fmt::Display for Error {
             ),
             Self::MissingEtag => write!(
                 formatter,
-                "Caddy response did not include an ETag required for a safe mutation"
+                "Caddy Admin API response did not include the ETag header required for a safe mutation; Nook requires Caddy 2.11.x (older versions may send ETag as a trailer)"
             ),
             Self::ConcurrentMutation => write!(
                 formatter,
